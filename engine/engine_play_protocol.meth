@@ -1,0 +1,537 @@
+// Playtest protocol: deterministic localhost TCP framing for Roblox-style
+// editor <-> server <-> client.
+//
+// First revision is newline-delimited text lines for debuggability.
+// Each line is one packet. Max line 2048 bytes. Unknown packets are skipped.
+//
+// Packet grammar (simplified):
+//   HELLO <side> <version>
+//   WELCOME <session_id> <tick_hz>
+//   SCENE_BEGIN <entity_count>
+//   ENTITY <id> <kind> <parent> <pos_mm_x> <pos_mm_y> <pos_mm_z> <rot_q_e6_x> ...
+//   SCRIPT <id> <role> <service_id> <owner_entity_id> <path_len> <path> <name_len> <name>
+//   SCENE_END
+//   INPUT <seq> <action> <held> <pressed> <released>
+//   XFORM <tick> <entity_id> <pos_mm...> <rot_q_e6...> <scale_e6>
+//   ERROR <side> <msg...>
+//   STOP <reason>
+//
+// Scaling:
+//   pos_mm: millimetres, int32
+//   rot_q_e6: quaternion components * 1e6, int32
+//   scale_e6: scale * 1e6, int32
+//
+// All paths and names are UTF-8, length-prefixed to avoid spaces/newlines issues.
+//
+// This module provides encode helpers and a simple line-based decoder state
+// machine. The server and client use it to serialize/deserialize.
+import "std/conv";
+import "std/mem";
+
+export function PLAY_PROTOCOL_VERSION() -> int32 { return 1; }
+
+export function PLAY_SIDE_SERVER() -> int32 { return 1; }
+export function PLAY_SIDE_CLIENT() -> int32 { return 2; }
+
+export function PLAY_PKT_HELLO() -> int32 { return 1; }
+export function PLAY_PKT_WELCOME() -> int32 { return 2; }
+export function PLAY_PKT_SCENE_BEGIN() -> int32 { return 3; }
+export function PLAY_PKT_ENTITY() -> int32 { return 4; }
+export function PLAY_PKT_SCRIPT() -> int32 { return 5; }
+export function PLAY_PKT_SCENE_END() -> int32 { return 6; }
+export function PLAY_PKT_INPUT() -> int32 { return 7; }
+export function PLAY_PKT_XFORM() -> int32 { return 8; }
+export function PLAY_PKT_ERROR() -> int32 { return 9; }
+export function PLAY_PKT_STOP() -> int32 { return 10; }
+
+export struct PlayPacket {
+  type: int32;
+  // union-like scratch for decoded fields
+  i0: int32;
+  i1: int32;
+  i2: int32;
+  i3: int32;
+  i4: int32;
+  i5: int32;
+  i6: int32;
+  i7: int32;
+  i8: int32;
+  i9: int32;
+  i10: int32;
+  i11: int32;
+  s0: uint8[520];
+  s1: uint8[128];
+}
+
+export function play_packet_reset(p: PlayPacket*) {
+  if (p == 0) {
+    return;
+  }
+  p->type = 0;
+  p->i0 = 0;
+  p->i1 = 0;
+  p->i2 = 0;
+  p->i3 = 0;
+  p->i4 = 0;
+  p->i5 = 0;
+  p->i6 = 0;
+  p->i7 = 0;
+  p->i8 = 0;
+  p->i9 = 0;
+  p->i10 = 0;
+  p->i11 = 0;
+  p->s0[0] = 0;
+  p->s1[0] = 0;
+}
+
+function play_write_i32(buf: cstring, cap: int32, pos: int32, v: int32) -> int32 {
+  var tmp: uint8[32];
+  int_to_dec((cstring)((int64)(&(tmp[0]))), (int64)v);
+  var j: int32 = 0;
+  while (j < 32 && tmp[j] != (uint8)0) {
+    if (pos + 1 >= cap) {
+      return -1;
+    }
+    buf[pos] = tmp[j];
+    pos = pos + 1;
+    j = j + 1;
+  }
+  if (pos + 1 >= cap) {
+    return -1;
+  }
+  buf[pos] = 32;
+  return pos + 1;
+}
+
+function play_write_str(buf: cstring, cap: int32, pos: int32, s: cstring) -> int32 {
+  if (s == 0) {
+    if (pos + 1 >= cap) {
+      return -1;
+    }
+    buf[pos] = 32;
+    return pos + 1;
+  }
+  var i: int32 = 0;
+  while ((uint8)(s[i]) != (uint8)0) {
+    if (pos + 1 >= cap) {
+      return -1;
+    }
+    buf[pos] = s[i];
+    pos = pos + 1;
+    i = i + 1;
+  }
+  if (pos + 1 >= cap) {
+    return -1;
+  }
+  buf[pos] = 32;
+  return pos + 1;
+}
+
+function play_strlen_cap(s: cstring, max_len: int32) -> int32 {
+  if (s == 0 || max_len <= 0) {
+    return 0;
+  }
+  var n: int32 = 0;
+  while (n < max_len && (uint8)(s[n]) != (uint8)0 && (uint8)(s[n]) != (uint8)10 && (uint8)(s[n]) != (uint8)13) {
+    n = n + 1;
+  }
+  return n;
+}
+
+function play_write_len_str(buf: cstring, cap: int32, pos: int32, s: cstring, max_len: int32) -> int32 {
+  if (buf == 0 || cap <= 0) {
+    return -1;
+  }
+  var L: int32 = play_strlen_cap(s, max_len);
+  pos = play_write_i32(buf, cap, pos, L);
+  if (pos < 0) {
+    return -1;
+  }
+  var i: int32 = 0;
+  while (i < L) {
+    if (pos + 1 >= cap) {
+      return -1;
+    }
+    buf[pos] = s[i];
+    pos = pos + 1;
+    i = i + 1;
+  }
+  if (pos + 1 >= cap) {
+    return -1;
+  }
+  buf[pos] = 32;
+  return pos + 1;
+}
+
+export function play_encode_welcome(buf: cstring, cap: int32, session_id: int32, tick_hz: int32) -> int32 {
+  if (buf == 0 || cap <= 0) {
+    return -1;
+  }
+  var pos: int32 = 0;
+  var pre: string = "WELCOME ";
+  var i: int32 = 0;
+  while (i < pre.length && pos + 1 < cap) {
+    buf[pos] = (uint8)(pre.chars[i]);
+    pos = pos + 1;
+    i = i + 1;
+  }
+  pos = play_write_i32(buf, cap, pos, session_id);
+  pos = play_write_i32(buf, cap, pos, tick_hz);
+  if (pos + 1 >= cap) {
+    return -1;
+  }
+  buf[pos] = 10;
+  buf[pos + 1] = 0;
+  return pos + 1;
+}
+
+export function play_encode_scene_begin(buf: cstring, cap: int32, entity_count: int32) -> int32 {
+  if (buf == 0 || cap <= 0) {
+    return -1;
+  }
+  var pos: int32 = 0;
+  var pre: string = "SCENE_BEGIN ";
+  var i: int32 = 0;
+  while (i < pre.length && pos + 1 < cap) {
+    buf[pos] = (uint8)(pre.chars[i]);
+    pos = pos + 1;
+    i = i + 1;
+  }
+  pos = play_write_i32(buf, cap, pos, entity_count);
+  if (pos + 1 >= cap) {
+    return -1;
+  }
+  buf[pos] = 10;
+  buf[pos + 1] = 0;
+  return pos + 1;
+}
+
+export function play_encode_scene_end(buf: cstring, cap: int32) -> int32 {
+  if (buf == 0 || cap < 11) {
+    return -1;
+  }
+  var s: string = "SCENE_END\n";
+  var i: int32 = 0;
+  while (i < s.length && i + 1 < cap) {
+    buf[i] = (uint8)(s.chars[i]);
+    i = i + 1;
+  }
+  buf[i] = 0;
+  return i;
+}
+
+export function play_encode_entity(buf: cstring, cap: int32, id: int32, kind: int32, parent: int32, pos_x_mm: int32, pos_y_mm: int32, pos_z_mm: int32, rot_x_e6: int32, rot_y_e6: int32, rot_z_e6: int32, rot_w_e6: int32, scale_e6: int32, mesh_path: cstring, name: cstring) -> int32 {
+  if (buf == 0 || cap <= 0) {
+    return -1;
+  }
+  var pos: int32 = 0;
+  var pre: string = "ENTITY ";
+  var i: int32 = 0;
+  while (i < pre.length && pos + 1 < cap) {
+    buf[pos] = (uint8)(pre.chars[i]);
+    pos = pos + 1;
+    i = i + 1;
+  }
+  pos = play_write_i32(buf, cap, pos, id);
+  pos = play_write_i32(buf, cap, pos, kind);
+  pos = play_write_i32(buf, cap, pos, parent);
+  pos = play_write_i32(buf, cap, pos, pos_x_mm);
+  pos = play_write_i32(buf, cap, pos, pos_y_mm);
+  pos = play_write_i32(buf, cap, pos, pos_z_mm);
+  pos = play_write_i32(buf, cap, pos, rot_x_e6);
+  pos = play_write_i32(buf, cap, pos, rot_y_e6);
+  pos = play_write_i32(buf, cap, pos, rot_z_e6);
+  pos = play_write_i32(buf, cap, pos, rot_w_e6);
+  pos = play_write_i32(buf, cap, pos, scale_e6);
+  pos = play_write_len_str(buf, cap, pos, mesh_path, 519);
+  pos = play_write_len_str(buf, cap, pos, name, 127);
+  if (pos + 1 >= cap) {
+    return -1;
+  }
+  buf[pos] = 10;
+  buf[pos + 1] = 0;
+  return pos + 1;
+}
+
+export function play_encode_input(buf: cstring, cap: int32, seq: int32, action: int32, held: int32, pressed: int32, released: int32) -> int32 {
+  if (buf == 0 || cap <= 0) {
+    return -1;
+  }
+  var pos: int32 = 0;
+  var pre: string = "INPUT ";
+  var i: int32 = 0;
+  while (i < pre.length && pos + 1 < cap) {
+    buf[pos] = (uint8)(pre.chars[i]);
+    pos = pos + 1;
+    i = i + 1;
+  }
+  pos = play_write_i32(buf, cap, pos, seq);
+  pos = play_write_i32(buf, cap, pos, action);
+  pos = play_write_i32(buf, cap, pos, held);
+  pos = play_write_i32(buf, cap, pos, pressed);
+  pos = play_write_i32(buf, cap, pos, released);
+  if (pos + 1 >= cap) {
+    return -1;
+  }
+  buf[pos] = 10;
+  buf[pos + 1] = 0;
+  return pos + 1;
+}
+
+export function play_encode_xform(buf: cstring, cap: int32, tick: int32, entity_id: int32, pos_x_mm: int32, pos_y_mm: int32, pos_z_mm: int32, rot_x_e6: int32, rot_y_e6: int32, rot_z_e6: int32, rot_w_e6: int32, scale_e6: int32) -> int32 {
+  if (buf == 0 || cap <= 0) {
+    return -1;
+  }
+  var pos: int32 = 0;
+  var pre: string = "XFORM ";
+  var i: int32 = 0;
+  while (i < pre.length && pos + 1 < cap) {
+    buf[pos] = (uint8)(pre.chars[i]);
+    pos = pos + 1;
+    i = i + 1;
+  }
+  pos = play_write_i32(buf, cap, pos, tick);
+  pos = play_write_i32(buf, cap, pos, entity_id);
+  pos = play_write_i32(buf, cap, pos, pos_x_mm);
+  pos = play_write_i32(buf, cap, pos, pos_y_mm);
+  pos = play_write_i32(buf, cap, pos, pos_z_mm);
+  pos = play_write_i32(buf, cap, pos, rot_x_e6);
+  pos = play_write_i32(buf, cap, pos, rot_y_e6);
+  pos = play_write_i32(buf, cap, pos, rot_z_e6);
+  pos = play_write_i32(buf, cap, pos, rot_w_e6);
+  pos = play_write_i32(buf, cap, pos, scale_e6);
+  if (pos + 1 >= cap) {
+    return -1;
+  }
+  buf[pos] = 10;
+  buf[pos + 1] = 0;
+  return pos + 1;
+}
+
+export function play_encode_stop(buf: cstring, cap: int32, reason: cstring) -> int32 {
+  if (buf == 0 || cap <= 0) {
+    return -1;
+  }
+  var pos: int32 = 0;
+  var pre: string = "STOP ";
+  var i: int32 = 0;
+  while (i < pre.length && pos + 1 < cap) {
+    buf[pos] = (uint8)(pre.chars[i]);
+    pos = pos + 1;
+    i = i + 1;
+  }
+  pos = play_write_str(buf, cap, pos, reason);
+  if (pos + 1 >= cap) {
+    return -1;
+  }
+  buf[pos] = 10;
+  buf[pos + 1] = 0;
+  return pos + 1;
+}
+
+export function play_proto_atol(s: cstring) -> int64 {
+  if (s == 0) {
+    return 0;
+  }
+  var neg: int32 = 0;
+  var v: int64 = 0;
+  var i: int32 = 0;
+  if ((uint8)(s[0]) == (uint8)45) {
+    neg = 1;
+    i = 1;
+  }
+  while ((uint8)(s[i]) >= (uint8)48 && (uint8)(s[i]) <= (uint8)57) {
+    v = v * 10 + ((int64)((uint8)(s[i]) - 48));
+    i = i + 1;
+  }
+  if (neg != 0) {
+    v = 0 - v;
+  }
+  return v;
+}
+
+// Decoder: feed lines one by one. Returns packet type or 0 on skip/error.
+export function play_decode_line(line: cstring, pkt: PlayPacket*) -> int32 {
+  if (line == 0 || pkt == 0) {
+    return 0;
+  }
+  play_packet_reset(pkt);
+  // very simple token parser for first revision
+  var p: int32 = 0;
+  var tok: uint8[64];
+  // read first token
+  var j: int32 = 0;
+  while (p < 2048 && j + 1 < 64) {
+    var b: uint8 = (uint8)(line[p]);
+    if (b == (uint8)32 || b == (uint8)10 || b == (uint8)0) {
+      break;
+    }
+    tok[j] = b;
+    j = j + 1;
+    p = p + 1;
+  }
+  tok[j] = 0;
+  if (j == 0) {
+    return 0;
+  }
+  var cmd: cstring = (cstring)((int64)(&(tok[0])));
+  if (play_proto_starts(cmd, "WELCOME") != 0) {
+    pkt->type = PLAY_PKT_WELCOME();
+    // parse ints
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i0 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i1 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    return pkt->type;
+  }
+  if (play_proto_starts(cmd, "SCENE_BEGIN") != 0) {
+    pkt->type = PLAY_PKT_SCENE_BEGIN();
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i0 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    return pkt->type;
+  }
+  if (play_proto_starts(cmd, "SCENE_END") != 0) {
+    pkt->type = PLAY_PKT_SCENE_END();
+    return pkt->type;
+  }
+  if (play_proto_starts(cmd, "ENTITY") != 0) {
+    pkt->type = PLAY_PKT_ENTITY();
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i0 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i1 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i2 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i3 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i4 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i5 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i6 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i7 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i8 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i9 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i10 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_read_len_str(line, p, (cstring)((int64)(&(pkt->s0[0]))), 520);
+    p = play_proto_read_len_str(line, p, (cstring)((int64)(&(pkt->s1[0]))), 128);
+    return pkt->type;
+  }
+  if (play_proto_starts(cmd, "INPUT") != 0) {
+    pkt->type = PLAY_PKT_INPUT();
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i0 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i1 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i2 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i3 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i4 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    return pkt->type;
+  }
+  if (play_proto_starts(cmd, "XFORM") != 0) {
+    pkt->type = PLAY_PKT_XFORM();
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i0 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i1 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i2 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i3 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i4 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i5 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i6 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i7 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i8 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i9 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    return pkt->type;
+  }
+  if (play_proto_starts(cmd, "STOP") != 0) {
+    pkt->type = PLAY_PKT_STOP();
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(pkt->s0[0]))), 520);
+    return pkt->type;
+  }
+  // skip unknown
+  return 0;
+}
+
+function play_proto_starts(line: cstring, prefix: string) -> int32 {
+  if (line == 0) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < prefix.length) {
+    if ((uint8)(line[i]) != (uint8)(prefix.chars[i])) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+function play_proto_next_token(line: cstring, pos: int32, out: cstring, out_cap: int32) -> int32 {
+  while (pos < 2048 && (uint8)(line[pos]) == (uint8)32) {
+    pos = pos + 1;
+  }
+  var j: int32 = 0;
+  while (pos < 2048 && j + 1 < out_cap) {
+    var b: uint8 = (uint8)(line[pos]);
+    if (b == (uint8)0 || b == (uint8)32 || b == (uint8)10) {
+      break;
+    }
+    out[j] = b;
+    j = j + 1;
+    pos = pos + 1;
+  }
+  out[j] = 0;
+  return pos;
+}
+
+function play_proto_read_len_str(line: cstring, pos: int32, out: cstring, out_cap: int32) -> int32 {
+  if (line == 0 || out == 0 || out_cap <= 0) {
+    return pos;
+  }
+  var tok: uint8[64];
+  var next_pos: int32 = play_proto_next_token(line, pos, (cstring)((int64)(&(tok[0]))), 64);
+  var want: int32 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+  if (want < 0) {
+    want = 0;
+  }
+  pos = next_pos;
+  if ((uint8)(line[pos]) == (uint8)32) {
+    pos = pos + 1;
+  }
+  var i: int32 = 0;
+  var j: int32 = 0;
+  while (i < want && pos < 2048) {
+    var b: uint8 = (uint8)(line[pos]);
+    if (b == (uint8)0 || b == (uint8)10 || b == (uint8)13) {
+      break;
+    }
+    if (j + 1 < out_cap) {
+      out[j] = b;
+      j = j + 1;
+    }
+    pos = pos + 1;
+    i = i + 1;
+  }
+  out[j] = 0;
+  if ((uint8)(line[pos]) == (uint8)32) {
+    pos = pos + 1;
+  }
+  return pos;
+}

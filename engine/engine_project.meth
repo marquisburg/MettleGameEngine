@@ -1,0 +1,489 @@
+// Project root resolver: keeps the engine from assuming the current working
+// directory is the project. A "project" is a directory containing a
+// `project.mproj` file (any contents — its presence is the marker) OR the
+// directory the user explicitly opened.
+//
+// Resolution order (used by the editor at startup):
+//   1. --project <path>
+//   2. Walk up from cwd looking for project.mproj.
+//   3. Fall back to cwd.
+//
+// On disk a project.mproj is a tiny key=value file:
+//   name = My Game
+//   scene = scene.mscene
+//   assets = assets
+//
+// Unrecognised keys are silently ignored. All paths are project-relative.
+import "engine_explorer";
+import "engine_fs_win32";
+import "std/io";
+import "std/mem";
+
+extern function Project_Win32_GetCommandLineA() -> cstring = "GetCommandLineA";
+
+export struct ProjectInfo {
+  root: uint8[800];
+  name: uint8[128];
+  scene_path: uint8[260];
+  assets_subdir: uint8[260];
+  has_project_file: int32;
+  _pad: int32;
+}
+
+function proj_bytes() -> int64 {
+  return (int64)1472;
+}
+
+export function project_create() -> ProjectInfo* {
+  var raw: cstring = calloc((int64)1, proj_bytes());
+  if (raw == 0) {
+    return (ProjectInfo*)0;
+  }
+  return (ProjectInfo*)raw;
+}
+
+export function project_destroy(p: ProjectInfo*) {
+  if (p != 0) {
+    free((cstring)p);
+  }
+}
+
+export function project_root_ptr(p: ProjectInfo*) -> cstring {
+  if (p == 0) {
+    return (cstring)0;
+  }
+  return (cstring)((int64)(&(p->root[0])));
+}
+
+export function project_name_ptr(p: ProjectInfo*) -> cstring {
+  if (p == 0) {
+    return (cstring)0;
+  }
+  return (cstring)((int64)(&(p->name[0])));
+}
+
+export function project_scene_path_ptr(p: ProjectInfo*) -> cstring {
+  if (p == 0) {
+    return (cstring)0;
+  }
+  return (cstring)((int64)(&(p->scene_path[0])));
+}
+
+export function project_assets_subdir_ptr(p: ProjectInfo*) -> cstring {
+  if (p == 0) {
+    return (cstring)0;
+  }
+  return (cstring)((int64)(&(p->assets_subdir[0])));
+}
+
+export function project_has_file(p: ProjectInfo*) -> int32 {
+  if (p == 0) {
+    return 0;
+  }
+  return p->has_project_file;
+}
+
+function proj_copy_into(dst: cstring, cap: int32, src: cstring) {
+  if (dst == 0 || cap <= 0) {
+    return;
+  }
+  if (src == 0) {
+    dst[0] = 0;
+    return;
+  }
+  var i: int32 = 0;
+  while (i + 1 < cap) {
+    var b: uint8 = (uint8)(src[i]);
+    dst[i] = b;
+    if (b == (uint8)0) {
+      return;
+    }
+    i = i + 1;
+  }
+  dst[cap - 1] = 0;
+}
+
+function proj_defaults(p: ProjectInfo*) {
+  if (p == 0) {
+    return;
+  }
+  if (p->scene_path[0] == (uint8)0) {
+    proj_copy_into((cstring)((int64)(&(p->scene_path[0]))), 260, cstr("scene.mscene"));
+  }
+  if (p->assets_subdir[0] == (uint8)0) {
+    proj_copy_into((cstring)((int64)(&(p->assets_subdir[0]))), 260, cstr("."));
+  }
+  if (p->name[0] == (uint8)0) {
+    proj_copy_into((cstring)((int64)(&(p->name[0]))), 128, cstr("Untitled"));
+  }
+}
+
+function proj_file_exists(path: cstring) -> int32 {
+  if (path == 0) {
+    return 0;
+  }
+  var fp: cstring = fopen(path, cstr("rb"));
+  if (fp == 0) {
+    return 0;
+  }
+  fclose(fp);
+  return 1;
+}
+
+function proj_is_space(c: uint8) -> int32 {
+  if (c == (uint8)32 || c == (uint8)9 || c == (uint8)13 || c == (uint8)10) {
+    return 1;
+  }
+  return 0;
+}
+
+function proj_cmd_matches(cmd: cstring, pos: int32, needle: string) -> int32 {
+  var i: int32 = 0;
+  while (i < needle.length) {
+    if ((uint8)(cmd[pos + i]) != (uint8)(needle.chars[i])) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+function proj_trim_tail(buf: cstring, length: int32) -> int32 {
+  var n: int32 = length;
+  while (n > 0 && proj_is_space((uint8)(buf[n - 1])) != 0) {
+    n = n - 1;
+  }
+  buf[n] = 0;
+  return n;
+}
+
+function proj_skip_ws(line: cstring, pos: int32) -> int32 {
+  while (pos < 1024 && proj_is_space((uint8)(line[pos])) != 0) {
+    pos = pos + 1;
+  }
+  return pos;
+}
+
+// Parse a single `key = value` line. Writes value into dst.
+function proj_parse_kv(line: cstring, key: string, dst: cstring, dst_cap: int32) -> int32 {
+  if (line == 0) {
+    return 0;
+  }
+  var p: int32 = proj_skip_ws(line, 0);
+  var i: int32 = 0;
+  while (i < key.length) {
+    if ((uint8)(line[p + i]) != (uint8)(key.chars[i])) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  p = p + key.length;
+  p = proj_skip_ws(line, p);
+  if ((uint8)(line[p]) != (uint8)61) {
+    return 0;
+  }
+  p = p + 1;
+  p = proj_skip_ws(line, p);
+  var j: int32 = 0;
+  while (j + 1 < dst_cap) {
+    var b: uint8 = (uint8)(line[p + j]);
+    if (b == (uint8)0 || b == (uint8)10 || b == (uint8)13) {
+      break;
+    }
+    dst[j] = b;
+    j = j + 1;
+  }
+  dst[j] = 0;
+  proj_trim_tail(dst, j);
+  return 1;
+}
+
+function proj_join_root(root: cstring, child: cstring, out: cstring, out_cap: int32) {
+  if (out == 0 || out_cap <= 0) {
+    return;
+  }
+  out[0] = 0;
+  if (root == 0 || child == 0) {
+    return;
+  }
+  fs_path_join_child(out, out_cap, root, child);
+}
+
+// Try to load project.mproj from a given root. Returns 1 on success.
+function project_load_manifest(p: ProjectInfo*, root: cstring) -> int32 {
+  if (p == 0 || root == 0) {
+    return 0;
+  }
+  var path: uint8[1100];
+  proj_join_root(root, cstr("project.mproj"), (cstring)((int64)(&(path[0]))), 1100);
+  if (proj_file_exists((cstring)((int64)(&(path[0])))) == 0) {
+    return 0;
+  }
+  var fp: cstring = fopen((cstring)((int64)(&(path[0]))), cstr("r"));
+  if (fp == 0) {
+    return 0;
+  }
+  var line: uint8[1024];
+  while (fgets((cstring)((int64)(&(line[0]))), 1024, fp) != 0) {
+    var lc: cstring = (cstring)((int64)(&(line[0])));
+    if (proj_parse_kv(lc, "name", (cstring)((int64)(&(p->name[0]))), 128) != 0) {
+      continue;
+    }
+    if (proj_parse_kv(lc, "scene", (cstring)((int64)(&(p->scene_path[0]))), 260) != 0) {
+      continue;
+    }
+    proj_parse_kv(lc, "assets", (cstring)((int64)(&(p->assets_subdir[0]))), 260);
+  }
+  fclose(fp);
+  p->has_project_file = 1;
+  return 1;
+}
+
+export function project_set_name(p: ProjectInfo*, name: cstring) {
+  if (p == 0) {
+    return;
+  }
+  proj_copy_into((cstring)((int64)(&(p->name[0]))), 128, name);
+  if (p->name[0] == (uint8)0) {
+    proj_copy_into((cstring)((int64)(&(p->name[0]))), 128, cstr("Untitled"));
+  }
+}
+
+export function project_set_scene_path(p: ProjectInfo*, scene_path: cstring) {
+  if (p == 0) {
+    return;
+  }
+  proj_copy_into((cstring)((int64)(&(p->scene_path[0]))), 260, scene_path);
+  if (p->scene_path[0] == (uint8)0) {
+    proj_copy_into((cstring)((int64)(&(p->scene_path[0]))), 260, cstr("scene.mscene"));
+  }
+}
+
+export function project_set_assets_subdir(p: ProjectInfo*, assets_subdir: cstring) {
+  if (p == 0) {
+    return;
+  }
+  proj_copy_into((cstring)((int64)(&(p->assets_subdir[0]))), 260, assets_subdir);
+  if (p->assets_subdir[0] == (uint8)0) {
+    proj_copy_into((cstring)((int64)(&(p->assets_subdir[0]))), 260, cstr("."));
+  }
+}
+
+export function project_resolve_explicit(p: ProjectInfo*, root: cstring) -> int32 {
+  if (p == 0 || root == 0 || (uint8)(root[0]) == (uint8)0) {
+    return 0;
+  }
+  p->has_project_file = 0;
+  p->root[0] = 0;
+  p->name[0] = 0;
+  p->scene_path[0] = 0;
+  p->assets_subdir[0] = 0;
+  proj_copy_into((cstring)((int64)(&(p->root[0]))), 800, root);
+  project_load_manifest(p, (cstring)((int64)(&(p->root[0]))));
+  proj_defaults(p);
+  return 1;
+}
+
+// Walk parent directories looking for project.mproj. Returns 1 if one was
+// found, with p->root and other fields populated.
+function project_find_upwards(p: ProjectInfo*, start: cstring) -> int32 {
+  if (p == 0 || start == 0) {
+    return 0;
+  }
+  var probe: uint8[1024];
+  proj_copy_into((cstring)((int64)(&(probe[0]))), 1024, start);
+  var guard: int32 = 0;
+  while (guard < 32) {
+    var marker: uint8[1100];
+    proj_join_root((cstring)((int64)(&(probe[0]))), cstr("project.mproj"), (cstring)((int64)(&(marker[0]))), 1100);
+    if (proj_file_exists((cstring)((int64)(&(marker[0])))) != 0) {
+      proj_copy_into((cstring)((int64)(&(p->root[0]))), 800, (cstring)((int64)(&(probe[0]))));
+      project_load_manifest(p, (cstring)((int64)(&(p->root[0]))));
+      return 1;
+    }
+    var prev: uint8[1024];
+    proj_copy_into((cstring)((int64)(&(prev[0]))), 1024, (cstring)((int64)(&(probe[0]))));
+    fs_path_parent_inplace((cstring)((int64)(&(probe[0]))));
+    if ((uint8)(probe[0]) == (uint8)0) {
+      return 0;
+    }
+    // No change means we reached the drive root.
+    var i: int32 = 0;
+    var same: int32 = 1;
+    while (i < 1024) {
+      if ((uint8)(probe[i]) != (uint8)(prev[i])) {
+        same = 0;
+        break;
+      }
+      if ((uint8)(probe[i]) == (uint8)0) {
+        break;
+      }
+      i = i + 1;
+    }
+    if (same != 0) {
+      return 0;
+    }
+    guard = guard + 1;
+  }
+  return 0;
+}
+
+// Top-level resolver. Tries the in-tree marker walk first, then falls back to
+// the supplied cwd. Defaults the scene/assets fields if no project.mproj.
+export function project_resolve(p: ProjectInfo*, cwd: cstring) -> int32 {
+  if (p == 0 || cwd == 0) {
+    return 0;
+  }
+  p->has_project_file = 0;
+  p->root[0] = 0;
+  p->name[0] = 0;
+  p->scene_path[0] = 0;
+  p->assets_subdir[0] = 0;
+  if (project_find_upwards(p, cwd) == 0) {
+    proj_copy_into((cstring)((int64)(&(p->root[0]))), 800, cwd);
+  }
+  proj_defaults(p);
+  return 1;
+}
+
+// Absolute directory containing the running .exe (no trailing slash). Returns
+// 1 on success. Used so project resolution doesn't depend on the cwd, which
+// VS Code / IDE launchers set inconsistently.
+export function project_exe_dir(out: cstring, out_cap: int32) -> int32 {
+  if (out == 0 || out_cap <= 0) {
+    return 0;
+  }
+  out[0] = 0;
+  var got: uint32 = Win32_GetModuleFileNameA((int64)0, out, (uint32)(out_cap - 1));
+  if (got == (uint32)0) {
+    return 0;
+  }
+  out[(int32)got] = 0;
+  // Strip the trailing "\engine_editor.exe" component, leaving the directory.
+  fs_path_parent_inplace(out);
+  if ((uint8)(out[0]) == (uint8)0) {
+    return 0;
+  }
+  return 1;
+}
+
+// Preferred top-level resolver for GUI executables. Anchors to the exe's
+// directory (deterministic) and walks up for project.mproj from there; only
+// falls back to cwd if that fails. This fixes saves landing in different
+// scene files depending on how the editor was launched.
+export function project_resolve_from_exe(p: ProjectInfo*, cwd: cstring) -> int32 {
+  if (p == 0) {
+    return 0;
+  }
+  p->has_project_file = 0;
+  p->root[0] = 0;
+  p->name[0] = 0;
+  p->scene_path[0] = 0;
+  p->assets_subdir[0] = 0;
+  var exe_dir: uint8[1024];
+  exe_dir[0] = 0;
+  if (project_exe_dir((cstring)((int64)(&(exe_dir[0]))), 1024) != 0) {
+    if (project_find_upwards(p, (cstring)((int64)(&(exe_dir[0])))) != 0) {
+      proj_defaults(p);
+      return 1;
+    }
+    // No marker found upward from the exe: use the exe dir itself as root so
+    // the scene path is stable regardless of cwd.
+    proj_copy_into((cstring)((int64)(&(p->root[0]))), 800, (cstring)((int64)(&(exe_dir[0]))));
+    proj_defaults(p);
+    return 1;
+  }
+  // Last resort: old cwd-based behaviour.
+  if (cwd != 0 && project_find_upwards(p, cwd) == 0) {
+    proj_copy_into((cstring)((int64)(&(p->root[0]))), 800, cwd);
+  }
+  proj_defaults(p);
+  return 1;
+}
+
+export function project_arg_path(out: cstring, out_cap: int32) -> int32 {
+  if (out == 0 || out_cap <= 0) {
+    return 0;
+  }
+  out[0] = 0;
+  var cmd: cstring = Project_Win32_GetCommandLineA();
+  if (cmd == 0) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < 4096 && (uint8)(cmd[i]) != (uint8)0) {
+    if (proj_cmd_matches(cmd, i, "--project") != 0) {
+      i = i + 9;
+      while (i < 4096 && proj_is_space((uint8)(cmd[i])) != 0) {
+        i = i + 1;
+      }
+      var quote: uint8 = 0;
+      if ((uint8)(cmd[i]) == (uint8)34) {
+        quote = 34;
+        i = i + 1;
+      }
+      var j: int32 = 0;
+      while (j + 1 < out_cap && i < 4096) {
+        var b: uint8 = (uint8)(cmd[i]);
+        if (b == (uint8)0) {
+          break;
+        }
+        if (quote != 0) {
+          if (b == quote) {
+            break;
+          }
+        } else {
+          if (proj_is_space(b) != 0) {
+            break;
+          }
+        }
+        out[j] = b;
+        j = j + 1;
+        i = i + 1;
+      }
+      out[j] = 0;
+      if (j > 0) {
+        return 1;
+      }
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+function project_write_s(fp: cstring, label: string, value: cstring) {
+  fputs(label.chars, fp);
+  if (value != 0) {
+    fputs(value, fp);
+  }
+  fputs(cstr("\n"), fp);
+}
+
+export function project_save_manifest(p: ProjectInfo*) -> int32 {
+  if (p == 0 || p->root[0] == (uint8)0) {
+    return 0;
+  }
+  var path: uint8[1100];
+  proj_join_root((cstring)((int64)(&(p->root[0]))), cstr("project.mproj"), (cstring)((int64)(&(path[0]))), 1100);
+  var fp: cstring = fopen((cstring)((int64)(&(path[0]))), cstr("w"));
+  if (fp == 0) {
+    return 0;
+  }
+  project_write_s(fp, "name = ", (cstring)((int64)(&(p->name[0]))));
+  project_write_s(fp, "scene = ", (cstring)((int64)(&(p->scene_path[0]))));
+  project_write_s(fp, "assets = ", (cstring)((int64)(&(p->assets_subdir[0]))));
+  fclose(fp);
+  p->has_project_file = 1;
+  return 1;
+}
+
+// Absolute path to the scene file inside the project root. Stored on p so the
+// caller can pass the pointer to scene_io_save/load.
+export function project_resolve_scene_abs(p: ProjectInfo*, out: cstring, out_cap: int32) {
+  if (p == 0 || out == 0 || out_cap <= 0) {
+    return;
+  }
+  out[0] = 0;
+  fs_path_join_child(out, out_cap, project_root_ptr(p), project_scene_path_ptr(p));
+}

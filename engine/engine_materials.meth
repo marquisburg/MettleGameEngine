@@ -1,0 +1,149 @@
+// Texture/material resource records. The loader reads image headers today and
+// reserves explicit Vulkan image/view/sampler handles for the renderer upload
+// step, so game/editor code can depend on stable texture and material ids.
+import "std/io";
+import "std/mem";
+
+export struct TextureRecord {
+  vk_image: int64;
+  vk_view: int64;
+  vk_sampler: int64;
+  id: int32;
+  width: int32;
+  height: int32;
+  channels: int32;
+  upload_state: int32;
+  path: uint8[800];
+}
+
+export struct TextureStore {
+  rows: TextureRecord*;
+  cap: int32;
+  count: int32;
+  next_id: int32;
+  _pad: int32;
+}
+
+export struct MaterialRecord {
+  albedo_r: float64;
+  albedo_g: float64;
+  albedo_b: float64;
+  roughness: float64;
+  metallic: float64;
+  id: int32;
+  albedo_texture_id: int32;
+  normal_texture_id: int32;
+  _pad: int32;
+  name: uint8[64];
+}
+
+function tex_row_bytes() -> int64 { return (int64)864; }
+function tex_store_bytes() -> int64 { return (int64)64; }
+
+function tex_copy(dst: cstring, cap: int32, src: cstring) {
+  if (dst == 0 || cap <= 0) { return; }
+  if (src == 0) { dst[0] = 0; return; }
+  var i: int32 = 0;
+  while (i + 1 < cap) {
+    var b: uint8 = (uint8)(src[i]);
+    dst[i] = b;
+    if (b == (uint8)0) { return; }
+    i = i + 1;
+  }
+  dst[cap - 1] = 0;
+}
+
+export function texture_store_create(cap: int32) -> TextureStore* {
+  if (cap <= 0) { cap = 256; }
+  if (cap > 4096) { cap = 4096; }
+  var raw: cstring = calloc((int64)1, tex_store_bytes());
+  if (raw == 0) { return 0; }
+  var ts: TextureStore* = (TextureStore*)raw;
+  ts->cap = cap;
+  ts->next_id = 1;
+  var rows: cstring = calloc(tex_row_bytes(), (int64)cap);
+  if (rows == 0) {
+    free(raw);
+    return 0;
+  }
+  ts->rows = (TextureRecord*)rows;
+  return ts;
+}
+
+export function texture_store_destroy(ts: TextureStore*) {
+  if (ts == 0) { return; }
+  if (ts->rows != 0) {
+    free((cstring)ts->rows);
+    ts->rows = 0;
+  }
+  free((cstring)ts);
+}
+
+function texture_slot(ts: TextureStore*, i: int32) -> TextureRecord* {
+  if (ts == 0 || ts->rows == 0 || i < 0 || i >= ts->cap) {
+    return 0;
+  }
+  return (TextureRecord*)((cstring)((int64)ts->rows + (int64)i * tex_row_bytes()));
+}
+
+function tex_u32_le(h: uint8*, p: int32) -> int32 {
+  return (int32)h[p] + (int32)h[p + 1] * 256 + (int32)h[p + 2] * 65536 + (int32)h[p + 3] * 16777216;
+}
+
+function tex_u32_be(h: uint8*, p: int32) -> int32 {
+  return (int32)h[p + 3] + (int32)h[p + 2] * 256 + (int32)h[p + 1] * 65536 + (int32)h[p] * 16777216;
+}
+
+function texture_read_header(path: cstring, out_w: int32*, out_h: int32*, out_ch: int32*) -> int32 {
+  var fp: cstring = fopen(path, cstr("rb"));
+  if (fp == 0) { return 0; }
+  var h: uint8[64];
+  var n: int64 = fread((cstring)((int64)(&(h[0]))), (int64)1, (int64)64, fp);
+  fclose(fp);
+  if (n < (int64)24) { return 0; }
+  if (h[0] == (uint8)66 && h[1] == (uint8)77) {
+    out_w[0] = tex_u32_le(&(h[0]), 18);
+    out_h[0] = tex_u32_le(&(h[0]), 22);
+    out_ch[0] = 4;
+    return 1;
+  }
+  if (h[0] == (uint8)137 && h[1] == (uint8)80 && h[2] == (uint8)78 && h[3] == (uint8)71) {
+    out_w[0] = tex_u32_be(&(h[0]), 16);
+    out_h[0] = tex_u32_be(&(h[0]), 20);
+    out_ch[0] = 4;
+    return 1;
+  }
+  return 0;
+}
+
+export function texture_store_import_image(ts: TextureStore*, path: cstring) -> int32 {
+  if (ts == 0 || path == 0 || ts->count >= ts->cap) {
+    return 0;
+  }
+  var w: int32 = 0;
+  var h: int32 = 0;
+  var ch: int32 = 0;
+  if (texture_read_header(path, &w, &h, &ch) == 0) {
+    return 0;
+  }
+  var tr: TextureRecord* = texture_slot(ts, ts->count);
+  if (tr == 0) { return 0; }
+  memset((cstring)tr, 0, tex_row_bytes());
+  tr->id = ts->next_id;
+  tr->width = w;
+  tr->height = h;
+  tr->channels = ch;
+  tr->upload_state = 1;
+  tex_copy((cstring)((int64)(&(tr->path[0]))), 800, path);
+  ts->next_id = ts->next_id + 1;
+  ts->count = ts->count + 1;
+  return tr->id;
+}
+
+export function texture_record_bind_vk_handles(t: TextureRecord*, image: int64, view: int64, sampler: int64) {
+  if (t == 0) { return; }
+  t->vk_image = image;
+  t->vk_view = view;
+  t->vk_sampler = sampler;
+  t->upload_state = 2;
+}

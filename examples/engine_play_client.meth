@@ -1,0 +1,511 @@
+// Playtest client with render window.
+//
+// Entry: engine_play_client.exe --playtest <manifest>
+//
+// Connects to server, receives snapshot, runs LocalScripts, renders the
+// replicated Workspace, sends input, applies deltas.
+//
+// Reuses as much of the existing engine_viewport + game_gdi_win32 as possible
+// so the client window looks and feels like the editor viewport.
+import "../engine/engine_lua";
+import "../engine/engine_input";
+import "../engine/engine_mesh";
+import "../engine/engine_play_manifest";
+import "../engine/engine_play_protocol";
+import "../engine/engine_scene";
+import "../engine/engine_scene_io";
+import "../engine/engine_services";
+import "../engine/engine_services_io";
+import "../engine/engine_viewport";
+import "../engine/engine_vk_scene";
+import "../engine/engine_vulkan";
+import "../engine/game_gdi_win32";
+import "std/io";
+import "std/mem";
+import "std/net";
+import "std/thread";
+
+extern function ioctlsocket(s: int64, cmd: int32, argp: uint32*) -> int32 = "ioctlsocket";
+
+function client_log(s: string) {
+  fputs(s.chars, get_stdout());
+}
+
+function client_apply_entity_packet(sc: Scene*, meshes: MeshStore*, pkt: PlayPacket*) {
+  if (sc == 0 || pkt == 0) {
+    return;
+  }
+  var id: int32 = pkt->i0;
+  if (id <= 0) {
+    return;
+  }
+  var e: Entity* = scene_find(sc, id);
+  if (e == 0) {
+    var new_id: int32 = scene_add(sc, pkt->i1, (float64)pkt->i3 / 1000.0, (float64)pkt->i4 / 1000.0, (float64)pkt->i5 / 1000.0, 1.0);
+    e = scene_find(sc, new_id);
+    if (e != 0) {
+      e->id = id;
+      if (sc->next_id <= id) {
+        sc->next_id = id + 1;
+      }
+    }
+  }
+  if (e == 0) {
+    return;
+  }
+  e->kind = pkt->i1;
+  e->parent_id = pkt->i2;
+  e->pos_x = (float64)pkt->i3 / 1000.0;
+  e->pos_y = (float64)pkt->i4 / 1000.0;
+  e->pos_z = (float64)pkt->i5 / 1000.0;
+  e->rot_x = (float64)pkt->i6 / 1000000.0;
+  e->rot_y = (float64)pkt->i7 / 1000000.0;
+  e->rot_z = (float64)pkt->i8 / 1000000.0;
+  e->rot_w = (float64)pkt->i9 / 1000000.0;
+  scene_entity_normalize_rotation(e);
+  e->scale = (float64)pkt->i10 / 1000000.0;
+  if (e->scale <= 0.0) {
+    e->scale = 1.0;
+  }
+  scene_set_name(sc, id, (cstring)((int64)(&(pkt->s1[0]))));
+  if (pkt->i1 == SK_MESH() && pkt->s0[0] != (uint8)0) {
+    var mid: int32 = 0;
+    var half: float64 = e->half;
+    if (meshes != 0) {
+      mid = mesh_store_import_mesh(meshes, (cstring)((int64)(&(pkt->s0[0]))));
+      if (mid != 0) {
+        var mr: MeshRecord* = mesh_store_find(meshes, mid);
+        half = mesh_record_half(mr);
+      }
+    }
+    scene_set_mesh_ref(sc, id, mid, (cstring)((int64)(&(pkt->s0[0]))), half);
+  }
+}
+
+function client_process_snapshot_line(sc: Scene*, meshes: MeshStore*, line: cstring) -> int32 {
+  var pkt: PlayPacket;
+  var typ: int32 = play_decode_line(line, &pkt);
+  if (typ == PLAY_PKT_SCENE_BEGIN()) {
+    scene_clear(sc);
+    if (meshes != 0) {
+      mesh_store_clear(meshes);
+    }
+    return 0;
+  }
+  if (typ == PLAY_PKT_ENTITY()) {
+    client_apply_entity_packet(sc, meshes, &pkt);
+    return 0;
+  }
+  if (typ == PLAY_PKT_SCENE_END()) {
+    return 1;
+  }
+  return 0;
+}
+
+function client_apply_xform_packet(sc: Scene*, pkt: PlayPacket*) -> int32 {
+  if (sc == 0 || pkt == 0) {
+    return 0;
+  }
+  var id: int32 = pkt->i1;
+  if (id <= 0) {
+    return 0;
+  }
+  var e: Entity* = scene_find(sc, id);
+  if (e == 0) {
+    return 0;
+  }
+  e->pos_x = (float64)pkt->i2 / 1000.0;
+  e->pos_y = (float64)pkt->i3 / 1000.0;
+  e->pos_z = (float64)pkt->i4 / 1000.0;
+  e->rot_x = (float64)pkt->i5 / 1000000.0;
+  e->rot_y = (float64)pkt->i6 / 1000000.0;
+  e->rot_z = (float64)pkt->i7 / 1000000.0;
+  e->rot_w = (float64)pkt->i8 / 1000000.0;
+  scene_entity_normalize_rotation(e);
+  e->scale = (float64)pkt->i9 / 1000000.0;
+  if (e->scale <= 0.0) {
+    e->scale = 1.0;
+  }
+  return 1;
+}
+
+function client_process_runtime_line(sc: Scene*, meshes: MeshStore*, line: cstring, running: int32*) -> int32 {
+  var pkt: PlayPacket;
+  var typ: int32 = play_decode_line(line, &pkt);
+  if (typ == PLAY_PKT_XFORM()) {
+    return client_apply_xform_packet(sc, &pkt);
+  }
+  if (typ == PLAY_PKT_ENTITY()) {
+    client_apply_entity_packet(sc, meshes, &pkt);
+    return 1;
+  }
+  if (typ == PLAY_PKT_SCENE_BEGIN()) {
+    scene_clear(sc);
+    if (meshes != 0) {
+      mesh_store_clear(meshes);
+    }
+    return 1;
+  }
+  if (typ == PLAY_PKT_STOP()) {
+    if (running != 0) {
+      *running = 0;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+function client_process_runtime_bytes(sc: Scene*, meshes: MeshStore*, data: cstring, n: int32, line: cstring, line_len: int32*, running: int32*) -> int32 {
+  var changed: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    var b: uint8 = (uint8)(data[i]);
+    if (b == (uint8)10) {
+      line[*line_len] = 0;
+      if (client_process_runtime_line(sc, meshes, line, running) != 0) {
+        changed = 1;
+      }
+      *line_len = 0;
+    } else {
+      if (b != (uint8)13) {
+        if (*line_len + 1 < 2048) {
+          line[*line_len] = b;
+          *line_len = *line_len + 1;
+        } else {
+          *line_len = 0;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return changed;
+}
+
+function client_process_snapshot_bytes(sc: Scene*, meshes: MeshStore*, data: cstring, n: int32, line: cstring, line_len: int32*) -> int32 {
+  var i: int32 = 0;
+  while (i < n) {
+    var b: uint8 = (uint8)(data[i]);
+    if (b == (uint8)10) {
+      line[*line_len] = 0;
+      if (client_process_snapshot_line(sc, meshes, line) != 0) {
+        *line_len = 0;
+        return 1;
+      }
+      *line_len = 0;
+    } else {
+      if (b != (uint8)13) {
+        if (*line_len + 1 < 2048) {
+          line[*line_len] = b;
+          *line_len = *line_len + 1;
+        } else {
+          *line_len = 0;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+function client_recv_initial_snapshot(sock: int64, sc: Scene*, meshes: MeshStore*) -> int32 {
+  if (sc == 0) {
+    return 0;
+  }
+  var buf: uint8[4096];
+  var line: uint8[2048];
+  var line_len: int32 = 0;
+  var done: int32 = 0;
+  while (done == 0) {
+    var n: int32 = recv(sock, (cstring)((int64)(&(buf[0]))), 4096, 0);
+    if (n <= 0) {
+      return 0;
+    }
+    done = client_process_snapshot_bytes(sc, meshes, (cstring)((int64)(&(buf[0]))), n, (cstring)((int64)(&(line[0]))), &line_len);
+  }
+  return 1;
+}
+
+function client_send_input_snapshot(sock: int64, input: InputMap*, seq: int32) {
+  if (input == 0) {
+    return;
+  }
+  var buf: uint8[128];
+  var action: int32 = 0;
+  while (action < IA_COUNT()) {
+    var n: int32 = play_encode_input((cstring)((int64)(&(buf[0]))), 128, seq, action, input_action_held(input, action), input_action_pressed(input, action), input_action_released(input, action));
+    if (n > 0) {
+      send(sock, (cstring)((int64)(&(buf[0]))), n, 0);
+    }
+    action = action + 1;
+  }
+}
+
+export function main() -> int32 {
+  var mani: PlayManifest* = play_manifest_create();
+  if (mani == 0) {
+    return 1;
+  }
+  var mpath: uint8[800];
+  if (play_manifest_arg_path((cstring)((int64)(&(mpath[0]))), 800) == 0) {
+    mpath[0] = 46; mpath[1] = 92; mpath[2] = 46; mpath[3] = 109; mpath[4] = 101;
+    mpath[5] = 116; mpath[6] = 104; mpath[7] = 112; mpath[8] = 108; mpath[9] = 97;
+    mpath[10] = 121; mpath[11] = 92; mpath[12] = 112; mpath[13] = 108; mpath[14] = 97;
+    mpath[15] = 121; mpath[16] = 116; mpath[17] = 101; mpath[18] = 115; mpath[19] = 116;
+    mpath[20] = 46; mpath[21] = 109; mpath[22] = 97; mpath[23] = 110; mpath[24] = 105;
+    mpath[25] = 102; mpath[26] = 101; mpath[27] = 115; mpath[28] = 116; mpath[29] = 0;
+  }
+  if (play_manifest_load((cstring)((int64)(&(mpath[0]))), mani) == 0) {
+    play_manifest_destroy(mani);
+    return 2;
+  }
+
+  net_init();
+
+  var client_sock: int64 = socket_tcp();
+  if (client_sock == INVALID_SOCKET()) {
+    play_manifest_destroy(mani);
+    net_cleanup();
+    return 3;
+  }
+
+  var host: cstring = play_manifest_host(mani);
+  var port: int32 = play_manifest_port(mani);
+  var addr: cstring = sockaddr_in(host, port);
+  if (addr == 0) {
+    closesocket(client_sock);
+    play_manifest_destroy(mani);
+    net_cleanup();
+    return 4;
+  }
+
+  if (connect(client_sock, addr, 16) == SOCKET_ERROR()) {
+    free(addr);
+    closesocket(client_sock);
+    play_manifest_destroy(mani);
+    net_cleanup();
+    return 5;
+  }
+  free(addr);
+
+  var sc: Scene* = scene_create(4096);
+  if (sc == 0) {
+    closesocket(client_sock);
+    play_manifest_destroy(mani);
+    net_cleanup();
+    return 6;
+  }
+  var meshes: MeshStore* = mesh_store_create(128);
+  if (meshes == 0) {
+    scene_destroy(sc);
+    closesocket(client_sock);
+    play_manifest_destroy(mani);
+    net_cleanup();
+    return 13;
+  }
+
+  if (client_recv_initial_snapshot(client_sock, sc, meshes) == 0) {
+    mesh_store_destroy(meshes);
+    scene_destroy(sc);
+    closesocket(client_sock);
+    play_manifest_destroy(mani);
+    net_cleanup();
+    return 9;
+  }
+  var nb: uint32 = 1;
+  ioctlsocket(client_sock, (int32)-2147195266, &nb);
+
+  var sm: ServiceModel* = service_model_create(512);
+  if (sm == 0) {
+    mesh_store_destroy(meshes);
+    scene_destroy(sc);
+    closesocket(client_sock);
+    play_manifest_destroy(mani);
+    net_cleanup();
+    return 11;
+  }
+  // Load services snapshot (StarterPlayerScripts -> LOCAL, ReplicatedStorage
+  // -> MODULE). Same file the editor wrote and the server loaded; on local
+  // playtest both processes read the same .methplay/services.msvc.
+  var csvc_path: cstring = play_manifest_services_snapshot(mani);
+  if (csvc_path != 0 && (uint8)(csvc_path[0]) != (uint8)0) {
+    if (service_io_load(csvc_path, sm) != 0) {
+      client_log("services snapshot loaded\n");
+    }
+  }
+
+  var lua_vm: LuaScriptVm* = lua_vm_create_client(sc, sm);
+  if (lua_vm == 0) {
+    service_model_destroy(sm);
+    mesh_store_destroy(meshes);
+    scene_destroy(sc);
+    closesocket(client_sock);
+    play_manifest_destroy(mani);
+    net_cleanup();
+    return 7;
+  }
+
+  lua_vm_load_service_scripts(lua_vm, SVC_STARTER_PLAYER_SCRIPTS(), SCRIPT_ROLE_LOCAL());
+  lua_vm_load_service_scripts(lua_vm, SVC_REPLICATED_STORAGE(), SCRIPT_ROLE_MODULE());
+
+  // Create window using existing game_gdi_win32
+  var g: GameWin32* = game_win32_create(cstr("Playtest Client"), 1280, 720);
+  if (g == 0) {
+    lua_vm_destroy(lua_vm);
+    service_model_destroy(sm);
+    mesh_store_destroy(meshes);
+    scene_destroy(sc);
+    closesocket(client_sock);
+    play_manifest_destroy(mani);
+    net_cleanup();
+    return 8;
+  }
+
+  var vp: EngineViewport* = engine_viewport_create(g);
+  if (vp == 0) {
+    game_win32_destroy(g);
+    lua_vm_destroy(lua_vm);
+    service_model_destroy(sm);
+    mesh_store_destroy(meshes);
+    scene_destroy(sc);
+    closesocket(client_sock);
+    play_manifest_destroy(mani);
+    net_cleanup();
+    return 12;
+  }
+  engine_viewport_sync_scene(vp, sc);
+
+  var input: InputMap* = input_map_create();
+  if (input == 0) {
+    engine_viewport_destroy(vp);
+    game_win32_destroy(g);
+    lua_vm_destroy(lua_vm);
+    service_model_destroy(sm);
+    mesh_store_destroy(meshes);
+    scene_destroy(sc);
+    closesocket(client_sock);
+    play_manifest_destroy(mani);
+    net_cleanup();
+    return 10;
+  }
+  lua_vm->input = input;
+
+  var vk_on: int32 = 0;
+  var vctx: VkContext* = 0;
+  var vbuf: VkSceneBuf* = 0;
+  var vchild: int64 = game_win32_create_child(g, 0, 0, g->width, g->height);
+  if (vchild != 0) {
+    vctx = vk_context_create_core();
+    if (vctx != 0) {
+      var okv: int32 = 1;
+      if (vk_context_create_surface_swapchain(vctx, g->hinstance, vchild, (uint32)g->width, (uint32)g->height) == 0) { okv = 0; }
+      if (okv != 0 && vk_context_create_render_infra(vctx) == 0) { okv = 0; }
+      if (okv != 0 && vk_context_create_pipeline(vctx) == 0) { okv = 0; }
+      if (okv != 0) {
+        vbuf = vk_scene_create();
+        if (vbuf != 0) {
+          vk_on = 1;
+        }
+      }
+      if (vk_on == 0) {
+        if (vbuf != 0) {
+          vk_scene_destroy(vbuf);
+          vbuf = 0;
+        }
+        vk_context_destroy_core(vctx);
+        vctx = 0;
+      }
+    }
+    if (vk_on == 0) {
+      game_win32_destroy_child(g);
+    }
+  }
+
+  var running: int32 = 1;
+  var frame: int32 = 0;
+  var runtime_time: float64 = 0.0;
+  var input_seq: int32 = 0;
+  var net_line: uint8[2048];
+  var net_line_len: int32 = 0;
+  while (game_win32_is_running(g) != 0 && running != 0) {
+    game_win32_poll_messages(g);
+    var frame_dt: float64 = game_win32_frame_delta_seconds(g);
+    if (frame_dt <= 0.0) {
+      frame_dt = 0.016;
+    }
+    input_map_update(input, g);
+
+    engine_viewport_input_tick(vp, sc, meshes, g, 0, 0, g->width, g->height);
+
+    client_send_input_snapshot(client_sock, input, input_seq);
+    input_seq = input_seq + 1;
+
+    // Drain authoritative scene deltas from the non-blocking socket.
+    // recv() returns -1 (0xFFFFFFFF) when there's nothing to read on a
+    // non-blocking socket. `n2 > 0` does NOT reject that (the int32 compares
+    // unsigned, so -1 looks like ~4 billion and the byte loop overruns the
+    // buffer — this was the playtest crash). Decode the result by its
+    // unsigned bit pattern and clamp positive counts to the buffer size.
+    var buf: uint8[4096];
+    var draining: int32 = 1;
+    while (draining != 0) {
+      var n2: int32 = recv(client_sock, (cstring)((int64)(&(buf[0]))), 4096, 0);
+      var n2u: uint32 = (uint32)n2;
+      if (n2u == (uint32)4294967295) {
+        // would-block / error: no data this frame.
+        draining = 0;
+      } else {
+        if (n2u == (uint32)0) {
+          running = 0;
+          draining = 0;
+        } else {
+          var got2: int32 = (int32)n2u;
+          if (got2 > 4096) {
+            got2 = 4096;
+          }
+          client_process_runtime_bytes(sc, meshes, (cstring)((int64)(&(buf[0]))), got2, (cstring)((int64)(&(net_line[0]))), &net_line_len, &running);
+        }
+      }
+    }
+
+    runtime_time = runtime_time + frame_dt;
+    lua_vm_tick(lua_vm, frame_dt, runtime_time);
+
+    if (vk_on != 0) {
+      var resized: int32 = game_win32_move_child(g, 0, 0, g->width, g->height);
+      if (resized != 0) {
+        vk_recreate_swapchain(vctx, (uint32)g->width, (uint32)g->height);
+      }
+      var aspect: float64 = 1.0;
+      if (g->height > 0) {
+        aspect = (float64)g->width / (float64)g->height;
+      }
+      vk_scene_build(vbuf, sc, vp, meshes);
+      vk_scene_build_mvp(vbuf, vp, aspect);
+      vk_scene_present(vctx, vbuf);
+    } else {
+      engine_viewport_render(vp, sc, g, 0, 0, g->width, g->height);
+      game_win32_present(g);
+    }
+    frame = frame + 1;
+    game_win32_tick_seconds(g);
+    thread_sleep_ms((uint32)8);
+  }
+
+  // cleanup
+  if (vk_on != 0) {
+    vk_scene_destroy(vbuf);
+    vk_context_destroy_core(vctx);
+    game_win32_destroy_child(g);
+  }
+  input_map_destroy(input);
+  engine_viewport_destroy(vp);
+  game_win32_destroy(g);
+  lua_vm_destroy(lua_vm);
+  service_model_destroy(sm);
+  mesh_store_destroy(meshes);
+  scene_destroy(sc);
+  closesocket(client_sock);
+  play_manifest_destroy(mani);
+  net_cleanup();
+  return 0;
+}

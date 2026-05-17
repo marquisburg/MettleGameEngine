@@ -1,0 +1,396 @@
+// Methlang engine editor shell: explorer (left) + flat asset registry (right) +
+// viewport placeholder. Windows + internal linker only.
+//
+// From repo root:
+//   .\build_engine_editor.bat
+//   .\bin\methlang.exe --build --emit-obj --linker internal examples\engine_editor.meth -o examples\engine_editor.exe
+//
+// From bin:
+//   .\methlang.exe --build --emit-obj --linker internal ..\examples\engine_editor.meth -o ..\examples\engine_editor.exe
+
+import "../engine/engine_assets";
+import "../engine/engine_editor_ui";
+import "../engine/engine_explorer";
+import "../engine/engine_fs_win32";
+import "../engine/engine_input";
+import "../engine/engine_lua";
+import "../engine/engine_materials";
+import "../engine/engine_mesh";
+import "../engine/engine_output_log";
+import "../engine/engine_play_manifest";
+import "../engine/engine_process_win32";
+import "../engine/engine_project";
+import "../engine/engine_runtime";
+import "../engine/engine_scene";
+import "../engine/engine_scene_io";
+import "../engine/engine_services";
+import "../engine/engine_services_io";
+import "../engine/engine_viewport";
+import "../engine/engine_vk_scene";
+import "../engine/engine_vulkan";
+import "../engine/game_gdi_win32";
+import "std/io";
+import "std/process";
+import "std/win32";
+
+extern function Win32_CreateDirectoryA(path: cstring, security_attributes: cstring) -> int32 = "CreateDirectoryA";
+
+// Editor viewport rect (where the 3D view lives), derived from window size.
+function ed_vp_x(g: GameWin32*) -> int32 { return EDITOR_PANEL_W() + EDITOR_ASSET_W() + (int32)12; }
+function ed_vp_y(g: GameWin32*) -> int32 { return EDITOR_BODY_TOP(); }
+function ed_vp_w(g: GameWin32*) -> int32 {
+  var w: int32 = g->width - EDITOR_PANEL_W() - EDITOR_ASSET_W() - EDITOR_INSPECTOR_W() - (int32)20;
+  if (w < 1) { w = 1; }
+  return w;
+}
+function ed_vp_h(g: GameWin32*) -> int32 {
+  // Leave room for the Output panel along the bottom so the Vulkan child
+  // window doesn't draw over it (must match editor_viewport_region's bottom).
+  var h: int32 = g->height - EDITOR_BODY_TOP() - EDITOR_OUTPUT_H();
+  if (h < 1) { h = 1; }
+  return h;
+}
+
+function editor_start_playtest(sv: PlaytestSupervisor*, proj: ProjectInfo*, sc: Scene*) -> int32 {
+  if (sv == 0 || proj == 0 || sc == 0) {
+    return 0;
+  }
+  var play_dir: uint8[1024];
+  var manifest_path: uint8[1024];
+  var scene_snapshot: uint8[1024];
+  var services_snapshot: uint8[1024];
+  var server_log: uint8[1024];
+  var client_log: uint8[1024];
+
+  fs_path_join_child((cstring)((int64)(&(play_dir[0]))), 1024, project_root_ptr(proj), cstr(".methplay"));
+  Win32_CreateDirectoryA((cstring)((int64)(&(play_dir[0]))), (cstring)0);
+  fs_path_join_child((cstring)((int64)(&(manifest_path[0]))), 1024, (cstring)((int64)(&(play_dir[0]))), cstr("playtest.manifest"));
+  fs_path_join_child((cstring)((int64)(&(scene_snapshot[0]))), 1024, (cstring)((int64)(&(play_dir[0]))), cstr("scene.mscene"));
+  fs_path_join_child((cstring)((int64)(&(services_snapshot[0]))), 1024, (cstring)((int64)(&(play_dir[0]))), cstr("services.msvc"));
+  fs_path_join_child((cstring)((int64)(&(server_log[0]))), 1024, (cstring)((int64)(&(play_dir[0]))), cstr("server.log"));
+  fs_path_join_child((cstring)((int64)(&(client_log[0]))), 1024, (cstring)((int64)(&(play_dir[0]))), cstr("client.log"));
+
+  if (scene_io_save((cstring)((int64)(&(scene_snapshot[0]))), sc) == 0) {
+    return 0;
+  }
+
+  // Scan the project's convention folders (ServerScriptService /
+  // StarterPlayerScripts / ReplicatedStorage) and write services.msvc next to
+  // the scene snapshot. Without this the on-disk service scripts are never
+  // registered and the playtest server/client tick nothing.
+  var sm: ServiceModel* = service_model_create(1024);
+  if (sm != 0) {
+    service_io_build_from_project(sm, project_root_ptr(proj), (cstring)((int64)(&(services_snapshot[0]))));
+    service_model_destroy(sm);
+  }
+
+  var mani: PlayManifest* = play_manifest_create();
+  if (mani == 0) {
+    return 0;
+  }
+  play_manifest_set_session(mani, 1, 39555, 60);
+  play_manifest_set_paths(mani, project_root_ptr(proj), (cstring)((int64)(&(scene_snapshot[0]))), (cstring)((int64)(&(services_snapshot[0]))), (cstring)((int64)(&(server_log[0]))), (cstring)((int64)(&(client_log[0]))));
+  var ok: int32 = play_manifest_save((cstring)((int64)(&(manifest_path[0]))), mani);
+  play_manifest_destroy(mani);
+  if (ok == 0) {
+    return 0;
+  }
+  return playtest_start(sv, (cstring)((int64)(&(manifest_path[0]))), cstr("examples\\engine_play_server.exe"), cstr("examples\\engine_play_client.exe"));
+}
+
+function main() -> int32 {
+  var es: ExplorerState* = explorer_create(768);
+  if (es == 0) {
+    return 2;
+  }
+  var cw: uint8[768];
+  cw[0] = 0;
+  var got_cd: uint32 = Win32_GetCurrentDirectoryA((uint32)767, (cstring)((int64)(&(cw[0]))));
+  if (got_cd == (uint32)0) {
+    cw[0] = 46;
+    cw[1] = 0;
+  }
+  var proj: ProjectInfo* = project_create();
+  if (proj == 0) {
+    explorer_destroy(es);
+    return 11;
+  }
+  var project_arg: uint8[768];
+  project_arg[0] = 0;
+  if (project_arg_path((cstring)((int64)(&(project_arg[0]))), 768) != 0) {
+    project_resolve_explicit(proj, (cstring)((int64)(&(project_arg[0]))));
+  } else {
+    // Anchor to the .exe directory, not the cwd. VS Code / IDE launchers set
+    // the cwd inconsistently, which made the editor pick different
+    // project.mproj files (and thus different scene files) between runs —
+    // saves appeared to "not work" because the next launch loaded a
+    // different scene.
+    project_resolve_from_exe(proj, (cstring)((int64)(&(cw[0]))));
+  }
+  explorer_set_cwd_cstr(es, project_root_ptr(proj));
+  explorer_set_project_root(es, project_root_ptr(proj));
+  var am: AssetManager* = asset_manager_create(8192);
+  if (am == 0) {
+    project_destroy(proj);
+    explorer_destroy(es);
+    return 3;
+  }
+  asset_manager_set_project_root(am, project_root_ptr(proj));
+  var g: GameWin32* = game_win32_create(cstr("Meth Engine"), (int32)1360, (int32)720);
+  if (g == 0) {
+    asset_manager_destroy(am);
+    project_destroy(proj);
+    explorer_destroy(es);
+    return 4;
+  }
+  game_win32_clear_rgba_pixels(g->pixels, g->width * g->height, swizzle_bgra8((uint8)18, (uint8)20, (uint8)24, (uint8)255));
+  game_win32_present(g);
+  game_win32_poll_messages(g);
+  var vp: EngineViewport* = engine_viewport_create(g);
+  if (vp == 0) {
+    game_win32_destroy(g);
+    asset_manager_destroy(am);
+    project_destroy(proj);
+    explorer_destroy(es);
+    return 5;
+  }
+  var ui: EditorUiState* = editor_ui_create();
+  if (ui == 0) {
+    engine_viewport_destroy(vp);
+    game_win32_destroy(g);
+    asset_manager_destroy(am);
+    project_destroy(proj);
+    explorer_destroy(es);
+    return 6;
+  }
+  var meshes: MeshStore* = mesh_store_create(128);
+  if (meshes == 0) {
+    editor_ui_destroy(ui);
+    engine_viewport_destroy(vp);
+    game_win32_destroy(g);
+    asset_manager_destroy(am);
+    project_destroy(proj);
+    explorer_destroy(es);
+    return 7;
+  }
+  var sc: Scene* = scene_create(512);
+  if (sc == 0) {
+    mesh_store_destroy(meshes);
+    editor_ui_destroy(ui);
+    engine_viewport_destroy(vp);
+    game_win32_destroy(g);
+    asset_manager_destroy(am);
+    project_destroy(proj);
+    explorer_destroy(es);
+    return 8;
+  }
+  var input: InputMap* = input_map_create();
+  if (input == 0) {
+    scene_destroy(sc);
+    mesh_store_destroy(meshes);
+    editor_ui_destroy(ui);
+    engine_viewport_destroy(vp);
+    game_win32_destroy(g);
+    asset_manager_destroy(am);
+    project_destroy(proj);
+    explorer_destroy(es);
+    return 9;
+  }
+  var rt: RuntimeState* = runtime_create(512);
+  if (rt == 0) {
+    input_map_destroy(input);
+    scene_destroy(sc);
+    mesh_store_destroy(meshes);
+    editor_ui_destroy(ui);
+    engine_viewport_destroy(vp);
+    game_win32_destroy(g);
+    asset_manager_destroy(am);
+    project_destroy(proj);
+    explorer_destroy(es);
+    return 10;
+  }
+  output_log_init();
+  output_log_info(cstr("Engine editor started"));
+  var lua_reg: LuaScriptRegistry* = lua_registry_create(256);
+  if (lua_reg == 0) {
+    runtime_destroy(rt);
+    input_map_destroy(input);
+    scene_destroy(sc);
+    mesh_store_destroy(meshes);
+    editor_ui_destroy(ui);
+    engine_viewport_destroy(vp);
+    game_win32_destroy(g);
+    asset_manager_destroy(am);
+    project_destroy(proj);
+    explorer_destroy(es);
+    return 12;
+  }
+  runtime_set_lua_registry(rt, lua_reg);
+  var play_sv: PlaytestSupervisor* = playtest_supervisor_create();
+  if (play_sv == 0) {
+    lua_registry_destroy(lua_reg);
+    runtime_destroy(rt);
+    input_map_destroy(input);
+    scene_destroy(sc);
+    mesh_store_destroy(meshes);
+    editor_ui_destroy(ui);
+    engine_viewport_destroy(vp);
+    game_win32_destroy(g);
+    asset_manager_destroy(am);
+    project_destroy(proj);
+    explorer_destroy(es);
+    return 13;
+  }
+  var scene_abs: uint8[1024];
+  project_resolve_scene_abs(proj, (cstring)((int64)(&(scene_abs[0]))), 1024);
+  editor_ui_set_scene_path(ui, (cstring)((int64)(&(scene_abs[0]))));
+  var loaded_scene: int32 = scene_io_load(editor_ui_default_scene_path(ui, es), sc, meshes);
+  if (loaded_scene == 0) {
+    scene_seed_default(sc);
+  }
+  engine_viewport_sync_scene(vp, sc);
+  explorer_refresh(es);
+  asset_registry_rebuild(am);
+  if (loaded_scene != 0) {
+    engine_viewport_frame_selection(vp, sc);
+  }
+
+  // Vulkan 3D viewport: a child window over the viewport rect, GPU-rendered.
+  // If any step fails, vk_on stays 0 and the editor falls back to the CPU
+  // wireframe (engine_viewport_render) drawn into the DIB.
+  var vk_on: int32 = 0;
+  var vctx: VkContext* = 0;
+  var vbuf: VkSceneBuf* = 0;
+  var vchild: int64 = game_win32_create_child(g, ed_vp_x(g), ed_vp_y(g), ed_vp_w(g), ed_vp_h(g));
+  if (vchild != 0) {
+    vctx = vk_context_create_core();
+    if (vctx != 0) {
+      var okv: int32 = 1;
+      if (vk_context_create_surface_swapchain(vctx, g->hinstance, vchild, (uint32)ed_vp_w(g), (uint32)ed_vp_h(g)) == 0) { okv = 0; }
+      if (okv != 0 && vk_context_create_render_infra(vctx) == 0) { okv = 0; }
+      if (okv != 0 && vk_context_create_pipeline(vctx) == 0) { okv = 0; }
+      if (okv != 0) {
+        vbuf = vk_scene_create();
+        if (vbuf != 0) {
+          vk_on = 1;
+        }
+      }
+      if (vk_on == 0) {
+        vk_context_destroy_core(vctx);
+        vctx = 0;
+      }
+    }
+    if (vk_on == 0) {
+      game_win32_destroy_child(g);
+    }
+  }
+
+  var frame: int32 = 0;
+  var dirty: int32 = 1;
+  var last_log_count: int32 = 0;
+  while (game_win32_is_running(g) != 0) {
+    game_win32_poll_messages(g);
+    input_map_update(input, g);
+    var editor_active: int32 = game_win32_window_is_foreground(g);
+    var frame_dt: float64 = game_win32_frame_delta_seconds(g);
+    if (editor_active != 0 && input_action_pressed(input, IA_PLAY_TOGGLE()) != 0) {
+      if (playtest_is_active(play_sv) != 0) {
+        playtest_stop(play_sv);
+      } else {
+        editor_start_playtest(play_sv, proj, sc);
+      }
+      dirty = 1;
+    }
+    playtest_poll(play_sv);
+    // A resize rebuilt the DIB at a new size; the whole frame must be redrawn
+    // so the next BitBlt shows correct content (not a stretched stale buffer).
+    if (game_win32_consume_resized(g) != 0) {
+      dirty = 1;
+    }
+    if (frame > 2) {
+      if (editor_active != 0) {
+        if (editor_ui_input_tick(ui, g, proj, es, am, sc, meshes, vp, lua_reg) != 0) {
+          dirty = 1;
+        }
+        if (editor_ui_keyboard_captured(ui) == 0) {
+          if (editor_ui_project_files_focused(ui) != 0) {
+            explorer_input_tick(es);
+          } else {
+            explorer_reset_key_repeat(es);
+          }
+          if (engine_viewport_input_tick(vp, sc, meshes, g, ed_vp_x(g), ed_vp_y(g), ed_vp_w(g), ed_vp_h(g)) != 0) {
+            dirty = 1;
+          }
+        }
+      } else {
+        editor_ui_reset_input_edges(ui);
+        explorer_reset_key_repeat(es);
+        engine_viewport_reset_input_edges(vp);
+      }
+    }
+    // New runtime/Lua output arrived: redraw so the Output panel shows it
+    // even when there was no other input this frame.
+    var cur_log_count: int32 = output_log_count();
+    if (cur_log_count != last_log_count) {
+      last_log_count = cur_log_count;
+      dirty = 1;
+    }
+    if (frame > 2 && explorer_needs_refresh(es) != 0) {
+      explorer_refresh(es);
+      asset_registry_rebuild(am);
+      dirty = 1;
+    }
+    // The viewport animates while flying; keep re-rendering so motion is smooth.
+    // The double-buffered present (single BitBlt of the cached DIB, plus a
+    // WM_PAINT that re-blits on uncover/move) means this no longer flickers,
+    // but it is still the camera's animation pump.
+    if (frame > 2) {
+      dirty = 1;
+    }
+    if (dirty != 0) {
+      engine_editor_present(g, ui, proj, es, am, vp, sc, frame, vk_on, playtest_is_active(play_sv));
+      dirty = 0;
+    }
+    // Vulkan 3D viewport: track the child to the (possibly resized) viewport
+    // rect, then build + present the scene on the GPU. The child window covers
+    // the CPU viewport region, so the GDI panels/text around it stay visible.
+    if (vk_on != 0 && frame > 2) {
+      var vw: int32 = ed_vp_w(g);
+      var vh: int32 = ed_vp_h(g);
+      var resized: int32 = game_win32_move_child(g, ed_vp_x(g), ed_vp_y(g), vw, vh);
+      if (resized != 0) {
+        vk_recreate_swapchain(vctx, (uint32)vw, (uint32)vh);
+      }
+      var aspect: float64 = 1.0;
+      if (vh > 0) {
+        aspect = (float64)vw / (float64)vh;
+      }
+      vk_scene_build(vbuf, sc, vp, meshes);
+      vk_scene_build_mvp(vbuf, vp, aspect);
+      vk_scene_present(vctx, vbuf);
+    }
+    frame = frame + 1;
+    game_win32_tick_seconds(g);
+    win32_sleep_ms((uint32)8);
+  }
+  if (vk_on != 0) {
+    vk_scene_destroy(vbuf);
+    vk_context_destroy_core(vctx);
+    game_win32_destroy_child(g);
+  }
+  playtest_supervisor_destroy(play_sv);
+  scene_io_save(editor_ui_default_scene_path(ui, es), sc);
+  lua_registry_destroy(lua_reg);
+  output_log_destroy();
+  runtime_destroy(rt);
+  input_map_destroy(input);
+  scene_destroy(sc);
+  mesh_store_destroy(meshes);
+  asset_manager_destroy(am);
+  editor_ui_destroy(ui);
+  engine_viewport_destroy(vp);
+  explorer_destroy(es);
+  project_destroy(proj);
+  game_win32_destroy(g);
+  return 0;
+}

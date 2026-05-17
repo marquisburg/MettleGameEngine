@@ -1,0 +1,622 @@
+// Bridge: turn the editor Scene + camera pose into Vulkan line geometry and an
+// MVP matrix, then drive engine_vulkan's frame. engine_vulkan stays scene-
+// agnostic; this module is the only place that knows about both.
+//
+// Geometry matches the CPU wireframe (floor grid on y=0, origin axes, one wire
+// cube per entity). Vertices are interleaved float32: px,py,pz, r,g,b. Lines
+// are pairs of vertices (LINE_LIST). MVP is column-major (GLSL mat4), built to
+// match the CPU camera basis:
+//   forward = (sin yaw cos pitch, sin pitch, cos yaw cos pitch)
+//   right   = (cos yaw, 0, -sin yaw)
+import "engine_mesh";
+import "engine_scene";
+import "engine_viewport";
+import "engine_vulkan";
+import "std/io";
+import "std/mem";
+
+extern function sinf64(x: float64) -> float64 = "sin";
+extern function cosf64(x: float64) -> float64 = "cos";
+extern function tanf64(x: float64) -> float64 = "tan";
+extern function sqrtf64(x: float64) -> float64 = "sqrt";
+
+// Max line vertices we will emit. Buffer in engine_vulkan holds 10922; keep
+// well under. grid (21*2 lines *2) + axes + 12 edges * entities.
+function VK_SCENE_MAX_VERTS() -> int32 { return 50000; }
+
+export struct VkSceneBuf {
+  verts: float32*;
+  capacity: int32;
+  count: int32;
+  solid_count: int32;
+  line_count: int32;
+  mvp: float32[16];
+}
+
+function vksc_bytes() -> int64 { return (int64)160; }
+
+export function vk_scene_create() -> VkSceneBuf* {
+  var raw: cstring = calloc((int64)1, vksc_bytes());
+  if (raw == 0) {
+    return 0;
+  }
+  var s: VkSceneBuf* = (VkSceneBuf*)raw;
+  var cap: int32 = VK_SCENE_MAX_VERTS();
+  var blob: cstring = malloc((int64)cap * (int64)24);
+  if (blob == 0) {
+    free(raw);
+    return 0;
+  }
+  s->verts = (float32*)blob;
+  s->capacity = cap;
+  s->count = 0;
+  return s;
+}
+
+export function vk_scene_destroy(s: VkSceneBuf*) {
+  if (s == 0) {
+    return;
+  }
+  if (s->verts != 0) {
+    free((cstring)s->verts);
+    s->verts = 0;
+  }
+  free((cstring)s);
+}
+
+// Append one vertex (position + color) to the buffer.
+function vksc_vtx(s: VkSceneBuf*, x: float64, y: float64, z: float64, r: float64, g: float64, b: float64) {
+  if (s->count >= s->capacity) {
+    return;
+  }
+  var base: int64 = (int64)s->verts + (int64)s->count * (int64)24;
+  var p: float32* = (float32*)base;
+  p[0] = (float32)x;
+  p[1] = (float32)y;
+  p[2] = (float32)z;
+  p[3] = (float32)r;
+  p[4] = (float32)g;
+  p[5] = (float32)b;
+  s->count = s->count + 1;
+}
+
+function vksc_line(s: VkSceneBuf*, ax: float64, ay: float64, az: float64, bx: float64, by: float64, bz: float64, r: float64, g: float64, b: float64) {
+  vksc_vtx(s, ax, ay, az, r, g, b);
+  vksc_vtx(s, bx, by, bz, r, g, b);
+}
+
+function vksc_tri(s: VkSceneBuf*, ax: float64, ay: float64, az: float64, bx: float64, by: float64, bz: float64, cx: float64, cy: float64, cz: float64, r: float64, g: float64, b: float64) {
+  vksc_vtx(s, ax, ay, az, r, g, b);
+  vksc_vtx(s, bx, by, bz, r, g, b);
+  vksc_vtx(s, cx, cy, cz, r, g, b);
+}
+
+// One transformed cube corner (idx bits select +/- on each axis), applying the
+// entity's scale*half then rotation (roll Z -> pitch X -> yaw Y, the engine's
+// documented order, matching vksc_rot / vp_e_rot_vec_comp) then translation.
+// Roll was previously omitted, so the Z (roll) rotation ring did nothing.
+function vksc_corner(sc: Scene*, e: Entity*, idx: int32, axis: int32) -> float64 {
+  return scene_entity_corner(sc, e, idx, axis);
+}
+
+function vksc_cube_edge(s: VkSceneBuf*, sc: Scene*, e: Entity*, a: int32, b: int32, r: float64, g: float64, bl: float64) {
+  var ax: float64 = vksc_corner(sc, e, a, 0);
+  var ay: float64 = vksc_corner(sc, e, a, 1);
+  var az: float64 = vksc_corner(sc, e, a, 2);
+  var bx: float64 = vksc_corner(sc, e, b, 0);
+  var by: float64 = vksc_corner(sc, e, b, 1);
+  var bz: float64 = vksc_corner(sc, e, b, 2);
+  vksc_line(s, ax, ay, az, bx, by, bz, r, g, bl);
+}
+
+// Entity local->world rotated vector (roll Z, pitch X, yaw Y) -- mirrors the
+// CPU vp_e_rot_vec_comp so gizmo axes align with the picking/manip math.
+function vksc_rot(sc: Scene*, e: Entity*, sx: float64, sy: float64, sz: float64, comp: int32) -> float64 {
+  return scene_entity_world_rot_vec(sc, e, sx, sy, sz, comp);
+}
+
+function vksc_mesh_world(sc: Scene*, e: Entity*, x: float64, y: float64, z: float64, comp: int32) -> float64 {
+  return scene_entity_mesh_world(sc, e, x, y, z, comp);
+}
+
+function vksc_emit_mesh_triangles(s: VkSceneBuf*, sc: Scene*, e: Entity*, m: MeshRecord*, selected: int32) {
+  if (s == 0 || e == 0 || m == 0) {
+    return;
+  }
+  var tri_n: int32 = mesh_record_tri_count(m);
+  var t: int32 = 0;
+  while (t < tri_n) {
+    var ia: int32 = mesh_tri_index(m, t, 0);
+    var ib: int32 = mesh_tri_index(m, t, 1);
+    var ic: int32 = mesh_tri_index(m, t, 2);
+    var ax: float64 = vksc_mesh_world(sc, e, mesh_vx(m, ia), mesh_vy(m, ia), mesh_vz(m, ia), 0);
+    var ay: float64 = vksc_mesh_world(sc, e, mesh_vx(m, ia), mesh_vy(m, ia), mesh_vz(m, ia), 1);
+    var az: float64 = vksc_mesh_world(sc, e, mesh_vx(m, ia), mesh_vy(m, ia), mesh_vz(m, ia), 2);
+    var bx: float64 = vksc_mesh_world(sc, e, mesh_vx(m, ib), mesh_vy(m, ib), mesh_vz(m, ib), 0);
+    var by: float64 = vksc_mesh_world(sc, e, mesh_vx(m, ib), mesh_vy(m, ib), mesh_vz(m, ib), 1);
+    var bz: float64 = vksc_mesh_world(sc, e, mesh_vx(m, ib), mesh_vy(m, ib), mesh_vz(m, ib), 2);
+    var cx: float64 = vksc_mesh_world(sc, e, mesh_vx(m, ic), mesh_vy(m, ic), mesh_vz(m, ic), 0);
+    var cy: float64 = vksc_mesh_world(sc, e, mesh_vx(m, ic), mesh_vy(m, ic), mesh_vz(m, ic), 1);
+    var cz: float64 = vksc_mesh_world(sc, e, mesh_vx(m, ic), mesh_vy(m, ic), mesh_vz(m, ic), 2);
+    var ux: float64 = bx - ax;
+    var uy: float64 = by - ay;
+    var uz: float64 = bz - az;
+    var vx: float64 = cx - ax;
+    var vy: float64 = cy - ay;
+    var vz: float64 = cz - az;
+    var nx: float64 = uy * vz - uz * vy;
+    var ny: float64 = uz * vx - ux * vz;
+    var nz: float64 = ux * vy - uy * vx;
+    var nl: float64 = sqrtf64(nx * nx + ny * ny + nz * nz);
+    if (nl < 0.000001) { nl = 0.000001; }
+    nx = nx / nl;
+    ny = ny / nl;
+    nz = nz / nl;
+    var lx: float64 = -0.35;
+    var ly: float64 = 0.78;
+    var lz: float64 = -0.52;
+    var ld: float64 = nx * lx + ny * ly + nz * lz;
+    if (ld < 0.0) { ld = 0.0 - ld; }
+    var shade: float64 = 0.30 + ld * 0.70;
+    var r: float64 = 0.50 * shade;
+    var g: float64 = 0.67 * shade;
+    var b: float64 = 0.86 * shade;
+    if (selected != 0) {
+      r = 0.90 * shade;
+      g = 0.72 * shade;
+      b = 0.32 * shade;
+    }
+    vksc_tri(s, ax, ay, az, bx, by, bz, cx, cy, cz, r, g, b);
+    t = t + 1;
+  }
+}
+
+// World-space unit vector for local axis (1=X,2=Y,3=Z).
+function vksc_axis(sc: Scene*, e: Entity*, which: int32, comp: int32) -> float64 {
+  if (which == 1) { return vksc_rot(sc, e, 1.0, 0.0, 0.0, comp); }
+  if (which == 2) { return vksc_rot(sc, e, 0.0, 1.0, 0.0, comp); }
+  return vksc_rot(sc, e, 0.0, 0.0, 1.0, comp);
+}
+
+// Ring-plane basis U for rotation gizmo around local `ring_axis` (mirrors CPU).
+function vksc_ring_u(sc: Scene*, e: Entity*, ring_axis: int32, comp: int32) -> float64 {
+  var ax: float64 = vksc_axis(sc, e, ring_axis, 0);
+  var ay: float64 = vksc_axis(sc, e, ring_axis, 1);
+  var az: float64 = vksc_axis(sc, e, ring_axis, 2);
+  var wx: float64 = 0.0;
+  var wy: float64 = 1.0;
+  var wz: float64 = 0.0;
+  var adot: float64 = ax * wx + ay * wy + az * wz;
+  if (adot * adot > 0.81) {
+    wy = 0.0;
+    wz = 1.0;
+  }
+  var tx: float64 = wy * az - wz * ay;
+  var ty: float64 = wz * ax - wx * az;
+  var tz: float64 = wx * ay - wy * ax;
+  var tlen: float64 = sqrtf64(tx * tx + ty * ty + tz * tz);
+  if (tlen < 0.000001) { tlen = 0.000001; }
+  if (comp == 0) { return tx / tlen; }
+  if (comp == 1) { return ty / tlen; }
+  return tz / tlen;
+}
+
+function vksc_ring_v(sc: Scene*, e: Entity*, ring_axis: int32, comp: int32) -> float64 {
+  // V = axis x U (axis and U are unit & orthogonal).
+  var ax: float64 = vksc_axis(sc, e, ring_axis, 0);
+  var ay: float64 = vksc_axis(sc, e, ring_axis, 1);
+  var az: float64 = vksc_axis(sc, e, ring_axis, 2);
+  var ux: float64 = vksc_ring_u(sc, e, ring_axis, 0);
+  var uy: float64 = vksc_ring_u(sc, e, ring_axis, 1);
+  var uz: float64 = vksc_ring_u(sc, e, ring_axis, 2);
+  if (comp == 0) { return ay * uz - az * uy; }
+  if (comp == 1) { return az * ux - ax * uz; }
+  return ax * uy - ay * ux;
+}
+
+// World-aligned ring basis (must match vp_gizmo_ring_*_world in the viewport).
+// The rotate gizmo uses world axes so every ring responds regardless of the
+// entity's current rotation.
+function vksc_wring_axis(which: int32, comp: int32) -> float64 {
+  if (which == 1) {
+    if (comp == 0) { return 1.0; }
+    return 0.0;
+  }
+  if (which == 2) {
+    if (comp == 1) { return 1.0; }
+    return 0.0;
+  }
+  if (comp == 2) { return 1.0; }
+  return 0.0;
+}
+
+function vksc_wring_u(which: int32, comp: int32) -> float64 {
+  var ax: float64 = vksc_wring_axis(which, 0);
+  var ay: float64 = vksc_wring_axis(which, 1);
+  var az: float64 = vksc_wring_axis(which, 2);
+  var wx: float64 = 0.0;
+  var wy: float64 = 1.0;
+  var wz: float64 = 0.0;
+  var adot: float64 = ax * wx + ay * wy + az * wz;
+  if (adot * adot > 0.81) {
+    wy = 0.0;
+    wz = 1.0;
+  }
+  var tx: float64 = wy * az - wz * ay;
+  var ty: float64 = wz * ax - wx * az;
+  var tz: float64 = wx * ay - wy * ax;
+  var tlen: float64 = sqrtf64(tx * tx + ty * ty + tz * tz);
+  if (tlen < 0.000001) { tlen = 0.000001; }
+  if (comp == 0) { return tx / tlen; }
+  if (comp == 1) { return ty / tlen; }
+  return tz / tlen;
+}
+
+function vksc_wring_v(which: int32, comp: int32) -> float64 {
+  var ax: float64 = vksc_wring_axis(which, 0);
+  var ay: float64 = vksc_wring_axis(which, 1);
+  var az: float64 = vksc_wring_axis(which, 2);
+  var ux: float64 = vksc_wring_u(which, 0);
+  var uy: float64 = vksc_wring_u(which, 1);
+  var uz: float64 = vksc_wring_u(which, 2);
+  if (comp == 0) { return ay * uz - az * uy; }
+  if (comp == 1) { return az * ux - ax * uz; }
+  return ax * uy - ay * ux;
+}
+
+function vksc_gizmo_radius(sc: Scene*, e: Entity*, vp: EngineViewport*) -> float64 {
+  if (e == 0) {
+    return 1.0;
+  }
+  var d: float64 = 6.0;
+  if (vp != 0) {
+    var yaw: float64 = vp->cam_yaw;
+    var pitch: float64 = vp->cam_pitch;
+    var cy: float64 = cosf64(yaw);
+    var sy: float64 = sinf64(yaw);
+    var cp: float64 = cosf64(pitch);
+    var sp: float64 = sinf64(pitch);
+    var rx: float64 = scene_entity_world_pos(sc, e, 0) - vp->cam_x;
+    var ry: float64 = scene_entity_world_pos(sc, e, 1) - vp->cam_y;
+    var rz: float64 = scene_entity_world_pos(sc, e, 2) - vp->cam_z;
+    var z1: float64 = rx * sy + rz * cy;
+    d = ry * sp + z1 * cp;
+  }
+  if (d < 2.0) { d = 2.0; }
+  var r: float64 = d * 0.16;
+  var base: float64 = e->half * scene_entity_world_scale(sc, e);
+  var min_r: float64 = base * 0.75;
+  if (min_r < 0.55) { min_r = 0.55; }
+  if (r < min_r) { r = min_r; }
+  if (r > 8.0) { r = 8.0; }
+  return r;
+}
+
+function vksc_axis_color_comp(which: int32, hot: int32, comp: int32) -> float64 {
+  var r: float64 = 0.31;
+  var g: float64 = 0.31;
+  var b: float64 = 0.82;
+  if (which == 2) { r = 0.35; g = 0.78; b = 0.35; }
+  if (which == 3) { r = 0.31; g = 0.51; b = 0.86; }
+  if (hot != 0) {
+    r = r + 0.4; g = g + 0.4; b = b + 0.4;
+    if (r > 1.0) { r = 1.0; }
+    if (g > 1.0) { g = 1.0; }
+    if (b > 1.0) { b = 1.0; }
+  }
+  if (comp == 0) { return r; }
+  if (comp == 1) { return g; }
+  return b;
+}
+
+function vksc_handle_box(s: VkSceneBuf*, cx: float64, cy: float64, cz: float64, h: float64, r: float64, g: float64, b: float64) {
+  var x0: float64 = cx - h;
+  var x1: float64 = cx + h;
+  var y0: float64 = cy - h;
+  var y1: float64 = cy + h;
+  var z0: float64 = cz - h;
+  var z1: float64 = cz + h;
+  vksc_line(s, x0, y0, z0, x1, y0, z0, r, g, b);
+  vksc_line(s, x1, y0, z0, x1, y0, z1, r, g, b);
+  vksc_line(s, x1, y0, z1, x0, y0, z1, r, g, b);
+  vksc_line(s, x0, y0, z1, x0, y0, z0, r, g, b);
+  vksc_line(s, x0, y1, z0, x1, y1, z0, r, g, b);
+  vksc_line(s, x1, y1, z0, x1, y1, z1, r, g, b);
+  vksc_line(s, x1, y1, z1, x0, y1, z1, r, g, b);
+  vksc_line(s, x0, y1, z1, x0, y1, z0, r, g, b);
+  vksc_line(s, x0, y0, z0, x0, y1, z0, r, g, b);
+  vksc_line(s, x1, y0, z0, x1, y1, z0, r, g, b);
+  vksc_line(s, x1, y0, z1, x1, y1, z1, r, g, b);
+  vksc_line(s, x0, y0, z1, x0, y1, z1, r, g, b);
+}
+
+// Axis color (matches vp_gizmo_axis_col): X blue-ish, Y green, Z light-blue;
+// hot (active drag axis) brightens.
+function vksc_axis_rgb(s: VkSceneBuf*, ax: float64, ay: float64, az: float64, bx: float64, by: float64, bz: float64, which: int32, hot: int32) {
+  var r: float64 = 0.31;
+  var g: float64 = 0.31;
+  var b: float64 = 0.82;
+  if (which == 2) { r = 0.35; g = 0.78; b = 0.35; }
+  if (which == 3) { r = 0.31; g = 0.51; b = 0.86; }
+  if (hot != 0) {
+    r = r + 0.4; g = g + 0.4; b = b + 0.4;
+    if (r > 1.0) { r = 1.0; }
+    if (g > 1.0) { g = 1.0; }
+    if (b > 1.0) { b = 1.0; }
+  }
+  vksc_line(s, ax, ay, az, bx, by, bz, r, g, b);
+}
+
+// Emit the transform gizmo for the selected entity, matching the CPU drawer:
+// tool 1 = move (axis arrows), 3 = scale (axis bars), 2 = rotate (3 rings).
+function vksc_gizmo(s: VkSceneBuf*, sc: Scene*, e: Entity*, vp: EngineViewport*, tool: int32, manip_axis: int32, manip_drag: int32, hover_axis: int32) {
+  if (e == 0) {
+    return;
+  }
+  if (tool != 1 && tool != 2 && tool != 3) {
+    return;
+  }
+  var rad: float64 = vksc_gizmo_radius(sc, e, vp);
+  var ox: float64 = scene_entity_world_pos(sc, e, 0);
+  var oy: float64 = scene_entity_world_pos(sc, e, 1);
+  var oz: float64 = scene_entity_world_pos(sc, e, 2);
+  if (tool == 1) {
+    var a: int32 = 1;
+    while (a <= 3) {
+      var hot: int32 = 0;
+      if ((manip_drag != 0 && manip_axis == a) || hover_axis == a) { hot = 1; }
+      var dx: float64 = vksc_axis(sc, e, a, 0);
+      var dy: float64 = vksc_axis(sc, e, a, 1);
+      var dz: float64 = vksc_axis(sc, e, a, 2);
+      var ex: float64 = ox + dx * rad;
+      var ey: float64 = oy + dy * rad;
+      var ez: float64 = oz + dz * rad;
+      vksc_axis_rgb(s, ox, oy, oz, ex, ey, ez, a, hot);
+      // Arrowhead: two short back-swept segments along ring-U.
+      var rux: float64 = vksc_ring_u(sc, e, a, 0);
+      var ruy: float64 = vksc_ring_u(sc, e, a, 1);
+      var ruz: float64 = vksc_ring_u(sc, e, a, 2);
+      var ah: float64 = rad * 0.16;
+      var bk: float64 = rad * 0.2;
+      vksc_axis_rgb(s, ex, ey, ez, ex - dx * bk + rux * ah, ey - dy * bk + ruy * ah, ez - dz * bk + ruz * ah, a, hot);
+      vksc_axis_rgb(s, ex, ey, ez, ex - dx * bk - rux * ah, ey - dy * bk - ruy * ah, ez - dz * bk - ruz * ah, a, hot);
+      var hr: float64 = vksc_axis_color_comp(a, hot, 0);
+      var hg: float64 = vksc_axis_color_comp(a, hot, 1);
+      var hb: float64 = vksc_axis_color_comp(a, hot, 2);
+      var hs: float64 = rad * 0.045;
+      if (hot != 0) { hs = rad * 0.065; }
+      if (hs < 0.06) { hs = 0.06; }
+      vksc_handle_box(s, ex, ey, ez, hs, hr, hg, hb);
+      a = a + 1;
+    }
+    return;
+  }
+  if (tool == 3) {
+    var rs: float64 = rad * 0.78;
+    var a2: int32 = 1;
+    while (a2 <= 3) {
+      var hot2: int32 = 0;
+      if ((manip_drag != 0 && manip_axis == a2) || hover_axis == a2) { hot2 = 1; }
+      var dx2: float64 = vksc_axis(sc, e, a2, 0);
+      var dy2: float64 = vksc_axis(sc, e, a2, 1);
+      var dz2: float64 = vksc_axis(sc, e, a2, 2);
+      var sx: float64 = ox + dx2 * rs;
+      var sy: float64 = oy + dy2 * rs;
+      var sz: float64 = oz + dz2 * rs;
+      vksc_axis_rgb(s, ox, oy, oz, sx, sy, sz, a2, hot2);
+      var sr: float64 = vksc_axis_color_comp(a2, hot2, 0);
+      var sg: float64 = vksc_axis_color_comp(a2, hot2, 1);
+      var sb: float64 = vksc_axis_color_comp(a2, hot2, 2);
+      var sh: float64 = rad * 0.055;
+      if (hot2 != 0) { sh = rad * 0.075; }
+      if (sh < 0.07) { sh = 0.07; }
+      vksc_handle_box(s, sx, sy, sz, sh, sr, sg, sb);
+      a2 = a2 + 1;
+    }
+    return;
+  }
+  // tool == 2: three rotation rings.
+  var rr: float64 = rad * 0.92;
+  // 36 segments to match vp_gizmo_hit_rotate's seg_n (so the visible ring and
+  // the hit-test polyline coincide).
+  var seg: int32 = 36;
+  var a3: int32 = 1;
+  while (a3 <= 3) {
+    var hot3: int32 = 0;
+    if ((manip_drag != 0 && manip_axis == a3) || hover_axis == a3) { hot3 = 1; }
+    var ux: float64 = vksc_wring_u(a3, 0);
+    var uy: float64 = vksc_wring_u(a3, 1);
+    var uz: float64 = vksc_wring_u(a3, 2);
+    var vx: float64 = vksc_wring_v(a3, 0);
+    var vy: float64 = vksc_wring_v(a3, 1);
+    var vz: float64 = vksc_wring_v(a3, 2);
+    var px: float64 = ox + rr * ux;
+    var py: float64 = oy + rr * uy;
+    var pz: float64 = oz + rr * uz;
+    var k: int32 = 1;
+    while (k <= seg) {
+      var ang: float64 = (float64)k * 6.28318530717958647692 / (float64)seg;
+      var ca: float64 = cosf64(ang);
+      var sa: float64 = sinf64(ang);
+      var nx: float64 = ox + rr * (ca * ux + sa * vx);
+      var ny: float64 = oy + rr * (ca * uy + sa * vy);
+      var nz: float64 = oz + rr * (ca * uz + sa * vz);
+      vksc_axis_rgb(s, px, py, pz, nx, ny, nz, a3, hot3);
+      px = nx;
+      py = ny;
+      pz = nz;
+      k = k + 1;
+    }
+    a3 = a3 + 1;
+  }
+}
+
+// Rebuild the whole line list from the scene: floor grid, origin axes, a wire
+// cube per visible entity (selected = amber, hovered = light blue), and the
+// transform gizmo on the selected entity for the active tool.
+export function vk_scene_build(s: VkSceneBuf*, sc: Scene*, vp: EngineViewport*, meshes: MeshStore*) {
+  if (s == 0) {
+    return;
+  }
+  s->count = 0;
+  s->solid_count = 0;
+  s->line_count = 0;
+
+  if (sc != 0 && meshes != 0) {
+    var sel_solid: int32 = scene_selected_id(sc);
+    var sn: int32 = scene_count(sc);
+    var si: int32 = 0;
+    while (si < sn) {
+      var se: Entity* = scene_row(sc, si);
+      si = si + 1;
+      if (se == 0) { continue; }
+      if ((se->flags & SE_FLAG_HIDDEN()) != 0) { continue; }
+      if (se->kind == SK_MESH() && se->mesh_id != 0) {
+        var sm: MeshRecord* = mesh_store_find(meshes, se->mesh_id);
+        var is_sel: int32 = 0;
+        if (sel_solid != 0 && se->id == sel_solid) { is_sel = 1; }
+        vksc_emit_mesh_triangles(s, sc, se, sm, is_sel);
+      }
+    }
+  }
+  s->solid_count = s->count;
+
+  // Floor grid on y=0, span +/-20 step 2 (matches CPU renderer).
+  var span: int32 = 20;
+  var i: int32 = 0 - span;
+  while (i <= span) {
+    var f: float64 = (float64)i;
+    var sp: float64 = (float64)span;
+    vksc_line(s, f, 0.0, 0.0 - sp, f, 0.0, sp, 0.20, 0.24, 0.28);
+    vksc_line(s, 0.0 - sp, 0.0, f, sp, 0.0, f, 0.20, 0.24, 0.28);
+    i = i + 2;
+  }
+  // Origin axes (X red, Z blue).
+  vksc_line(s, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.82, 0.31, 0.31);
+  vksc_line(s, 0.0, 0.0, 0.0, 0.0, 0.0, 6.0, 0.31, 0.51, 0.86);
+
+  if (sc == 0) {
+    s->line_count = s->count - s->solid_count;
+    return;
+  }
+  var sel_id: int32 = scene_selected_id(sc);
+  var hov_id: int32 = scene_hover_id(sc);
+  var n: int32 = scene_count(sc);
+  var ei: int32 = 0;
+  while (ei < n) {
+    var e: Entity* = scene_row(sc, ei);
+    ei = ei + 1;
+    if (e == 0) {
+      continue;
+    }
+    if ((e->flags & SE_FLAG_HIDDEN()) != 0) {
+      continue;
+    }
+    var r: float64 = 0.34;
+    var g: float64 = 0.80;
+    var b: float64 = 1.0;
+    if (sel_id != 0 && e->id == sel_id) {
+      r = 1.0; g = 0.82; b = 0.37;
+    } else {
+      if (hov_id != 0 && e->id == hov_id) {
+        r = 0.70; g = 0.92; b = 1.0;
+      }
+    }
+    vksc_cube_edge(s, sc, e, 0, 1, r, g, b);
+    vksc_cube_edge(s, sc, e, 0, 2, r, g, b);
+    vksc_cube_edge(s, sc, e, 1, 3, r, g, b);
+    vksc_cube_edge(s, sc, e, 2, 3, r, g, b);
+    vksc_cube_edge(s, sc, e, 4, 5, r, g, b);
+    vksc_cube_edge(s, sc, e, 4, 6, r, g, b);
+    vksc_cube_edge(s, sc, e, 5, 7, r, g, b);
+    vksc_cube_edge(s, sc, e, 6, 7, r, g, b);
+    vksc_cube_edge(s, sc, e, 0, 4, r, g, b);
+    vksc_cube_edge(s, sc, e, 1, 5, r, g, b);
+    vksc_cube_edge(s, sc, e, 2, 6, r, g, b);
+    vksc_cube_edge(s, sc, e, 3, 7, r, g, b);
+  }
+
+  // Transform gizmo on the selected entity for the active tool (1 move, 2
+  // rotate, 3 scale). Mirrors the CPU vp_draw_transform_gizmo.
+  if (vp != 0 && sel_id != 0) {
+    var sel: Entity* = scene_find(sc, sel_id);
+    if (sel != 0) {
+      vksc_gizmo(s, sc, sel, vp, vp->active_tool, vp->manip_axis, vp->manip_dragging, vp->manip_hover_axis);
+    }
+  }
+  s->line_count = s->count - s->solid_count;
+}
+
+// Column-major MVP = perspective * view. View is built from the camera basis
+// (right, up, forward) and eye position, matching the CPU projection so the
+// Vulkan view agrees with picking/fly. aspect = width/height.
+export function vk_scene_build_mvp(s: VkSceneBuf*, vp: EngineViewport*, aspect: float64) {
+  if (s == 0 || vp == 0) {
+    return;
+  }
+  var yaw: float64 = vp->cam_yaw;
+  var pitch: float64 = vp->cam_pitch;
+  var cy: float64 = cosf64(yaw);
+  var sy: float64 = sinf64(yaw);
+  var cp: float64 = cosf64(pitch);
+  var sp: float64 = sinf64(pitch);
+  // Camera basis (same as CPU renderer).
+  var fx: float64 = sy * cp;
+  var fy: float64 = sp;
+  var fz: float64 = cy * cp;
+  var rx: float64 = cy;
+  var ry: float64 = 0.0;
+  var rz: float64 = 0.0 - sy;
+  // up = forward x right (left-handed-ish to match CPU y-up screen).
+  var ux: float64 = fy * rz - fz * ry;
+  var uy: float64 = fz * rx - fx * rz;
+  var uz: float64 = fx * ry - fy * rx;
+  var ex: float64 = vp->cam_x;
+  var ey: float64 = vp->cam_y;
+  var ez: float64 = vp->cam_z;
+  // View matrix (row vectors = basis, translation = -dot(basis, eye)).
+  var tx: float64 = 0.0 - (rx * ex + ry * ey + rz * ez);
+  var ty: float64 = 0.0 - (ux * ex + uy * ey + uz * ez);
+  var tz: float64 = 0.0 - (fx * ex + fy * ey + fz * ez);
+
+  // Perspective: 60deg vertical FOV, near 0.1, far 500.
+  var fovy: float64 = 1.0471975512;
+  var tn: float64 = tanf64(fovy * 0.5);
+  var f: float64 = 1.0 / tn;
+  var nearz: float64 = 0.1;
+  var farz: float64 = 500.0;
+  var a: float64 = f / aspect;
+  var b: float64 = f;
+  var c: float64 = farz / (farz - nearz);
+  var d: float64 = 0.0 - (farz * nearz) / (farz - nearz);
+
+  // M = P * V, column-major (m[col*4 + row]). Vulkan clip: y down, z [0,1];
+  // we negate the y row to flip into Vulkan's coordinate convention.
+  var m: float32* = (float32*)((int64)(&(s->mvp[0])));
+  m[0]  = (float32)(a * rx);
+  m[1]  = (float32)(0.0 - (b * ux));
+  m[2]  = (float32)(c * fx);
+  m[3]  = (float32)fx;
+  m[4]  = (float32)(a * ry);
+  m[5]  = (float32)(0.0 - (b * uy));
+  m[6]  = (float32)(c * fy);
+  m[7]  = (float32)fy;
+  m[8]  = (float32)(a * rz);
+  m[9]  = (float32)(0.0 - (b * uz));
+  m[10] = (float32)(c * fz);
+  m[11] = (float32)fz;
+  m[12] = (float32)(a * tx);
+  m[13] = (float32)(0.0 - (b * ty));
+  m[14] = (float32)(c * tz + d);
+  m[15] = (float32)tz;
+}
+
+// Upload the built geometry + draw one Vulkan frame with the built MVP.
+export function vk_scene_present(ctx: VkContext*, s: VkSceneBuf*) -> int32 {
+  if (ctx == 0 || s == 0) {
+    return 0;
+  }
+  vk_upload_vertices_split(ctx, s->verts, s->solid_count, s->line_count);
+  var mvp_ptr: float32* = (float32*)((int64)(&(s->mvp[0])));
+  return vk_draw_frame(ctx, mvp_ptr);
+}

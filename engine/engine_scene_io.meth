@@ -1,0 +1,328 @@
+// Scene save/load for the editor. Text format, versioned, line-oriented, and
+// intentionally easy to inspect:
+//   methscene 1
+//   selected <id>
+//   entity
+//   id <id>
+//   kind <kind>
+//   pos_mm <x> <y> <z>
+//   rot_q <x> <y> <z> <w>        (scaled by 1e6)
+//   rot_urad <yaw> <pitch> <roll> (legacy read-only import)
+//   scale_u <scale>
+//   half_u <half>
+//   parent <id>
+//   script <id> <enabled>
+//   mesh_path <absolute-or-project path>
+//   lua_script <project-relative-or-absolute .lua path>   (v3+)
+//   name <display name>
+//   end
+import "engine_mesh";
+import "engine_scene";
+import "std/conv";
+import "std/io";
+
+function sio_write_i64(fp: cstring, v: int64) {
+  var buf: uint8[32];
+  int_to_dec((cstring)((int64)(&(buf[0]))), v);
+  fputs((cstring)((int64)(&(buf[0]))), fp);
+}
+
+function sio_write_line_i64(fp: cstring, label: string, v: int64) {
+  fputs(label.chars, fp);
+  sio_write_i64(fp, v);
+  fputs(cstr("\n"), fp);
+}
+
+function sio_scaled(v: float64, scale: float64) -> int64 {
+  var out32: int32 = 0;
+  if (v >= 0.0) {
+    out32 = (int32)(v * scale + 0.5);
+  } else {
+    out32 = (int32)(v * scale - 0.5);
+  }
+  return (int64)out32;
+}
+
+function sio_unscaled(v: int64, scale: float64) -> float64 {
+  return (float64)v / scale;
+}
+
+function sio_legacy_sanitize_scaled(v: int64) -> int64 {
+  // Old builds cast negative float64 values directly to int64; the object
+  // backend produced INT32_MAX, launching saved objects kilometres away.
+  if (v >= (int64)2147000000) {
+    return (int64)0;
+  }
+  if (v <= (int64)-2147000000) {
+    return (int64)0;
+  }
+  return v;
+}
+
+function sio_starts(line: cstring, prefix: string) -> int32 {
+  if (line == 0) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < prefix.length) {
+    if ((uint8)(line[i]) != (uint8)(prefix.chars[i])) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+function sio_copy_tail(dst: cstring, dst_cap: int32, line: cstring, start: int32) {
+  if (dst == 0 || dst_cap <= 0) {
+    return;
+  }
+  var j: int32 = 0;
+  var p: int32 = start;
+  while (j + 1 < dst_cap) {
+    var b: uint8 = (uint8)(line[p]);
+    if (b == (uint8)0 || b == (uint8)13 || b == (uint8)10) {
+      break;
+    }
+    dst[j] = b;
+    j = j + 1;
+    p = p + 1;
+  }
+  dst[j] = 0;
+}
+
+function sio_space(c: uint8) -> int32 {
+  if (c == (uint8)32 || c == (uint8)9 || c == (uint8)13 || c == (uint8)10) {
+    return 1;
+  }
+  return 0;
+}
+
+function sio_next_token(line: cstring, pos: int32, out: cstring, out_cap: int32) -> int32 {
+  while (pos < 1024 && sio_space((uint8)(line[pos])) != 0) {
+    pos = pos + 1;
+  }
+  var j: int32 = 0;
+  while (pos < 1024 && j + 1 < out_cap) {
+    var b: uint8 = (uint8)(line[pos]);
+    if (b == (uint8)0 || sio_space(b) != 0) {
+      break;
+    }
+    out[j] = b;
+    j = j + 1;
+    pos = pos + 1;
+  }
+  out[j] = 0;
+  return pos;
+}
+
+function sio_parse_i64_after(line: cstring, prefix_len: int32) -> int64 {
+  return atol((cstring)((int64)line + (int64)prefix_len));
+}
+
+function sio_write_entity(fp: cstring, e: Entity*) {
+  if (fp == 0 || e == 0) {
+    return;
+  }
+  fputs(cstr("entity\n"), fp);
+  sio_write_line_i64(fp, "id ", (int64)e->id);
+  sio_write_line_i64(fp, "kind ", (int64)e->kind);
+  sio_write_line_i64(fp, "parent ", (int64)e->parent_id);
+  fputs(cstr("script "), fp);
+  sio_write_i64(fp, (int64)e->script_id);
+  fputs(cstr(" "), fp);
+  sio_write_i64(fp, (int64)e->script_enabled);
+  fputs(cstr("\n"), fp);
+  fputs(cstr("pos_mm "), fp);
+  sio_write_i64(fp, sio_scaled(e->pos_x, 1000.0));
+  fputs(cstr(" "), fp);
+  sio_write_i64(fp, sio_scaled(e->pos_y, 1000.0));
+  fputs(cstr(" "), fp);
+  sio_write_i64(fp, sio_scaled(e->pos_z, 1000.0));
+  fputs(cstr("\n"), fp);
+  fputs(cstr("rot_q "), fp);
+  sio_write_i64(fp, sio_scaled(e->rot_x, 1000000.0));
+  fputs(cstr(" "), fp);
+  sio_write_i64(fp, sio_scaled(e->rot_y, 1000000.0));
+  fputs(cstr(" "), fp);
+  sio_write_i64(fp, sio_scaled(e->rot_z, 1000000.0));
+  fputs(cstr(" "), fp);
+  sio_write_i64(fp, sio_scaled(e->rot_w, 1000000.0));
+  fputs(cstr("\n"), fp);
+  sio_write_line_i64(fp, "scale_u ", sio_scaled(e->scale, 1000000.0));
+  sio_write_line_i64(fp, "half_u ", sio_scaled(e->half, 1000000.0));
+  fputs(cstr("mesh_path "), fp);
+  fputs(scene_entity_mesh_path(e), fp);
+  fputs(cstr("\n"), fp);
+  if ((uint8)(e->lua_script[0]) != (uint8)0) {
+    fputs(cstr("lua_script "), fp);
+    fputs(scene_entity_lua_script(e), fp);
+    fputs(cstr("\n"), fp);
+  }
+  fputs(cstr("name "), fp);
+  fputs(scene_entity_name(e), fp);
+  fputs(cstr("\nend\n"), fp);
+}
+
+export function scene_io_save(path: cstring, sc: Scene*) -> int32 {
+  if (path == 0 || sc == 0) {
+    return 0;
+  }
+  var fp: cstring = fopen(path, cstr("w"));
+  if (fp == 0) {
+    return 0;
+  }
+  fputs(cstr("methscene 3\n"), fp);
+  sio_write_line_i64(fp, "selected ", (int64)scene_selected_id(sc));
+  var n: int32 = scene_count(sc);
+  var i: int32 = 0;
+  while (i < n) {
+    var e: Entity* = scene_row(sc, i);
+    if (e != 0) {
+      sio_write_entity(fp, e);
+    }
+    i = i + 1;
+  }
+  fclose(fp);
+  return 1;
+}
+
+function sio_apply_mesh_path(e: Entity*, meshes: MeshStore*) {
+  if (e == 0 || meshes == 0) {
+    return;
+  }
+  if (e->kind != SK_MESH()) {
+    return;
+  }
+  if (e->mesh_path[0] == (uint8)0) {
+    return;
+  }
+  var mid: int32 = mesh_store_import_mesh(meshes, (cstring)((int64)(&(e->mesh_path[0]))));
+  if (mid != 0) {
+    var mr: MeshRecord* = mesh_store_find(meshes, mid);
+    e->mesh_id = mid;
+    e->half = mesh_record_half(mr);
+  }
+}
+
+export function scene_io_load(path: cstring, sc: Scene*, meshes: MeshStore*) -> int32 {
+  if (path == 0 || sc == 0) {
+    return 0;
+  }
+  var fp: cstring = fopen(path, cstr("r"));
+  if (fp == 0) {
+    return 0;
+  }
+  if (meshes != 0) {
+    mesh_store_clear(meshes);
+  }
+  scene_clear(sc);
+  var line: uint8[1024];
+  var tok: uint8[64];
+  var cur: Entity* = 0;
+  var max_id: int32 = 0;
+  var saved_selected: int32 = 0;
+  while (fgets((cstring)((int64)(&(line[0]))), 1024, fp) != 0) {
+    var lc: cstring = (cstring)((int64)(&(line[0])));
+    if (sio_starts(lc, "selected ") != 0) {
+      saved_selected = (int32)sio_parse_i64_after(lc, 9);
+    } else {
+      if (sio_starts(lc, "entity") != 0) {
+        var new_id: int32 = scene_add(sc, SK_CUBE(), 0.0, 0.0, 0.0, 1.0);
+        cur = scene_find(sc, new_id);
+      } else {
+        if (sio_starts(lc, "end") != 0) {
+          sio_apply_mesh_path(cur, meshes);
+          cur = 0;
+        } else {
+          if (cur != 0) {
+            if (sio_starts(lc, "id ") != 0) {
+              cur->id = (int32)sio_parse_i64_after(lc, 3);
+              if (cur->id > max_id) { max_id = cur->id; }
+            } else {
+              if (sio_starts(lc, "kind ") != 0) {
+                cur->kind = (int32)sio_parse_i64_after(lc, 5);
+              } else {
+                if (sio_starts(lc, "parent ") != 0) {
+                  cur->parent_id = (int32)sio_parse_i64_after(lc, 7);
+                } else {
+                  if (sio_starts(lc, "script ") != 0) {
+                    var sp: int32 = 7;
+                    sp = sio_next_token(lc, sp, (cstring)((int64)(&(tok[0]))), 64);
+                    cur->script_id = (int32)atol((cstring)((int64)(&(tok[0]))));
+                    sp = sio_next_token(lc, sp, (cstring)((int64)(&(tok[0]))), 64);
+                    cur->script_enabled = (int32)atol((cstring)((int64)(&(tok[0]))));
+                  } else {
+                    if (sio_starts(lc, "scale_u ") != 0) {
+                    cur->scale = sio_unscaled(sio_parse_i64_after(lc, 8), 1000000.0);
+                  } else {
+                    if (sio_starts(lc, "half_u ") != 0) {
+                      cur->half = sio_unscaled(sio_parse_i64_after(lc, 7), 1000000.0);
+                    } else {
+                      if (sio_starts(lc, "name ") != 0) {
+                        sio_copy_tail((cstring)((int64)(&(cur->name[0]))), 64, lc, 5);
+                      } else {
+                        if (sio_starts(lc, "mesh_path ") != 0) {
+                          sio_copy_tail((cstring)((int64)(&(cur->mesh_path[0]))), 520, lc, 10);
+                        } else {
+                        if (sio_starts(lc, "lua_script ") != 0) {
+                          sio_copy_tail((cstring)((int64)(&(cur->lua_script[0]))), 260, lc, 11);
+                        } else {
+                          if (sio_starts(lc, "pos_mm ") != 0) {
+                            var p: int32 = 7;
+                            p = sio_next_token(lc, p, (cstring)((int64)(&(tok[0]))), 64);
+                            cur->pos_x = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000.0);
+                            p = sio_next_token(lc, p, (cstring)((int64)(&(tok[0]))), 64);
+                            cur->pos_y = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000.0);
+                            p = sio_next_token(lc, p, (cstring)((int64)(&(tok[0]))), 64);
+                            cur->pos_z = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000.0);
+                          } else {
+                            if (sio_starts(lc, "rot_q ") != 0) {
+                              var qp: int32 = 6;
+                              qp = sio_next_token(lc, qp, (cstring)((int64)(&(tok[0]))), 64);
+                              cur->rot_x = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000000.0);
+                              qp = sio_next_token(lc, qp, (cstring)((int64)(&(tok[0]))), 64);
+                              cur->rot_y = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000000.0);
+                              qp = sio_next_token(lc, qp, (cstring)((int64)(&(tok[0]))), 64);
+                              cur->rot_z = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000000.0);
+                              qp = sio_next_token(lc, qp, (cstring)((int64)(&(tok[0]))), 64);
+                              cur->rot_w = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000000.0);
+                              scene_entity_normalize_rotation(cur);
+                            } else {
+                              if (sio_starts(lc, "rot_urad ") != 0) {
+                              var rp: int32 = 9;
+                              rp = sio_next_token(lc, rp, (cstring)((int64)(&(tok[0]))), 64);
+                              var lyaw: float64 = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000000.0);
+                              rp = sio_next_token(lc, rp, (cstring)((int64)(&(tok[0]))), 64);
+                              var lpitch: float64 = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000000.0);
+                              rp = sio_next_token(lc, rp, (cstring)((int64)(&(tok[0]))), 64);
+                              var lroll: float64 = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000000.0);
+                              scene_entity_set_rotation_euler_legacy(cur, lyaw, lpitch, lroll);
+                              }
+                            }
+                          }
+                        }
+                        }
+                      }
+                    }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  fclose(fp);
+  sc->next_id = max_id + 1;
+  scene_set_selected(sc, saved_selected);
+  if (scene_selected_id(sc) == 0 && scene_count(sc) > 0) {
+    var first: Entity* = scene_row(sc, 0);
+    if (first != 0) {
+      scene_set_selected(sc, first->id);
+    }
+  }
+  return 1;
+}

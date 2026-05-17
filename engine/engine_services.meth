@@ -1,0 +1,212 @@
+// Service model for Roblox-style playtest architecture.
+//
+// Provides fixed-capacity service containers (Workspace, ServerScriptService,
+// ReplicatedStorage, StarterPlayer, StarterPlayerScripts) and script records
+// with role (ServerScript, LocalScript, ModuleScript). This sits alongside
+// the existing Scene/Entity model.
+//
+// Workspace remains the authoritative Scene. Service-level scripts and
+// metadata live here. Entity-attached lua_script fields from prior versions
+// are migrated at snapshot time into transient server script records.
+//
+// Allocation follows engine conventions: calloc header struct + malloc row
+// blob. All 8-byte fields first in structs. Constants returned via functions
+// because Methlang lacks top-level constant expressions.
+import "std/mem";
+
+export function SVC_WORKSPACE() -> int32 { return 1; }
+export function SVC_SERVER_SCRIPT_SERVICE() -> int32 { return 2; }
+export function SVC_REPLICATED_STORAGE() -> int32 { return 3; }
+export function SVC_STARTER_PLAYER() -> int32 { return 4; }
+export function SVC_STARTER_PLAYER_SCRIPTS() -> int32 { return 5; }
+
+export function SCRIPT_ROLE_SERVER() -> int32 { return 1; }
+export function SCRIPT_ROLE_LOCAL() -> int32 { return 2; }
+export function SCRIPT_ROLE_MODULE() -> int32 { return 3; }
+
+export function SCRIPT_ROLE_LABEL_CSTR(role: int32) -> cstring {
+  if (role == SCRIPT_ROLE_SERVER()) {
+    var s: string = "server";
+    return s.chars;
+  }
+  if (role == SCRIPT_ROLE_LOCAL()) {
+    var s: string = "local";
+    return s.chars;
+  }
+  if (role == SCRIPT_ROLE_MODULE()) {
+    var s: string = "module";
+    return s.chars;
+  }
+  var s: string = "?";
+  return s.chars;
+}
+
+export struct ServiceScriptRecord {
+  id: int32;
+  service_id: int32;
+  role: int32;
+  owner_entity_id: int32;
+  enabled: int32;
+  load_order: int32;
+  name: uint8[64];
+  path: uint8[520];
+}
+
+export struct ServiceModel {
+  scripts: ServiceScriptRecord*;
+  script_cap: int32;
+  script_count: int32;
+  next_script_id: int32;
+}
+
+function service_record_bytes() -> int64 {
+  return (int64)624;
+}
+
+function service_model_header_bytes() -> int64 {
+  return (int64)32;
+}
+
+export function service_model_create(script_cap: int32) -> ServiceModel* {
+  if (script_cap <= 0) {
+    script_cap = 512;
+  }
+  if (script_cap > 16384) {
+    script_cap = 16384;
+  }
+  var raw: cstring = calloc((int64)1, service_model_header_bytes());
+  if (raw == 0) {
+    return (ServiceModel*)0;
+  }
+  var sm: ServiceModel* = (ServiceModel*)raw;
+  sm->script_cap = script_cap;
+  sm->script_count = 0;
+  sm->next_script_id = 1;
+  var blob: cstring = calloc(service_record_bytes(), (int64)script_cap);
+  if (blob == 0) {
+    free(raw);
+    return (ServiceModel*)0;
+  }
+  sm->scripts = (ServiceScriptRecord*)blob;
+  return sm;
+}
+
+export function service_model_destroy(sm: ServiceModel*) {
+  if (sm == 0) {
+    return;
+  }
+  if (sm->scripts != 0) {
+    free((cstring)sm->scripts);
+    sm->scripts = 0;
+  }
+  free((cstring)sm);
+}
+
+export function service_script_record_ptr(sm: ServiceModel*, i: int32) -> ServiceScriptRecord* {
+  if (sm == 0 || i < 0 || i >= sm->script_cap) {
+    return (ServiceScriptRecord*)0;
+  }
+  var base: ServiceScriptRecord* = sm->scripts;
+  if (base == 0) {
+    return (ServiceScriptRecord*)0;
+  }
+  var off: int64 = (int64)i * service_record_bytes();
+  return (ServiceScriptRecord*)((cstring)((int64)base + off));
+}
+
+export function service_model_find_script(sm: ServiceModel*, id: int32) -> ServiceScriptRecord* {
+  if (sm == 0 || id <= 0) {
+    return (ServiceScriptRecord*)0;
+  }
+  var i: int32 = 0;
+  while (i < sm->script_count) {
+    var rec: ServiceScriptRecord* = service_script_record_ptr(sm, i);
+    if (rec != 0 && rec->id == id) {
+      return rec;
+    }
+    i = i + 1;
+  }
+  return (ServiceScriptRecord*)0;
+}
+
+export function service_model_add_script(sm: ServiceModel*, service_id: int32, role: int32, owner_entity_id: int32, path: cstring, name: cstring) -> int32 {
+  if (sm == 0 || sm->script_count >= sm->script_cap) {
+    return 0;
+  }
+  var id: int32 = sm->next_script_id;
+  sm->next_script_id = sm->next_script_id + 1;
+  var rec: ServiceScriptRecord* = service_script_record_ptr(sm, sm->script_count);
+  if (rec == 0) {
+    return 0;
+  }
+  rec->id = id;
+  rec->service_id = service_id;
+  rec->role = role;
+  rec->owner_entity_id = owner_entity_id;
+  rec->enabled = 1;
+  rec->load_order = sm->script_count;
+  if (name != 0) {
+    service_copy_cstr((cstring)((int64)(&(rec->name[0]))), 64, name);
+  } else {
+    rec->name[0] = 0;
+  }
+  if (path != 0) {
+    service_copy_cstr((cstring)((int64)(&(rec->path[0]))), 520, path);
+  } else {
+    rec->path[0] = 0;
+  }
+  sm->script_count = sm->script_count + 1;
+  return id;
+}
+
+export function service_model_remove_script(sm: ServiceModel*, id: int32) {
+  if (sm == 0 || id <= 0) {
+    return;
+  }
+  var i: int32 = 0;
+  while (i < sm->script_count) {
+    var rec: ServiceScriptRecord* = service_script_record_ptr(sm, i);
+    if (rec != 0 && rec->id == id) {
+      var j: int32 = i;
+      while (j + 1 < sm->script_count) {
+        var src: ServiceScriptRecord* = service_script_record_ptr(sm, j + 1);
+        var dst: ServiceScriptRecord* = service_script_record_ptr(sm, j);
+        if (src != 0 && dst != 0) {
+          memcpy((cstring)dst, (cstring)src, service_record_bytes());
+        }
+        j = j + 1;
+      }
+      sm->script_count = sm->script_count - 1;
+      return;
+    }
+    i = i + 1;
+  }
+}
+
+export function service_model_clear(sm: ServiceModel*) {
+  if (sm == 0) {
+    return;
+  }
+  sm->script_count = 0;
+  sm->next_script_id = 1;
+}
+
+function service_copy_cstr(dst: cstring, dst_cap: int32, src: cstring) {
+  if (dst == 0 || dst_cap <= 0) {
+    return;
+  }
+  if (src == 0) {
+    dst[0] = 0;
+    return;
+  }
+  var i: int32 = 0;
+  while (i + 1 < dst_cap) {
+    var b: uint8 = (uint8)(src[i]);
+    dst[i] = b;
+    if (b == (uint8)0) {
+      return;
+    }
+    i = i + 1;
+  }
+  dst[dst_cap - 1] = 0;
+}

@@ -1,0 +1,1085 @@
+// Windows-only MIN game loop: Win32 window + PeekMessage dispatch + StretchDIBits
+// from a caller-owned RGBA (BGRA packed) framebuffer. Targets --build --emit-obj
+// --linker internal (kernel32/user32/gdi32 already resolved by Methlang linker).
+//
+import "std/mem";
+
+function gcw_cstr_lit(s: string) -> cstring {
+  return s.chars;
+}
+
+export struct GameWin32 {
+  hwnd: int64;
+  hinstance: int64;
+  pixels: uint32*;
+  qpc_frequency: int64;
+  prev_qpc: int64;
+  key_bits0: int64;
+  key_bits1: int64;
+  key_bits2: int64;
+  key_bits3: int64;
+  mem_dc: int64;
+  dib: int64;
+  old_dib: int64;
+  width: int32;
+  height: int32;
+  stride_px: int32;
+  running: int32;
+  mouse_captured: int32;
+  capture_saved_x: int32;
+  capture_saved_y: int32;
+  capture_anchor_x: int32;
+  capture_anchor_y: int32;
+  pending_resize_w: int32;
+  pending_resize_h: int32;
+  resize_dirty: int32;
+  child_hwnd: int64;
+  child_x: int32;
+  child_y: int32;
+  child_w: int32;
+  child_h: int32;
+}
+
+var GAME_WIN32_ACTIVE: GameWin32* = 0;
+var GAME_WIN32_WHEEL_ACCUM: int32 = 0;
+
+export struct Win32Rect {
+  left: int32;
+  top: int32;
+  right: int32;
+  bottom: int32;
+}
+
+export struct Win32Msg {
+  hwnd: int64;
+  msg: uint32;
+  _pad_after_msg: uint32;
+  wparam: int64;
+  lparam: int64;
+  time: uint32;
+  pt_x: int32;
+  pt_y: int32;
+  _pad_tail: uint32;
+}
+
+export struct Win32Point {
+  x: int32;
+  y: int32;
+}
+
+// PAINTSTRUCT (x64): hdc, fErase, rcPaint(4 LONG), fRestore, fIncUpdate, 32-byte
+// rgbReserved. We never read past hdc; padding kept so BeginPaint can fill it.
+export struct Win32PaintStruct {
+  hdc: int64;
+  f_erase: int32;
+  rc_left: int32;
+  rc_top: int32;
+  rc_right: int32;
+  rc_bottom: int32;
+  f_restore: int32;
+  f_inc_update: int32;
+  rgb_reserved0: int64;
+  rgb_reserved1: int64;
+  rgb_reserved2: int64;
+  rgb_reserved3: int64;
+}
+
+export struct Win32WndClassExA {
+  cb_size: uint32;
+  style: uint32;
+  lpfn_wnd_proc: int64;
+  cb_cls_extra: int32;
+  cb_wnd_extra: int32;
+  instance: int64;
+  icon: int64;
+  cursor: int64;
+  brush_bg: int64;
+  menu_name: int64;
+  class_name: int64;
+  icon_sm: int64;
+}
+
+export struct Win32BitmapRgb32 {
+  bi_size: uint32;
+  bi_width: int32;
+  bi_height: int32;
+  bi_planes: uint16;
+  bi_bit_count: uint16;
+  bi_compression: uint32;
+  bi_size_image: uint32;
+  bi_xppm: int32;
+  bi_yppm: int32;
+  bi_clr_used: uint32;
+  bi_clr_important: uint32;
+  bmi_palette_pad: uint32;
+}
+
+export function GW_FALSE() -> int32 {
+  return 0;
+}
+
+export function GW_TRUE() -> int32 {
+  return 1;
+}
+
+export function PM_REMOVE_VAL() -> uint32 {
+  return 1;
+}
+
+export function SRCCOPY_VAL() -> uint32 {
+  return (uint32)13369376;
+}
+
+export function BI_RGB_VAL() -> uint32 {
+  return 0;
+}
+
+export function DIB_RGB_COLORS_VAL() -> uint32 {
+  return 0;
+}
+
+export function WM_CLOSE_VAL() -> uint32 {
+  return 16;
+}
+
+export function WM_DESTROY_VAL() -> uint32 {
+  return 2;
+}
+
+export function WM_ERASEBKGND_VAL() -> uint32 {
+  return 20;
+}
+
+export function WM_KILLFOCUS_VAL() -> uint32 {
+  return 8;
+}
+
+export function WM_QUIT_VAL() -> uint32 {
+  return 18;
+}
+
+export function WM_PAINT_VAL() -> uint32 {
+  return 15;
+}
+
+export function WM_SIZE_VAL() -> uint32 {
+  return 5;
+}
+
+export function WM_GETMINMAXINFO_VAL() -> uint32 {
+  return 36;
+}
+
+// SIZE_MINIMIZED wParam: skip reallocation while the window has no client area.
+export function WM_SIZE_MINIMIZED() -> int64 {
+  return (int64)1;
+}
+
+export function DIB_BITS_FROM_RGB() -> uint32 {
+  return 0;
+}
+
+export function WM_KEYDOWN_VAL() -> uint32 {
+  return 256;
+}
+
+export function WM_KEYUP_VAL() -> uint32 {
+  return 257;
+}
+
+export function WM_SYSKEYDOWN_VAL() -> uint32 {
+  return 260;
+}
+
+export function WM_SYSKEYUP_VAL() -> uint32 {
+  return 261;
+}
+
+export function WM_LBUTTONDOWN_VAL() -> uint32 {
+  return 513;
+}
+
+export function WM_LBUTTONUP_VAL() -> uint32 {
+  return 514;
+}
+
+export function WM_RBUTTONDOWN_VAL() -> uint32 {
+  return 516;
+}
+
+export function WM_RBUTTONUP_VAL() -> uint32 {
+  return 517;
+}
+
+export function SW_SHOW_VAL() -> int32 {
+  return 5;
+}
+
+export function CS_HREDRAW_VAL() -> uint32 {
+  return (uint32)2;
+}
+
+export function CS_VREDRAW_VAL() -> uint32 {
+  return (uint32)1;
+}
+
+export function WHITE_BRUSH_STOCK_OBJECT() -> int32 {
+  return 0;
+}
+
+export function SYSTEM_FIXED_FONT_STOCK() -> int32 {
+  return 16;
+}
+
+export function SHARED_CURSOR_ICON_RESOURCE() -> int64 {
+  return (int64)32512;
+}
+
+export function CW_USEDEFAULT_LONG() -> int32 {
+  return -2147483648;
+}
+
+export function WNDCLASSEXA_BYTE_SIZE() -> uint32 {
+  return (uint32)80;
+}
+
+export function BITMAPINFOHEADER_BYTE_SIZE() -> uint32 {
+  return (uint32)40;
+}
+
+export function WIN32_WS_OVERLAPPEDWINDOW() -> uint32 {
+  return (uint32)13565952;
+}
+
+// WS_CHILD (0x40000000) | WS_VISIBLE (0x10000000) | WS_CLIPSIBLINGS
+// (0x04000000). A child window for the Vulkan swapchain: clipped to the
+// viewport rect, no border, parented to the editor window.
+export function WIN32_WS_CHILD_VISIBLE() -> uint32 {
+  return (uint32)1342177280;
+}
+
+export function GDI_BKMODE_TRANSPARENT() -> int32 {
+  return 1;
+}
+
+export function COLORREF_WHITE() -> uint32 {
+  return (uint32)16777215;
+}
+
+export function COLORREF_DIM_TEXT() -> uint32 {
+  return (uint32)12632256;
+}
+
+// GDI COLORREF is 0x00BBGGRR (high byte zero). This differs from the
+// framebuffer pixel layout produced by swizzle_bgra8 (0xAARRGGBB), so text
+// color must be built with this, not swizzle_bgra8 — passing a swizzled pixel
+// to SetTextColor sets the high byte and GDI renders it as black.
+export function colorref_rgb(r: uint8, g: uint8, b: uint8) -> uint32 {
+  var ur: uint32 = ((uint32)r) & (uint32)255;
+  var ug: uint32 = ((uint32)g) & (uint32)255;
+  var ub: uint32 = ((uint32)b) & (uint32)255;
+  return ub * (uint32)65536 + ug * (uint32)256 + ur;
+}
+
+export extern function Win32_GetModuleHandleA(module_name: cstring) -> int64 = "GetModuleHandleA";
+export extern function Win32_QueryPerformanceFrequency(out_hz: int64*) -> int32 = "QueryPerformanceFrequency";
+export extern function Win32_QueryPerformanceCounter(out_ctr: int64*) -> int32 = "QueryPerformanceCounter";
+
+export extern function Win32_RegisterClassExA(wc: Win32WndClassExA*) -> uint16 = "RegisterClassExA";
+export extern function Win32_UnregisterClassA(class_name: cstring, instance: int64) -> int32 = "UnregisterClassA";
+export extern function Win32_AdjustWindowRectEx(rect: Win32Rect*, style: uint32, has_menu: int32, ex_style: uint32) -> int32 = "AdjustWindowRectEx";
+export extern function Win32_CreateWindowExA(ex_style: uint32, class_name: cstring, window_title: cstring, style: uint32, x: int32, y: int32, win_w: int32, win_h: int32, parent: int64, menu: int64, instance: int64, lp_param: cstring) -> int64 = "CreateWindowExA";
+export extern function Win32_DestroyWindow(hwnd: int64) -> int32 = "DestroyWindow";
+export extern function Win32_MoveWindow(hwnd: int64, x: int32, y: int32, w: int32, h: int32, repaint: int32) -> int32 = "MoveWindow";
+export extern function Win32_ShowWindow(hwnd: int64, cmd_show: int32) -> int32 = "ShowWindow";
+export extern function Win32_UpdateWindow(hwnd: int64) -> int32 = "UpdateWindow";
+export extern function Win32_TranslateMessage(msg: Win32Msg*) -> int32 = "TranslateMessage";
+export extern function Win32_DispatchMessageA(msg: Win32Msg*) -> int64 = "DispatchMessageA";
+export extern function Win32_PostQuitMessage(exit_code: int32) = "PostQuitMessage";
+export extern function Win32_DefWindowProcA(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 = "DefWindowProcA";
+export extern function Win32_PeekMessageA(msg: Win32Msg*, hwnd: int64, filter_min: uint32, filter_max: uint32, remove_msg: uint32) -> int32 = "PeekMessageA";
+export extern function Win32_GetDC(hwnd: int64) -> int64 = "GetDC";
+export extern function Win32_ReleaseDC(hwnd: int64, dc: int64) -> int32 = "ReleaseDC";
+export extern function Win32_LoadCursorA(inst: int64, name_or_id: cstring) -> int64 = "LoadCursorA";
+export extern function Win32_LoadIconA(inst: int64, name_or_id: cstring) -> int64 = "LoadIconA";
+// Win32 returns SHORT; read as int32 and test bit 15 so fly keys work with the
+// object backend (full RAX after extern calls) and regardless of sign/zero ext.
+export extern function Win32_GetAsyncKeyState(vkey: int32) -> int32 = "GetAsyncKeyState";
+// 256-byte key snapshot; byte[vkey] bit 7 (0x80) set => key is down (async).
+export extern function Win32_GetKeyboardState(key_state: cstring) -> int32 = "GetKeyboardState";
+export extern function Win32_GetCursorPos(pt: Win32Point*) -> int32 = "GetCursorPos";
+export extern function Win32_ScreenToClient(hwnd: int64, pt: Win32Point*) -> int32 = "ScreenToClient";
+export extern function Win32_ClientToScreen(hwnd: int64, pt: Win32Point*) -> int32 = "ClientToScreen";
+export extern function Win32_SetCursorPos(x: int32, y: int32) -> int32 = "SetCursorPos";
+export extern function Win32_ShowCursor(show: int32) -> int32 = "ShowCursor";
+export extern function Win32_SetCapture(hwnd: int64) -> int64 = "SetCapture";
+export extern function Win32_ReleaseCapture() -> int32 = "ReleaseCapture";
+export extern function Win32_GetClientRect(hwnd: int64, rect: Win32Rect*) -> int32 = "GetClientRect";
+export extern function Win32_GetForegroundWindow() -> int64 = "GetForegroundWindow";
+export extern function Win32_SetFocus(hwnd: int64) -> int64 = "SetFocus";
+
+export extern function Win32_GetStockObject(which: int32) -> int64 = "GetStockObject";
+export extern function Win32_SelectObject(dc: int64, gdi_obj: int64) -> int64 = "SelectObject";
+export extern function Win32_SetBkMode(dc: int64, mode: int32) -> int32 = "SetBkMode";
+export extern function Win32_SetTextColor(dc: int64, color_ref: uint32) -> uint32 = "SetTextColor";
+export extern function Win32_TextOutA(dc: int64, x: int32, y: int32, text: cstring, text_len: int32) -> int32 = "TextOutA";
+export extern function Win32_StretchDIBits(hdc: int64, x_dest: int32, y_dest: int32, w_dest: int32, h_dest: int32, x_src: int32, y_src: int32, w_src: int32, h_src: int32, pixels: cstring, bmp_info: Win32BitmapRgb32*, usage: uint32, rop_code: uint32) -> int32 = "StretchDIBits";
+
+// Double-buffer path: a DIB section bound to a memory DC. The engine draws into
+// the DIB bits (g->pixels); present is a single BitBlt of the cached bitmap to
+// the window DC. No per-frame StretchDIBits of the whole client area, so the
+// window never flashes the erase colour between clear and blit.
+export extern function Win32_CreateCompatibleDC(hdc: int64) -> int64 = "CreateCompatibleDC";
+export extern function Win32_DeleteDC(hdc: int64) -> int32 = "DeleteDC";
+export extern function Win32_DeleteObject(gdi_obj: int64) -> int32 = "DeleteObject";
+export extern function Win32_CreateDIBSection(hdc: int64, bmi: Win32BitmapRgb32*, usage: uint32, bits_out: int64*, section: int64, offset: uint32) -> int64 = "CreateDIBSection";
+export extern function Win32_BitBlt(dst_dc: int64, x: int32, y: int32, w: int32, h: int32, src_dc: int64, sx: int32, sy: int32, rop: uint32) -> int32 = "BitBlt";
+export extern function Win32_BeginPaint(hwnd: int64, ps: Win32PaintStruct*) -> int64 = "BeginPaint";
+export extern function Win32_EndPaint(hwnd: int64, ps: Win32PaintStruct*) -> int32 = "EndPaint";
+export extern function Win32_InvalidateRect(hwnd: int64, rect: Win32Rect*, erase: int32) -> int32 = "InvalidateRect";
+
+export function swizzle_bgra8(r: uint8, g: uint8, b: uint8, a: uint8) -> uint32 {
+  var ur: uint32 = (uint32)r;
+  var ug: uint32 = ((uint32)g) & (uint32)255;
+  var ub: uint32 = ((uint32)b) & (uint32)255;
+  var ua: uint32 = ((uint32)a) & (uint32)255;
+  return ua * (uint32)16777216 + ur * (uint32)65536 + ug * (uint32)256 + ub;
+}
+
+export function game_win32_clear_rgba_pixels(buf: uint32*, count: int32, color: uint32) {
+  var i: int32 = 0;
+  while (i < count) {
+    buf[i] = color;
+    i = i + 1;
+  }
+}
+
+export function game_win32_fill_pattern(buf: uint32*, w: int32, h: int32, frame: int32) {
+  var yy: int32 = 0;
+  while (yy < h) {
+    var xx: int32 = 0;
+    while (xx < w) {
+      var idx: int32 = yy * w + xx;
+      var rr: uint8 = (uint8)((xx + frame) & 255);
+      var gg: uint8 = (uint8)((yy + frame * 3) & 255);
+      var bb: uint8 = (uint8)((xx * 7 + yy * 11 + frame * 5) & 255);
+      buf[idx] = swizzle_bgra8(rr, gg, bb, 255);
+      xx = xx + 1;
+    }
+    yy = yy + 1;
+  }
+}
+
+export function game_input_key_held(vkey: int32) -> int32 {
+  if (vkey < 0 || vkey >= 256) {
+    return 0;
+  }
+  // Poll async first: works reliably during mouse capture / awkward focus when
+  // GetKeyboardState lags or clears before WM_KEY* catches up. High bit = down.
+  var ks: int32 = Win32_GetAsyncKeyState(vkey);
+  if ((ks & (int32)32768) != 0) {
+    return 1;
+  }
+  // Snapshot table (foreground thread message queue); secondary signal.
+  var kb: uint8[256];
+  if (Win32_GetKeyboardState((cstring)((int64)(&(kb[0])))) != 0) {
+    if (((int32)kb[vkey] & (int32)128) != 0) {
+      return 1;
+    }
+  }
+  // Last resort: bits driven from WM_KEYDOWN/WM_KEYUP in the wndproc.
+  if (GAME_WIN32_ACTIVE != 0) {
+    var word: int32 = vkey / 64;
+    var shift: int64 = (int64)(vkey % 64);
+    var bit: int64 = ((int64)1) << shift;
+    if (word == 0 && (GAME_WIN32_ACTIVE->key_bits0 & bit) != (int64)0) { return 1; }
+    if (word == 1 && (GAME_WIN32_ACTIVE->key_bits1 & bit) != (int64)0) { return 1; }
+    if (word == 2 && (GAME_WIN32_ACTIVE->key_bits2 & bit) != (int64)0) { return 1; }
+    if (word == 3 && (GAME_WIN32_ACTIVE->key_bits3 & bit) != (int64)0) { return 1; }
+  }
+  return 0;
+}
+
+// Returns net wheel notches since the last call (positive = wheel forward),
+// then resets the accumulator.
+export function game_mouse_consume_wheel() -> int32 {
+  var w: int32 = GAME_WIN32_WHEEL_ACCUM;
+  GAME_WIN32_WHEEL_ACCUM = 0;
+  return w;
+}
+
+export function game_win32_mouse_x(g: GameWin32*) -> int32 {
+  if (g == 0) {
+    return 0;
+  }
+  var pt: Win32Point;
+  pt.x = 0;
+  pt.y = 0;
+  if (Win32_GetCursorPos(&pt) == 0) {
+    return 0;
+  }
+  Win32_ScreenToClient(g->hwnd, &pt);
+  return pt.x;
+}
+
+export function game_win32_mouse_y(g: GameWin32*) -> int32 {
+  if (g == 0) {
+    return 0;
+  }
+  var pt: Win32Point;
+  pt.x = 0;
+  pt.y = 0;
+  if (Win32_GetCursorPos(&pt) == 0) {
+    return 0;
+  }
+  Win32_ScreenToClient(g->hwnd, &pt);
+  return pt.y;
+}
+
+// --- Raw-delta mouse capture -------------------------------------------------
+// While captured, the OS cursor is hidden and warped back to the client center
+// every read. Callers consume the per-frame (dx, dy) instead of an absolute
+// position, so a drag never clamps at a screen edge and never dies when the
+// pointer leaves the viewport rectangle.
+
+function game_mouse_client_center(g: GameWin32*, out: Win32Point*) {
+  var rc: Win32Rect;
+  rc.left = 0;
+  rc.top = 0;
+  rc.right = g->width;
+  rc.bottom = g->height;
+  Win32_GetClientRect(g->hwnd, &rc);
+  out->x = (rc.left + rc.right) / 2;
+  out->y = (rc.top + rc.bottom) / 2;
+}
+
+export function game_mouse_is_captured(g: GameWin32*) -> int32 {
+  if (g == 0) {
+    return 0;
+  }
+  return g->mouse_captured;
+}
+
+function game_win32_set_key(vkey: int32, down: int32);
+
+// capture_anchor_x/y hold the LAST ABSOLUTE screen cursor position. Deltas are
+// measured against that and the anchor advances every read, so there is no
+// per-frame warp race. We only re-center (and reset the anchor) when the cursor
+// nears a screen edge, so an endless drag never traps at the desktop boundary.
+export function game_mouse_begin_capture(g: GameWin32*) {
+  if (g == 0 || g->hwnd == 0) {
+    return;
+  }
+  if (g->mouse_captured != 0) {
+    return;
+  }
+  var saved: Win32Point;
+  saved.x = 0;
+  saved.y = 0;
+  Win32_GetCursorPos(&saved);
+  g->capture_saved_x = saved.x;
+  g->capture_saved_y = saved.y;
+  Win32_SetFocus(g->hwnd);
+  Win32_SetCapture(g->hwnd);
+  Win32_ShowCursor(0);
+  // Warp once to client center and seed the anchor with that screen position.
+  var c: Win32Point;
+  game_mouse_client_center(g, &c);
+  var s: Win32Point;
+  s.x = c.x;
+  s.y = c.y;
+  Win32_ClientToScreen(g->hwnd, &s);
+  Win32_SetCursorPos(s.x, s.y);
+  g->capture_anchor_x = s.x;
+  g->capture_anchor_y = s.y;
+  g->mouse_captured = 1;
+  game_win32_set_key(2, 1);
+}
+
+// Returns 1 if a nonzero delta was produced; writes screen-space dx/dy.
+export function game_mouse_read_delta(g: GameWin32*, out_dx: int32*, out_dy: int32*) -> int32 {
+  if (out_dx != 0) { *out_dx = 0; }
+  if (out_dy != 0) { *out_dy = 0; }
+  if (g == 0 || g->mouse_captured == 0) {
+    return 0;
+  }
+  var pt: Win32Point;
+  pt.x = 0;
+  pt.y = 0;
+  if (Win32_GetCursorPos(&pt) == 0) {
+    return 0;
+  }
+  // Measure real movement since the last sample. Warping every frame can race
+  // the OS cursor update path and collapse deltas to zero on some machines.
+  var dx: int32 = pt.x - g->capture_anchor_x;
+  var dy: int32 = pt.y - g->capture_anchor_y;
+  // Reject impossible deltas (bad sample) so they cannot poison camera state.
+  if (dx > 1000 || dx < -1000) { dx = 0; }
+  if (dy > 1000 || dy < -1000) { dy = 0; }
+  // Dead zone: ignore sub-threshold jitter so a still hand produces exactly
+  // zero, not a slow integrated drift (±3 screen pixels).
+  if (dx > -3 && dx < 3) { dx = 0; }
+  if (dy > -3 && dy < 3) { dy = 0; }
+  if (out_dx != 0) { *out_dx = dx; }
+  if (out_dy != 0) { *out_dy = dy; }
+  g->capture_anchor_x = pt.x;
+  g->capture_anchor_y = pt.y;
+  var client_pt: Win32Point;
+  client_pt.x = pt.x;
+  client_pt.y = pt.y;
+  Win32_ScreenToClient(g->hwnd, &client_pt);
+  var rc: Win32Rect;
+  rc.left = 0;
+  rc.top = 0;
+  rc.right = g->width;
+  rc.bottom = g->height;
+  Win32_GetClientRect(g->hwnd, &rc);
+  var margin: int32 = 96;
+  if (client_pt.x < rc.left + margin || client_pt.y < rc.top + margin || client_pt.x > rc.right - margin || client_pt.y > rc.bottom - margin) {
+    var c: Win32Point;
+    game_mouse_client_center(g, &c);
+    Win32_ClientToScreen(g->hwnd, &c);
+    Win32_SetCursorPos(c.x, c.y);
+    g->capture_anchor_x = c.x;
+    g->capture_anchor_y = c.y;
+  }
+  if (dx != 0 || dy != 0) {
+    return 1;
+  }
+  return 0;
+}
+
+function game_win32_set_key(vkey: int32, down: int32) {
+  if (vkey < 0 || vkey >= 256) {
+    return;
+  }
+  if (GAME_WIN32_ACTIVE == 0) {
+    return;
+  }
+  var word: int32 = vkey / 64;
+  var shift: int64 = (int64)(vkey % 64);
+  var bit: int64 = ((int64)1) << shift;
+  if (down != 0) {
+    if (word == 0) { GAME_WIN32_ACTIVE->key_bits0 = GAME_WIN32_ACTIVE->key_bits0 | bit; }
+    if (word == 1) { GAME_WIN32_ACTIVE->key_bits1 = GAME_WIN32_ACTIVE->key_bits1 | bit; }
+    if (word == 2) { GAME_WIN32_ACTIVE->key_bits2 = GAME_WIN32_ACTIVE->key_bits2 | bit; }
+    if (word == 3) { GAME_WIN32_ACTIVE->key_bits3 = GAME_WIN32_ACTIVE->key_bits3 | bit; }
+  } else {
+    var nbit: int64 = ~bit;
+    if (word == 0) { GAME_WIN32_ACTIVE->key_bits0 = GAME_WIN32_ACTIVE->key_bits0 & nbit; }
+    if (word == 1) { GAME_WIN32_ACTIVE->key_bits1 = GAME_WIN32_ACTIVE->key_bits1 & nbit; }
+    if (word == 2) { GAME_WIN32_ACTIVE->key_bits2 = GAME_WIN32_ACTIVE->key_bits2 & nbit; }
+    if (word == 3) { GAME_WIN32_ACTIVE->key_bits3 = GAME_WIN32_ACTIVE->key_bits3 & nbit; }
+  }
+}
+
+function game_win32_clear_keys(g: GameWin32*) {
+  if (g == 0) {
+    return;
+  }
+  g->key_bits0 = (int64)0;
+  g->key_bits1 = (int64)0;
+  g->key_bits2 = (int64)0;
+  g->key_bits3 = (int64)0;
+}
+
+export function game_mouse_end_capture(g: GameWin32*) {
+  if (g == 0) {
+    return;
+  }
+  if (g->mouse_captured == 0) {
+    return;
+  }
+  Win32_ReleaseCapture();
+  Win32_SetCursorPos(g->capture_saved_x, g->capture_saved_y);
+  Win32_ShowCursor(1);
+  g->mouse_captured = 0;
+  game_win32_set_key(2, 0);
+}
+
+export function game_win32_wnd_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+  if (msg == WM_ERASEBKGND_VAL()) {
+    return (int64)1;
+  }
+  if (msg == WM_KILLFOCUS_VAL()) {
+    if (GAME_WIN32_ACTIVE != 0) {
+      game_win32_clear_keys(GAME_WIN32_ACTIVE);
+      if (GAME_WIN32_ACTIVE->mouse_captured != 0) {
+        game_mouse_end_capture(GAME_WIN32_ACTIVE);
+      }
+    }
+    return Win32_DefWindowProcA(hwnd, msg, wparam, lparam);
+  }
+  if (msg == WM_KEYDOWN_VAL() || msg == WM_SYSKEYDOWN_VAL()) {
+    game_win32_set_key((int32)wparam, 1);
+    return Win32_DefWindowProcA(hwnd, msg, wparam, lparam);
+  }
+  if (msg == WM_KEYUP_VAL() || msg == WM_SYSKEYUP_VAL()) {
+    game_win32_set_key((int32)wparam, 0);
+    return Win32_DefWindowProcA(hwnd, msg, wparam, lparam);
+  }
+  if (msg == WM_LBUTTONDOWN_VAL()) {
+    game_win32_set_key(1, 1);
+    return Win32_DefWindowProcA(hwnd, msg, wparam, lparam);
+  }
+  if (msg == WM_LBUTTONUP_VAL()) {
+    game_win32_set_key(1, 0);
+    return Win32_DefWindowProcA(hwnd, msg, wparam, lparam);
+  }
+  if (msg == WM_RBUTTONDOWN_VAL()) {
+    game_win32_set_key(2, 1);
+    return Win32_DefWindowProcA(hwnd, msg, wparam, lparam);
+  }
+  if (msg == WM_RBUTTONUP_VAL()) {
+    game_win32_set_key(2, 0);
+    return Win32_DefWindowProcA(hwnd, msg, wparam, lparam);
+  }
+  if (msg == (uint32)522) {
+    // WM_MOUSEWHEEL: high word of wParam is a signed delta in 120ths.
+    var hw: int32 = (int32)((wparam >> (int64)16) & (int64)65535);
+    if (hw >= 32768) {
+      hw = hw - 65536;
+    }
+    GAME_WIN32_WHEEL_ACCUM = GAME_WIN32_WHEEL_ACCUM + hw / 120;
+    return (int64)0;
+  }
+  if (msg == WM_SIZE_VAL()) {
+    // Only the top-level window drives the framebuffer resize. The Vulkan
+    // child shares this window class/wndproc; without this guard, resizing
+    // the child via MoveWindow feeds its size back as the parent's pending
+    // resize, shrinking the DIB every frame (runaway scale-to-corner).
+    if (wparam != WM_SIZE_MINIMIZED() && GAME_WIN32_ACTIVE != 0 && hwnd == GAME_WIN32_ACTIVE->hwnd) {
+      var nw: int32 = (int32)(lparam & (int64)65535);
+      var nh: int32 = (int32)((lparam >> (int64)16) & (int64)65535);
+      if (nw > 0 && nh > 0) {
+        GAME_WIN32_ACTIVE->pending_resize_w = nw;
+        GAME_WIN32_ACTIVE->pending_resize_h = nh;
+        GAME_WIN32_ACTIVE->resize_dirty = 1;
+      }
+    }
+    return Win32_DefWindowProcA(hwnd, msg, wparam, lparam);
+  }
+  if (msg == WM_PAINT_VAL()) {
+    // OS-driven repaint: blit the cached bitmap so move/uncover/resize keep a
+    // valid frame even between engine present() calls. The engine still drives
+    // animation; this just stops the window going blank on stray paints.
+    var ps: Win32PaintStruct;
+    ps.hdc = (int64)0;
+    var pdc: int64 = Win32_BeginPaint(hwnd, &ps);
+    // Only the top-level window blits the cached DIB. The Vulkan child owns
+    // its own pixels (the swapchain); blitting the parent's panel DIB into it
+    // would paint the editor chrome over the 3D view. Just validate its paint.
+    var is_parent: int32 = 0;
+    if (GAME_WIN32_ACTIVE != 0 && hwnd == GAME_WIN32_ACTIVE->hwnd) {
+      is_parent = 1;
+    }
+    if (pdc != 0 && is_parent != 0 && GAME_WIN32_ACTIVE->mem_dc != 0) {
+      Win32_BitBlt(pdc, 0, 0, GAME_WIN32_ACTIVE->width, GAME_WIN32_ACTIVE->height, GAME_WIN32_ACTIVE->mem_dc, 0, 0, SRCCOPY_VAL());
+    }
+    Win32_EndPaint(hwnd, &ps);
+    return (int64)0;
+  }
+  if (msg == WM_CLOSE_VAL()) {
+    Win32_DestroyWindow(hwnd);
+    return (int64)0;
+  }
+  if (msg == WM_DESTROY_VAL()) {
+    Win32_PostQuitMessage(0);
+    if (GAME_WIN32_ACTIVE != 0) {
+      GAME_WIN32_ACTIVE->running = 0;
+    }
+    return Win32_DefWindowProcA(hwnd, msg, wparam, lparam);
+  }
+  return Win32_DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+
+function game_win32_bytes() -> int64 {
+  // 12 int64 (96) + 13 int32 (52) = 148; round up for backend slack.
+  return (int64)256;
+}
+
+function game_win32_class_name_c() -> cstring {
+  return gcw_cstr_lit("MethGameWin32Gdi");
+}
+
+export function game_win32_tick_seconds(g: GameWin32*) -> float64 {
+  if (g == 0) {
+    return 0.0;
+  }
+  var cur: int64 = 0;
+  Win32_QueryPerformanceCounter(&cur);
+  var delta: int64 = cur - g->prev_qpc;
+  g->prev_qpc = cur;
+  if (g->qpc_frequency <= 0) {
+    return 0.016;
+  }
+  return (float64)delta / (float64)g->qpc_frequency;
+}
+
+// Seconds since last game_win32_tick_seconds (does not advance the clock).
+// Use between tick and input so fly speed (mm/s) scales with real frame time.
+export function game_win32_frame_delta_seconds(g: GameWin32*) -> float64 {
+  if (g == 0) {
+    return 0.0;
+  }
+  if (g->qpc_frequency <= 0) {
+    return 0.016;
+  }
+  var cur: int64 = 0;
+  Win32_QueryPerformanceCounter(&cur);
+  var delta: int64 = cur - g->prev_qpc;
+  if (delta < 0) {
+    delta = 0;
+  }
+  var dt: float64 = (float64)delta / (float64)g->qpc_frequency;
+  if (dt > 0.25) {
+    dt = 0.25;
+  }
+  return dt;
+}
+
+// (Re)create the DIB section + memory DC at w x h. g->pixels is repointed at
+// the GDI-owned bits (top-down 32-bit BGRA). The previous DIB/DC are released.
+// Returns 1 on success, 0 on failure (leaves the old buffer intact on failure).
+function game_win32_make_dib(g: GameWin32*, w: int32, h: int32) -> int32 {
+  if (g == 0 || g->hwnd == 0) {
+    return 0;
+  }
+  if (w < 1) { w = 1; }
+  if (h < 1) { h = 1; }
+  var wdc: int64 = Win32_GetDC(g->hwnd);
+  if (wdc == 0) {
+    return 0;
+  }
+  var mdc: int64 = Win32_CreateCompatibleDC(wdc);
+  if (mdc == 0) {
+    Win32_ReleaseDC(g->hwnd, wdc);
+    return 0;
+  }
+  var bmi: Win32BitmapRgb32;
+  bmi.bi_size = BITMAPINFOHEADER_BYTE_SIZE();
+  bmi.bi_width = w;
+  bmi.bi_height = 0 - h;
+  bmi.bi_planes = (uint16)1;
+  bmi.bi_bit_count = (uint16)32;
+  bmi.bi_compression = BI_RGB_VAL();
+  bmi.bi_size_image = 0;
+  bmi.bi_xppm = 0;
+  bmi.bi_yppm = 0;
+  bmi.bi_clr_used = 0;
+  bmi.bi_clr_important = 0;
+  bmi.bmi_palette_pad = 0;
+  var bits_ptr: int64 = 0;
+  var hbm: int64 = Win32_CreateDIBSection(mdc, &bmi, DIB_BITS_FROM_RGB(), &bits_ptr, (int64)0, (uint32)0);
+  if (hbm == 0 || bits_ptr == 0) {
+    Win32_DeleteDC(mdc);
+    Win32_ReleaseDC(g->hwnd, wdc);
+    return 0;
+  }
+  var prev_obj: int64 = Win32_SelectObject(mdc, hbm);
+  Win32_ReleaseDC(g->hwnd, wdc);
+  // Tear down the old buffer only after the new one is fully live.
+  if (g->mem_dc != 0) {
+    if (g->old_dib != 0) {
+      Win32_SelectObject(g->mem_dc, g->old_dib);
+    }
+    if (g->dib != 0) {
+      Win32_DeleteObject(g->dib);
+    }
+    Win32_DeleteDC(g->mem_dc);
+  }
+  g->mem_dc = mdc;
+  g->dib = hbm;
+  g->old_dib = prev_obj;
+  g->pixels = (uint32*)((cstring)((int64)bits_ptr));
+  g->width = w;
+  g->height = h;
+  g->stride_px = w;
+  return 1;
+}
+
+// Apply a pending WM_SIZE: rebuild the DIB at the new client size. Idempotent;
+// safe to call every frame. resize_dirty is cleared once the new buffer is up.
+export function game_win32_apply_pending_resize(g: GameWin32*) -> int32 {
+  if (g == 0) {
+    return 0;
+  }
+  if (g->resize_dirty == 0) {
+    return 0;
+  }
+  var w: int32 = g->pending_resize_w;
+  var h: int32 = g->pending_resize_h;
+  g->resize_dirty = 0;
+  if (w < 1 || h < 1) {
+    return 0;
+  }
+  if (w == g->width && h == g->height) {
+    return 0;
+  }
+  if (game_win32_make_dib(g, w, h) == 0) {
+    return 0;
+  }
+  return 1;
+}
+
+export function game_win32_present_to_dc(g: GameWin32*, dc: int64) -> int32 {
+  if (g == 0 || dc == 0 || g->mem_dc == 0) {
+    return 0;
+  }
+  // Single blit of the cached bitmap. No clear of the destination, so the
+  // window never shows the erase colour between frames (no flicker).
+  return Win32_BitBlt(dc, 0, 0, g->width, g->height, g->mem_dc, 0, 0, SRCCOPY_VAL());
+}
+
+export function game_win32_present(g: GameWin32*) -> int32 {
+  if (g == 0) {
+    return 0;
+  }
+  if (g->hwnd == 0) {
+    return 0;
+  }
+  var dc: int64 = Win32_GetDC(g->hwnd);
+  if (dc == 0) {
+    return 0;
+  }
+  var r: int32 = game_win32_present_to_dc(g, dc);
+  Win32_ReleaseDC(g->hwnd, dc);
+  return r;
+}
+
+export function game_win32_poll_messages(g: GameWin32*) {
+  var m: Win32Msg;
+  while (Win32_PeekMessageA(&m, (int64)0, (uint32)0, (uint32)0, PM_REMOVE_VAL()) != 0) {
+    if (m.msg == WM_QUIT_VAL()) {
+      if (g != 0) {
+        g->running = 0;
+      }
+    }
+    Win32_TranslateMessage(&m);
+    Win32_DispatchMessageA(&m);
+  }
+  // Rebuild the DIB after draining messages, on this (main) thread, so the
+  // engine never draws into a buffer being torn down by WM_SIZE.
+  game_win32_apply_pending_resize(g);
+}
+
+// 1 if the client size changed since the last call to this function; lets the
+// host recompute layout (panel/viewport rects) only when it actually moved.
+export function game_win32_consume_resized(g: GameWin32*) -> int32 {
+  if (g == 0) {
+    return 0;
+  }
+  if (g->resize_dirty != 0) {
+    // Still pending (applied at next poll); report changed so layout refreshes.
+    return 1;
+  }
+  return 0;
+}
+
+// True when this GameWin32's top-level window is the foreground (active) window.
+// Use this for keyboard fly that must work while the cursor is elsewhere on screen.
+export function game_win32_window_is_foreground(g: GameWin32*) -> int32 {
+  if (g == 0 || g->hwnd == 0) {
+    return 0;
+  }
+  var fg: int64 = Win32_GetForegroundWindow();
+  if (fg == g->hwnd) {
+    return 1;
+  }
+  if (g->child_hwnd != 0 && fg == g->child_hwnd) {
+    return 1;
+  }
+  return 0;
+}
+
+export function game_win32_is_running(g: GameWin32*) -> int32 {
+  if (g == 0) {
+    return 0;
+  }
+  return g->running;
+}
+
+export function game_win32_create(window_title_c: cstring, client_w: int32, client_h: int32) -> GameWin32* {
+  if (window_title_c == 0) {
+    window_title_c = gcw_cstr_lit("Methlang");
+  }
+  if (client_w <= 0) {
+    client_w = 640;
+  }
+  if (client_h <= 0) {
+    client_h = 480;
+  }
+  var raw: cstring = calloc((int64)1, game_win32_bytes());
+  if (raw == 0) {
+    return 0;
+  }
+  var g: GameWin32* = (GameWin32*)raw;
+  g->pixels = 0;
+  g->mem_dc = 0;
+  g->dib = 0;
+  g->old_dib = 0;
+  g->width = client_w;
+  g->height = client_h;
+  g->stride_px = client_w;
+  g->pending_resize_w = client_w;
+  g->pending_resize_h = client_h;
+  g->resize_dirty = 0;
+  g->running = 1;
+  Win32_QueryPerformanceFrequency(&(g->qpc_frequency));
+  Win32_QueryPerformanceCounter(&(g->prev_qpc));
+  var hin: int64 = Win32_GetModuleHandleA((cstring)0);
+  g->hinstance = hin;
+  GAME_WIN32_ACTIVE = g;
+  var wc: Win32WndClassExA;
+  wc.cb_size = WNDCLASSEXA_BYTE_SIZE();
+  wc.style = CS_HREDRAW_VAL() | CS_VREDRAW_VAL();
+  wc.lpfn_wnd_proc = (int64)(&game_win32_wnd_proc);
+  wc.cb_cls_extra = 0;
+  wc.cb_wnd_extra = 0;
+  wc.instance = hin;
+  wc.icon = Win32_LoadIconA((int64)0, (cstring)((int64)SHARED_CURSOR_ICON_RESOURCE()));
+  wc.cursor = Win32_LoadCursorA((int64)0, (cstring)((int64)SHARED_CURSOR_ICON_RESOURCE()));
+  wc.brush_bg = Win32_GetStockObject(WHITE_BRUSH_STOCK_OBJECT());
+  wc.menu_name = (int64)0;
+  wc.class_name = (int64)game_win32_class_name_c();
+  wc.icon_sm = Win32_LoadIconA((int64)0, (cstring)((int64)SHARED_CURSOR_ICON_RESOURCE()));
+  var atom_u: uint16 = Win32_RegisterClassExA(&wc);
+  var atom_present: int32 = 0;
+  if (atom_u != 0) {
+    atom_present = 1;
+  }
+  if (atom_present == 0) {
+    GAME_WIN32_ACTIVE = 0;
+    free(raw);
+    return 0;
+  }
+  var rc: Win32Rect;
+  rc.left = 0;
+  rc.top = 0;
+  rc.right = client_w;
+  rc.bottom = client_h;
+  Win32_AdjustWindowRectEx(&rc, WIN32_WS_OVERLAPPEDWINDOW(), 0, (uint32)0);
+  var win_w: int32 = rc.right - rc.left;
+  var win_h: int32 = rc.bottom - rc.top;
+  var hwnd: int64 = Win32_CreateWindowExA((uint32)0, game_win32_class_name_c(), window_title_c, WIN32_WS_OVERLAPPEDWINDOW(), CW_USEDEFAULT_LONG(), CW_USEDEFAULT_LONG(), win_w, win_h, (int64)0, (int64)0, hin, (cstring)0);
+  if (hwnd == 0) {
+    Win32_UnregisterClassA(game_win32_class_name_c(), hin);
+    GAME_WIN32_ACTIVE = 0;
+    free(raw);
+    return 0;
+  }
+  g->hwnd = hwnd;
+  // Build the DIB at the true client size (AdjustWindowRectEx targets it, but
+  // the WM may clamp; GetClientRect is authoritative).
+  var crc: Win32Rect;
+  crc.left = 0;
+  crc.top = 0;
+  crc.right = client_w;
+  crc.bottom = client_h;
+  Win32_GetClientRect(hwnd, &crc);
+  var cw: int32 = crc.right - crc.left;
+  var ch: int32 = crc.bottom - crc.top;
+  if (cw < 1) { cw = client_w; }
+  if (ch < 1) { ch = client_h; }
+  if (game_win32_make_dib(g, cw, ch) == 0) {
+    Win32_DestroyWindow(hwnd);
+    Win32_UnregisterClassA(game_win32_class_name_c(), hin);
+    GAME_WIN32_ACTIVE = 0;
+    free(raw);
+    return 0;
+  }
+  Win32_ShowWindow(hwnd, SW_SHOW_VAL());
+  Win32_UpdateWindow(hwnd);
+  return g;
+}
+
+// Create a child window inside the parent's client area for a Vulkan swapchain
+// to target. Reuses the main window class (its wndproc returns 1 for
+// WM_ERASEBKGND, so GDI never paints/erases the child -> no flicker fighting
+// Vulkan present). Input still flows through the parent's message pump (same
+// thread). Returns the child HWND, or 0.
+export function game_win32_create_child(g: GameWin32*, x: int32, y: int32, w: int32, h: int32) -> int64 {
+  if (g == 0 || g->hwnd == 0) {
+    return 0;
+  }
+  if (w < 1) { w = 1; }
+  if (h < 1) { h = 1; }
+  var child: int64 = Win32_CreateWindowExA((uint32)0, game_win32_class_name_c(), (cstring)0, WIN32_WS_CHILD_VISIBLE(), x, y, w, h, g->hwnd, (int64)0, g->hinstance, (cstring)0);
+  if (child == 0) {
+    return 0;
+  }
+  g->child_hwnd = child;
+  g->child_x = x;
+  g->child_y = y;
+  g->child_w = w;
+  g->child_h = h;
+  Win32_ShowWindow(child, SW_SHOW_VAL());
+  Win32_UpdateWindow(child);
+  return child;
+}
+
+// Reposition/resize the child to track the viewport rect. Returns 1 if the
+// child's size actually changed (caller should rebuild the swapchain).
+export function game_win32_move_child(g: GameWin32*, x: int32, y: int32, w: int32, h: int32) -> int32 {
+  if (g == 0 || g->child_hwnd == 0) {
+    return 0;
+  }
+  if (w < 1) { w = 1; }
+  if (h < 1) { h = 1; }
+  var size_changed: int32 = 0;
+  if (w != g->child_w || h != g->child_h) {
+    size_changed = 1;
+  }
+  if (x == g->child_x && y == g->child_y && size_changed == 0) {
+    return 0;
+  }
+  Win32_MoveWindow(g->child_hwnd, x, y, w, h, 0);
+  g->child_x = x;
+  g->child_y = y;
+  g->child_w = w;
+  g->child_h = h;
+  return size_changed;
+}
+
+export function game_win32_destroy_child(g: GameWin32*) {
+  if (g == 0 || g->child_hwnd == 0) {
+    return;
+  }
+  Win32_DestroyWindow(g->child_hwnd);
+  g->child_hwnd = 0;
+}
+
+export function game_win32_destroy(g: GameWin32*) {
+  if (g == 0) {
+    return;
+  }
+  if (g->mouse_captured != 0) {
+    game_mouse_end_capture(g);
+  }
+  GAME_WIN32_ACTIVE = 0;
+  if (g->hwnd != 0) {
+    Win32_DestroyWindow(g->hwnd);
+    var drain: Win32Msg;
+    while (Win32_PeekMessageA(&drain, (int64)0, (uint32)0, (uint32)0, PM_REMOVE_VAL()) != 0) {
+      Win32_TranslateMessage(&drain);
+      Win32_DispatchMessageA(&drain);
+    }
+    g->hwnd = (int64)0;
+  }
+  Win32_UnregisterClassA(game_win32_class_name_c(), g->hinstance);
+  // DIB bits are GDI-owned (not malloc); release via GDI, do not free().
+  if (g->mem_dc != 0) {
+    if (g->old_dib != 0) {
+      Win32_SelectObject(g->mem_dc, g->old_dib);
+      g->old_dib = (int64)0;
+    }
+    if (g->dib != 0) {
+      Win32_DeleteObject(g->dib);
+      g->dib = (int64)0;
+    }
+    Win32_DeleteDC(g->mem_dc);
+    g->mem_dc = (int64)0;
+  }
+  g->pixels = 0;
+  free((cstring)g);
+}

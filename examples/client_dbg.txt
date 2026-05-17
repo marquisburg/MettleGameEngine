@@ -1,0 +1,9 @@
+[client-dbg] main: enter
+[client-dbg] main: manifest created
+[client-dbg] main: arg path resolved
+[client-dbg] main: manifest loaded
+[client-dbg] main: net_init done
+[client-dbg] main: socket_tcp done
+[client-dbg] main: host/port read
+[client-dbg] main: sockaddr_in done
+[client-dbg] main: connecting

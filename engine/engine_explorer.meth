@@ -1,0 +1,545 @@
+// Engine file explorer: Win32 directory listing, keyboard nav, project-root aware paths.
+import "engine_fs_win32";
+import "game_gdi_win32";
+import "std/mem";
+
+export struct FsEntry {
+  name: uint8[260];
+  is_dir: int32;
+  _pad_ent: int32;
+  size_bytes: int64;
+}
+
+export struct ExplorerState {
+  cwd: uint8[768];
+  pattern_buf: uint8[800];
+  scratch_join: uint8[800];
+  project_root: uint8[768];
+  entries: FsEntry*;
+  entry_cap: int32;
+  entry_count: int32;
+  selection: int32;
+  scroll: int32;
+  needs_refresh: int32;
+  key_up_rep: int32;
+  key_down_rep: int32;
+  key_enter_rep: int32;
+  key_back_rep: int32;
+}
+
+export function EXPLORER_PATH_CAP() -> int32 {
+  return 768;
+}
+
+export function EXPLORER_VISIBLE_LINES() -> int32 {
+  return 40;
+}
+
+export function VK_UP() -> int32 {
+  return 38;
+}
+
+export function VK_DOWN() -> int32 {
+  return 40;
+}
+
+export function VK_RETURN() -> int32 {
+  return 13;
+}
+
+export function VK_BACK() -> int32 {
+  return 8;
+}
+
+export function explorer_entry_row_bytes() -> int64 {
+  return (int64)320;
+}
+
+function explorer_fs_entry_ptr(es: ExplorerState*, i: int32) -> FsEntry* {
+  if (es == 0) {
+    return 0;
+  }
+  if (i < 0) {
+    return 0;
+  }
+  var basep: FsEntry* = es->entries;
+  if (basep == 0) {
+    return 0;
+  }
+  var off: int64 = (int64)i * explorer_entry_row_bytes();
+  var raw: cstring = (cstring)((int64)((int64)basep + off));
+  return (FsEntry*)raw;
+}
+
+function explorer_should_swap_prior(a_dir: int32, a_name: cstring, b_dir: int32, b_name: cstring) -> int32 {
+  if (a_dir == 1 && b_dir != 1) {
+    return 0;
+  }
+  if (a_dir != 1 && b_dir == 1) {
+    return 1;
+  }
+  if (fs_name_cmp_lex(a_name, b_name) > 0) {
+    return 1;
+  }
+  return 0;
+}
+
+function explorer_sort_entries_internal(es: ExplorerState*) {
+  if (es == 0) {
+    return;
+  }
+  var n: int32 = es->entry_count;
+  if (n <= 1) {
+    return;
+  }
+  var tmp_c: cstring = (cstring)((int64)(&(es->scratch_join[0])));
+  var i: int32 = 0;
+  while (i < n) {
+    var j: int32 = i + 1;
+    while (j < n) {
+      var pi: FsEntry* = explorer_fs_entry_ptr(es, i);
+      var pj: FsEntry* = explorer_fs_entry_ptr(es, j);
+      var swap: int32 = explorer_should_swap_prior(pi->is_dir, (cstring)((int64)(&(pi->name[0]))), pj->is_dir, (cstring)((int64)(&(pj->name[0]))));
+      if (swap != 0) {
+        memcpy(tmp_c, (cstring)pi, explorer_entry_row_bytes());
+        memcpy((cstring)pi, (cstring)pj, explorer_entry_row_bytes());
+        memcpy((cstring)pj, tmp_c, explorer_entry_row_bytes());
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+}
+
+function explorer_clamp_scroll_internal(es: ExplorerState*) {
+  var vis: int32 = EXPLORER_VISIBLE_LINES();
+  while (es->selection >= es->scroll + vis && vis > 0) {
+    es->scroll = es->scroll + 1;
+  }
+  while (es->selection < es->scroll && es->scroll > 0) {
+    es->scroll = es->scroll - 1;
+  }
+}
+
+function explorer_path_char_fold(ch: uint8) -> uint8 {
+  if (ch == (uint8)47) {
+    return (uint8)92;
+  }
+  if (ch >= (uint8)65 && ch <= (uint8)90) {
+    return ch + (uint8)32;
+  }
+  return ch;
+}
+
+function explorer_path_len_trim(path: cstring) -> int32 {
+  if (path == 0) {
+    return 0;
+  }
+  var n: int32 = 0;
+  while (n < EXPLORER_PATH_CAP() && (uint8)(path[n]) != (uint8)0) {
+    n = n + 1;
+  }
+  while (n > 3) {
+    var tail: uint8 = (uint8)(path[n - 1]);
+    if (tail != (uint8)92 && tail != (uint8)47) {
+      break;
+    }
+    n = n - 1;
+  }
+  return n;
+}
+
+function explorer_path_same(path_a: cstring, path_b: cstring) -> int32 {
+  var al: int32 = explorer_path_len_trim(path_a);
+  var bl: int32 = explorer_path_len_trim(path_b);
+  if (al != bl) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < al) {
+    if (explorer_path_char_fold((uint8)(path_a[i])) != explorer_path_char_fold((uint8)(path_b[i]))) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+function explorer_path_has_project_prefix(path: cstring, root: cstring) -> int32 {
+  var rl: int32 = explorer_path_len_trim(root);
+  var pl: int32 = explorer_path_len_trim(path);
+  if (rl <= 0 || pl < rl) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < rl) {
+    if (explorer_path_char_fold((uint8)(path[i])) != explorer_path_char_fold((uint8)(root[i]))) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  if (pl == rl) {
+    return 1;
+  }
+  var sep: uint8 = explorer_path_char_fold((uint8)(path[rl]));
+  if (sep == (uint8)92) {
+    return 1;
+  }
+  return 0;
+}
+
+export function explorer_create(entry_cap: int32) -> ExplorerState* {
+  if (entry_cap <= 0) {
+    entry_cap = 256;
+  }
+  if (entry_cap > 4096) {
+    entry_cap = 4096;
+  }
+  var raw: cstring = calloc((int64)1, (int64)4096);
+  if (raw == 0) {
+    return 0;
+  }
+  var es: ExplorerState* = (ExplorerState*)raw;
+  es->entry_cap = entry_cap;
+  es->entry_count = 0;
+  es->selection = 0;
+  es->scroll = 0;
+  es->needs_refresh = 1;
+  es->key_up_rep = 0;
+  es->key_down_rep = 0;
+  es->key_enter_rep = 0;
+  es->key_back_rep = 0;
+  var blob: cstring = malloc(explorer_entry_row_bytes() * (int64)entry_cap);
+  if (blob == 0) {
+    free(raw);
+    return 0;
+  }
+  es->entries = (FsEntry*)blob;
+  es->cwd[0] = 46;
+  es->cwd[1] = 0;
+  es->project_root[0] = 46;
+  es->project_root[1] = 0;
+  return es;
+}
+
+export function explorer_destroy(es: ExplorerState*) {
+  if (es == 0) {
+    return;
+  }
+  if (es->entries != 0) {
+    free((cstring)es->entries);
+    es->entries = 0;
+  }
+  free((cstring)es);
+}
+
+export function explorer_set_cwd_cstr(es: ExplorerState*, path: cstring) {
+  if (es == 0) {
+    return;
+  }
+  fs_copy_nul_terminated((cstring)((int64)(&(es->cwd[0]))), EXPLORER_PATH_CAP(), path);
+  es->needs_refresh = 1;
+  es->selection = 0;
+  es->scroll = 0;
+}
+
+export function explorer_set_project_root(es: ExplorerState*, path: cstring) {
+  if (es == 0) {
+    return;
+  }
+  fs_copy_nul_terminated((cstring)((int64)(&(es->project_root[0]))), EXPLORER_PATH_CAP(), path);
+}
+
+export function explorer_mark_dirty(es: ExplorerState*) {
+  if (es != 0) {
+    es->needs_refresh = 1;
+  }
+}
+
+export function explorer_needs_refresh(es: ExplorerState*) -> int32 {
+  if (es == 0) {
+    return 0;
+  }
+  return es->needs_refresh;
+}
+
+export function explorer_cwd_ptr(es: ExplorerState*) -> cstring {
+  if (es == 0) {
+    return (cstring)0;
+  }
+  return (cstring)((int64)(&(es->cwd[0])));
+}
+
+export function explorer_root_ptr(es: ExplorerState*) -> cstring {
+  if (es == 0) {
+    return (cstring)0;
+  }
+  return (cstring)((int64)(&(es->project_root[0])));
+}
+
+export function explorer_entry_count(es: ExplorerState*) -> int32 {
+  if (es == 0) {
+    return 0;
+  }
+  return es->entry_count;
+}
+
+export function explorer_selection(es: ExplorerState*) -> int32 {
+  if (es == 0) {
+    return 0;
+  }
+  return es->selection;
+}
+
+export function explorer_scroll(es: ExplorerState*) -> int32 {
+  if (es == 0) {
+    return 0;
+  }
+  return es->scroll;
+}
+
+export function explorer_select_index(es: ExplorerState*, idx: int32) {
+  if (es == 0 || es->entry_count <= 0) {
+    return;
+  }
+  if (idx < 0) {
+    idx = 0;
+  }
+  if (idx >= es->entry_count) {
+    idx = es->entry_count - 1;
+  }
+  es->selection = idx;
+  explorer_clamp_scroll_internal(es);
+}
+
+export function explorer_scroll_add(es: ExplorerState*, delta: int32) {
+  if (es == 0) {
+    return;
+  }
+  var vis: int32 = EXPLORER_VISIBLE_LINES();
+  var max_scroll: int32 = es->entry_count - vis;
+  if (max_scroll < 0) {
+    max_scroll = 0;
+  }
+  es->scroll = es->scroll + delta;
+  if (es->scroll < 0) {
+    es->scroll = 0;
+  }
+  if (es->scroll > max_scroll) {
+    es->scroll = max_scroll;
+  }
+}
+
+export function explorer_reset_key_repeat(es: ExplorerState*) {
+  if (es == 0) {
+    return;
+  }
+  es->key_up_rep = 0;
+  es->key_down_rep = 0;
+  es->key_enter_rep = 0;
+  es->key_back_rep = 0;
+}
+
+export function explorer_entry_name_ptr(es: ExplorerState*, idx: int32) -> cstring {
+  if (es == 0) {
+    return (cstring)0;
+  }
+  if (idx < 0) {
+    return (cstring)0;
+  }
+  if (idx >= es->entry_count) {
+    return (cstring)0;
+  }
+  var row: FsEntry* = explorer_fs_entry_ptr(es, idx);
+  return (cstring)((int64)(&(row->name[0])));
+}
+
+export function explorer_entry_is_dir(es: ExplorerState*, idx: int32) -> int32 {
+  if (es == 0) {
+    return 0;
+  }
+  if (idx < 0 || idx >= es->entry_count) {
+    return 0;
+  }
+  return explorer_fs_entry_ptr(es, idx)->is_dir;
+}
+
+export function explorer_entry_size_bytes(es: ExplorerState*, idx: int32) -> int64 {
+  if (es == 0) {
+    return (int64)0;
+  }
+  if (idx < 0 || idx >= es->entry_count) {
+    return (int64)0;
+  }
+  return explorer_fs_entry_ptr(es, idx)->size_bytes;
+}
+
+export function explorer_refresh(es: ExplorerState*) -> int32 {
+  if (es == 0) {
+    return -1;
+  }
+  es->entry_count = 0;
+  if (fs_path_append_sep_and_wild((cstring)((int64)(&(es->pattern_buf[0]))), 800, (cstring)((int64)(&(es->cwd[0])))) < 0) {
+    return -1;
+  }
+  var fd: Win32FindDataA;
+  var h: int64 = Win32_FindFirstFileA((cstring)((int64)(&(es->pattern_buf[0]))), &fd);
+  if (h == FS_INVALID_HANDLE_VALUE()) {
+    es->needs_refresh = 0;
+    if (es->selection >= es->entry_count) {
+      es->selection = 0;
+    }
+    es->scroll = 0;
+    return 0;
+  }
+  while (1) {
+    var nm: cstring = fs_find_data_name_c(&fd);
+    if (fs_dot_or_dotdot(nm) == 0) {
+      if (es->entry_count < es->entry_cap) {
+        var row: FsEntry* = explorer_fs_entry_ptr(es, es->entry_count);
+        fs_copy_nul_terminated((cstring)((int64)(&(row->name[0]))), 260, nm);
+        row->is_dir = fs_find_data_is_dir(&fd);
+        row->size_bytes = fs_combine_size64(fd.n_file_size_high, fd.n_file_size_low);
+        es->entry_count = es->entry_count + 1;
+      }
+    }
+    var nxt: int32 = Win32_FindNextFileA(h, &fd);
+    if (nxt == 0) {
+      break;
+    }
+  }
+  Win32_FindClose(h);
+  explorer_sort_entries_internal(es);
+  es->needs_refresh = 0;
+  if (es->entry_count <= 0) {
+    es->selection = 0;
+    es->scroll = 0;
+    return 0;
+  }
+  if (es->selection >= es->entry_count) {
+    es->selection = es->entry_count - 1;
+  }
+  if (es->scroll > es->selection) {
+    es->scroll = es->selection;
+  }
+  explorer_clamp_scroll_internal(es);
+  return 0;
+}
+
+export function explorer_move_selection(es: ExplorerState*, delta: int32) {
+  if (es == 0) {
+    return;
+  }
+  if (es->entry_count <= 0) {
+    return;
+  }
+  es->selection = es->selection + delta;
+  if (es->selection < 0) {
+    es->selection = 0;
+  }
+  if (es->selection >= es->entry_count) {
+    es->selection = es->entry_count - 1;
+  }
+  explorer_clamp_scroll_internal(es);
+}
+
+export function explorer_try_enter_selection(es: ExplorerState*) {
+  if (es == 0) {
+    return;
+  }
+  if (es->entry_count <= 0) {
+    return;
+  }
+  var idx: int32 = es->selection;
+  if (idx < 0) {
+    return;
+  }
+  if (idx >= es->entry_count) {
+    return;
+  }
+  var row: FsEntry* = explorer_fs_entry_ptr(es, idx);
+  if (row->is_dir != 1) {
+    return;
+  }
+  if (fs_path_join_child((cstring)((int64)(&(es->scratch_join[0]))), 800, (cstring)((int64)(&(es->cwd[0]))), (cstring)((int64)(&(row->name[0])))) < 0) {
+    return;
+  }
+  fs_copy_nul_terminated((cstring)((int64)(&(es->cwd[0]))), EXPLORER_PATH_CAP(), (cstring)((int64)(&(es->scratch_join[0]))));
+  es->needs_refresh = 1;
+  es->selection = 0;
+  es->scroll = 0;
+}
+
+export function explorer_try_parent_directory(es: ExplorerState*) {
+  if (es == 0) {
+    return;
+  }
+  if (explorer_path_same((cstring)((int64)(&(es->cwd[0]))), (cstring)((int64)(&(es->project_root[0])))) != 0) {
+    return;
+  }
+  fs_copy_nul_terminated((cstring)((int64)(&(es->scratch_join[0]))), 800, (cstring)((int64)(&(es->cwd[0]))));
+  fs_path_parent_inplace((cstring)((int64)(&(es->scratch_join[0]))));
+  if ((uint8)(es->scratch_join[0]) == (uint8)0) {
+    es->scratch_join[0] = 46;
+    es->scratch_join[1] = 0;
+  }
+  if (explorer_path_has_project_prefix((cstring)((int64)(&(es->scratch_join[0]))), (cstring)((int64)(&(es->project_root[0])))) == 0) {
+    fs_copy_nul_terminated((cstring)((int64)(&(es->scratch_join[0]))), 800, (cstring)((int64)(&(es->project_root[0]))));
+  }
+  fs_copy_nul_terminated((cstring)((int64)(&(es->cwd[0]))), EXPLORER_PATH_CAP(), (cstring)((int64)(&(es->scratch_join[0]))));
+  es->needs_refresh = 1;
+  es->selection = 0;
+  es->scroll = 0;
+}
+
+export function explorer_input_tick(es: ExplorerState*) {
+  if (es == 0) {
+    return;
+  }
+  var up_h: int32 = game_input_key_held(VK_UP());
+  if (up_h == 0) {
+    es->key_up_rep = 0;
+  } else {
+    es->key_up_rep = es->key_up_rep + 1;
+    if (es->key_up_rep == 1) {
+      explorer_move_selection(es, -1);
+    } else {
+      var mup: int32 = es->key_up_rep % 12;
+      if (mup == 0) {
+        explorer_move_selection(es, -1);
+      }
+    }
+  }
+  var dn_h: int32 = game_input_key_held(VK_DOWN());
+  if (dn_h == 0) {
+    es->key_down_rep = 0;
+  } else {
+    es->key_down_rep = es->key_down_rep + 1;
+    if (es->key_down_rep == 1) {
+      explorer_move_selection(es, 1);
+    } else {
+      var md: int32 = es->key_down_rep % 12;
+      if (md == 0) {
+        explorer_move_selection(es, 1);
+      }
+    }
+  }
+  var en_h: int32 = game_input_key_held(VK_RETURN());
+  if (en_h == 0) {
+    es->key_enter_rep = 0;
+  } else {
+    es->key_enter_rep = es->key_enter_rep + 1;
+    if (es->key_enter_rep == 1) {
+      explorer_try_enter_selection(es);
+    }
+  }
+  var bk_h: int32 = game_input_key_held(VK_BACK());
+  if (bk_h == 0) {
+    es->key_back_rep = 0;
+  } else {
+    es->key_back_rep = es->key_back_rep + 1;
+    if (es->key_back_rep == 1) {
+      explorer_try_parent_directory(es);
+    }
+  }
+}

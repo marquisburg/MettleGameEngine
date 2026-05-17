@@ -1,0 +1,518 @@
+// Fixed-capacity OBJ mesh store for the editor. The importer supports the
+// practical OBJ subset we need now: v positions and f faces with plain,
+// v/vt, v//vn, or v/vt/vn indices. Faces are triangulated as a fan.
+import "std/conv";
+import "std/io";
+import "std/mem";
+
+extern function atof_c(s: cstring) -> float64 = "atof";
+
+export struct MeshRecord {
+  verts: float64*;
+  tris: int32*;
+  half: float64;
+  id: int32;
+  vert_count: int32;
+  tri_count: int32;
+  vert_cap: int32;
+  tri_cap: int32;
+  path: uint8[520];
+}
+
+export struct MeshStore {
+  rows: MeshRecord*;
+  cap: int32;
+  count: int32;
+  next_id: int32;
+  _pad: int32;
+}
+
+function mesh_row_bytes() -> int64 {
+  return (int64)608;
+}
+
+function mesh_store_bytes() -> int64 {
+  return (int64)64;
+}
+
+function mesh_copy_cstr(dst: cstring, dst_cap: int32, src: cstring) {
+  if (dst == 0 || dst_cap <= 0) {
+    return;
+  }
+  if (src == 0) {
+    dst[0] = 0;
+    return;
+  }
+  var i: int32 = 0;
+  while (i + 1 < dst_cap) {
+    var b: uint8 = (uint8)(src[i]);
+    dst[i] = b;
+    if (b == (uint8)0) {
+      return;
+    }
+    i = i + 1;
+  }
+  dst[dst_cap - 1] = 0;
+}
+
+function mesh_ascii_lower(c: uint8) -> uint8 {
+  if (c >= (uint8)65 && c <= (uint8)90) {
+    return (uint8)((int32)c + 32);
+  }
+  return c;
+}
+
+function mesh_ext_matches(path: cstring, ext: string) -> int32 {
+  if (path == 0) {
+    return 0;
+  }
+  var L: int64 = strlen(path);
+  var E: int64 = ext.length;
+  if (E <= 0 || L < E) {
+    return 0;
+  }
+  var start: int64 = L - E;
+  var i: int64 = 0;
+  while (i < E) {
+    if (mesh_ascii_lower((uint8)(path[start + i])) != mesh_ascii_lower((uint8)(ext.chars[i]))) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+export function mesh_store_create(cap: int32) -> MeshStore* {
+  if (cap <= 0) {
+    cap = 64;
+  }
+  if (cap > 512) {
+    cap = 512;
+  }
+  var raw: cstring = calloc((int64)1, mesh_store_bytes());
+  if (raw == 0) {
+    return 0;
+  }
+  var ms: MeshStore* = (MeshStore*)raw;
+  ms->cap = cap;
+  ms->count = 0;
+  ms->next_id = 1;
+  var rows: cstring = calloc(mesh_row_bytes(), (int64)cap);
+  if (rows == 0) {
+    free(raw);
+    return 0;
+  }
+  ms->rows = (MeshRecord*)rows;
+  return ms;
+}
+
+function mesh_row(ms: MeshStore*, i: int32) -> MeshRecord* {
+  if (ms == 0 || i < 0 || i >= ms->count || ms->rows == 0) {
+    return 0;
+  }
+  var off: int64 = (int64)i * mesh_row_bytes();
+  return (MeshRecord*)((cstring)((int64)ms->rows + off));
+}
+
+function mesh_slot(ms: MeshStore*, i: int32) -> MeshRecord* {
+  if (ms == 0 || i < 0 || i >= ms->cap || ms->rows == 0) {
+    return 0;
+  }
+  var off: int64 = (int64)i * mesh_row_bytes();
+  return (MeshRecord*)((cstring)((int64)ms->rows + off));
+}
+
+export function mesh_store_clear(ms: MeshStore*) {
+  if (ms == 0) {
+    return;
+  }
+  var i: int32 = 0;
+  while (i < ms->count) {
+    var m: MeshRecord* = mesh_row(ms, i);
+    if (m != 0) {
+      if (m->verts != 0) {
+        free((cstring)m->verts);
+        m->verts = 0;
+      }
+      if (m->tris != 0) {
+        free((cstring)m->tris);
+        m->tris = 0;
+      }
+    }
+    i = i + 1;
+  }
+  if (ms->rows != 0) {
+    memset((cstring)ms->rows, 0, mesh_row_bytes() * (int64)ms->cap);
+  }
+  ms->count = 0;
+  ms->next_id = 1;
+}
+
+export function mesh_store_destroy(ms: MeshStore*) {
+  if (ms == 0) {
+    return;
+  }
+  mesh_store_clear(ms);
+  if (ms->rows != 0) {
+    free((cstring)ms->rows);
+    ms->rows = 0;
+  }
+  free((cstring)ms);
+}
+
+export function mesh_store_find(ms: MeshStore*, id: int32) -> MeshRecord* {
+  if (ms == 0 || id == 0) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < ms->count) {
+    var m: MeshRecord* = mesh_row(ms, i);
+    if (m != 0 && m->id == id) {
+      return m;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+export function mesh_record_path(m: MeshRecord*) -> cstring {
+  if (m == 0) {
+    return (cstring)0;
+  }
+  return (cstring)((int64)(&(m->path[0])));
+}
+
+export function mesh_record_half(m: MeshRecord*) -> float64 {
+  if (m == 0) {
+    return 1.0;
+  }
+  return m->half;
+}
+
+export function mesh_record_vertex_count(m: MeshRecord*) -> int32 {
+  if (m == 0) {
+    return 0;
+  }
+  return m->vert_count;
+}
+
+export function mesh_record_tri_count(m: MeshRecord*) -> int32 {
+  if (m == 0) {
+    return 0;
+  }
+  return m->tri_count;
+}
+
+export function mesh_vx(m: MeshRecord*, idx: int32) -> float64 {
+  if (m == 0 || m->verts == 0 || idx < 0 || idx >= m->vert_count) {
+    return 0.0;
+  }
+  return m->verts[idx * 3];
+}
+
+export function mesh_vy(m: MeshRecord*, idx: int32) -> float64 {
+  if (m == 0 || m->verts == 0 || idx < 0 || idx >= m->vert_count) {
+    return 0.0;
+  }
+  return m->verts[idx * 3 + 1];
+}
+
+export function mesh_vz(m: MeshRecord*, idx: int32) -> float64 {
+  if (m == 0 || m->verts == 0 || idx < 0 || idx >= m->vert_count) {
+    return 0.0;
+  }
+  return m->verts[idx * 3 + 2];
+}
+
+export function mesh_tri_index(m: MeshRecord*, tri: int32, corner: int32) -> int32 {
+  if (m == 0 || m->tris == 0 || tri < 0 || tri >= m->tri_count || corner < 0 || corner > 2) {
+    return -1;
+  }
+  return m->tris[tri * 3 + corner];
+}
+
+function obj_is_space(c: uint8) -> int32 {
+  if (c == (uint8)32 || c == (uint8)9 || c == (uint8)13 || c == (uint8)10) {
+    return 1;
+  }
+  return 0;
+}
+
+function obj_skip_spaces(line: cstring, pos: int32) -> int32 {
+  while (pos < 2048 && obj_is_space((uint8)(line[pos])) != 0) {
+    pos = pos + 1;
+  }
+  return pos;
+}
+
+function obj_copy_word(out: cstring, out_cap: int32, line: cstring, pos: int32) -> int32 {
+  if (out == 0 || out_cap <= 1) {
+    return pos;
+  }
+  var j: int32 = 0;
+  while (pos < 2048 && j + 1 < out_cap) {
+    var c: uint8 = (uint8)(line[pos]);
+    if (c == (uint8)0 || obj_is_space(c) != 0) {
+      break;
+    }
+    out[j] = c;
+    j = j + 1;
+    pos = pos + 1;
+  }
+  out[j] = 0;
+  return pos;
+}
+
+function obj_copy_face_index(out: cstring, out_cap: int32, line: cstring, pos: int32) -> int32 {
+  if (out == 0 || out_cap <= 1) {
+    return pos;
+  }
+  var j: int32 = 0;
+  while (pos < 2048) {
+    var c: uint8 = (uint8)(line[pos]);
+    if (c == (uint8)0 || obj_is_space(c) != 0) {
+      break;
+    }
+    if (c == (uint8)47) {
+      break;
+    }
+    if (j + 1 < out_cap) {
+      out[j] = c;
+      j = j + 1;
+    }
+    pos = pos + 1;
+  }
+  out[j] = 0;
+  while (pos < 2048) {
+    var c2: uint8 = (uint8)(line[pos]);
+    if (c2 == (uint8)0 || obj_is_space(c2) != 0) {
+      break;
+    }
+    pos = pos + 1;
+  }
+  return pos;
+}
+
+function mesh_add_vertex(m: MeshRecord*, x: float64, y: float64, z: float64) -> int32 {
+  if (m == 0 || m->verts == 0 || m->vert_count >= m->vert_cap) {
+    return 0;
+  }
+  var idx: int32 = m->vert_count * 3;
+  m->verts[idx] = x;
+  m->verts[idx + 1] = y;
+  m->verts[idx + 2] = z;
+  m->vert_count = m->vert_count + 1;
+  return 1;
+}
+
+function mesh_add_tri(m: MeshRecord*, a: int32, b: int32, c: int32) -> int32 {
+  if (m == 0 || m->tris == 0 || m->tri_count >= m->tri_cap) {
+    return 0;
+  }
+  if (a < 0 || b < 0 || c < 0) {
+    return 0;
+  }
+  var idx: int32 = m->tri_count * 3;
+  m->tris[idx] = a;
+  m->tris[idx + 1] = b;
+  m->tris[idx + 2] = c;
+  m->tri_count = m->tri_count + 1;
+  return 1;
+}
+
+function obj_to_index(raw_idx: int32, vert_count: int32) -> int32 {
+  if (raw_idx > 0) {
+    return raw_idx - 1;
+  }
+  if (raw_idx < 0) {
+    return vert_count + raw_idx;
+  }
+  return -1;
+}
+
+function mesh_recenter_and_bounds(m: MeshRecord*) {
+  if (m == 0 || m->verts == 0 || m->vert_count <= 0) {
+    return;
+  }
+  var minx: float64 = m->verts[0];
+  var miny: float64 = m->verts[1];
+  var minz: float64 = m->verts[2];
+  var maxx: float64 = minx;
+  var maxy: float64 = miny;
+  var maxz: float64 = minz;
+  var i: int32 = 0;
+  while (i < m->vert_count) {
+    var x: float64 = m->verts[i * 3];
+    var y: float64 = m->verts[i * 3 + 1];
+    var z: float64 = m->verts[i * 3 + 2];
+    if (x < minx) { minx = x; }
+    if (y < miny) { miny = y; }
+    if (z < minz) { minz = z; }
+    if (x > maxx) { maxx = x; }
+    if (y > maxy) { maxy = y; }
+    if (z > maxz) { maxz = z; }
+    i = i + 1;
+  }
+  var cx: float64 = (minx + maxx) * 0.5;
+  var cy: float64 = (miny + maxy) * 0.5;
+  var cz: float64 = (minz + maxz) * 0.5;
+  var hx: float64 = (maxx - minx) * 0.5;
+  var hy: float64 = (maxy - miny) * 0.5;
+  var hz: float64 = (maxz - minz) * 0.5;
+  var h: float64 = hx;
+  if (hy > h) { h = hy; }
+  if (hz > h) { h = hz; }
+  if (h < 0.05) { h = 0.05; }
+  m->half = h;
+  i = 0;
+  while (i < m->vert_count) {
+    m->verts[i * 3] = m->verts[i * 3] - cx;
+    m->verts[i * 3 + 1] = m->verts[i * 3 + 1] - cy;
+    m->verts[i * 3 + 2] = m->verts[i * 3 + 2] - cz;
+    i = i + 1;
+  }
+}
+
+export function mesh_store_import_obj(ms: MeshStore*, path: cstring) -> int32 {
+  if (ms == 0 || path == 0 || ms->count >= ms->cap) {
+    return 0;
+  }
+  var file: cstring = fopen(path, cstr("r"));
+  if (file == 0) {
+    return 0;
+  }
+  var m: MeshRecord* = mesh_slot(ms, ms->count);
+  if (m == 0) {
+    fclose(file);
+    return 0;
+  }
+  memset((cstring)m, 0, mesh_row_bytes());
+  m->vert_cap = 8192;
+  m->tri_cap = 16384;
+  m->verts = (float64*)malloc((int64)m->vert_cap * (int64)3 * (int64)8);
+  m->tris = (int32*)malloc((int64)m->tri_cap * (int64)3 * (int64)4);
+  if (m->verts == 0 || m->tris == 0) {
+    if (m->verts != 0) { free((cstring)m->verts); }
+    if (m->tris != 0) { free((cstring)m->tris); }
+    fclose(file);
+    return 0;
+  }
+  mesh_copy_cstr((cstring)((int64)(&(m->path[0]))), 520, path);
+  var line: uint8[2048];
+  var tok: uint8[96];
+  while (fgets((cstring)((int64)(&(line[0]))), 2048, file) != 0) {
+    if (line[0] == (uint8)118 && obj_is_space(line[1]) != 0) {
+      var p: int32 = obj_skip_spaces((cstring)((int64)(&(line[0]))), 1);
+      p = obj_copy_word((cstring)((int64)(&(tok[0]))), 96, (cstring)((int64)(&(line[0]))), p);
+      var x: float64 = atof_c((cstring)((int64)(&(tok[0]))));
+      p = obj_skip_spaces((cstring)((int64)(&(line[0]))), p);
+      p = obj_copy_word((cstring)((int64)(&(tok[0]))), 96, (cstring)((int64)(&(line[0]))), p);
+      var y: float64 = atof_c((cstring)((int64)(&(tok[0]))));
+      p = obj_skip_spaces((cstring)((int64)(&(line[0]))), p);
+      p = obj_copy_word((cstring)((int64)(&(tok[0]))), 96, (cstring)((int64)(&(line[0]))), p);
+      var z: float64 = atof_c((cstring)((int64)(&(tok[0]))));
+      mesh_add_vertex(m, x, y, z);
+    } else {
+      if (line[0] == (uint8)102 && obj_is_space(line[1]) != 0) {
+        var idxs: int32[32];
+        var n: int32 = 0;
+        var fp: int32 = obj_skip_spaces((cstring)((int64)(&(line[0]))), 1);
+        while (fp < 2048 && n < 32) {
+          fp = obj_skip_spaces((cstring)((int64)(&(line[0]))), fp);
+          var fc: uint8 = line[fp];
+          if (fc == (uint8)0 || fc == (uint8)13 || fc == (uint8)10) {
+            break;
+          }
+          fp = obj_copy_face_index((cstring)((int64)(&(tok[0]))), 96, (cstring)((int64)(&(line[0]))), fp);
+          var raw_i: int32 = atoi((cstring)((int64)(&(tok[0]))));
+          var vi: int32 = obj_to_index(raw_i, m->vert_count);
+          if (vi >= 0 && vi < m->vert_count) {
+            idxs[n] = vi;
+            n = n + 1;
+          }
+        }
+        if (n >= 3) {
+          var k: int32 = 1;
+          while (k + 1 < n) {
+            mesh_add_tri(m, idxs[0], idxs[k], idxs[k + 1]);
+            k = k + 1;
+          }
+        }
+      }
+    }
+  }
+  fclose(file);
+  if (m->vert_count <= 0 || m->tri_count <= 0) {
+    free((cstring)m->verts);
+    free((cstring)m->tris);
+    memset((cstring)m, 0, mesh_row_bytes());
+    return 0;
+  }
+  mesh_recenter_and_bounds(m);
+  var id: int32 = ms->next_id;
+  m->id = id;
+  ms->next_id = id + 1;
+  ms->count = ms->count + 1;
+  return id;
+}
+
+function mesh_store_import_gltf_proxy(ms: MeshStore*, path: cstring) -> int32 {
+  if (ms == 0 || path == 0 || ms->count >= ms->cap) {
+    return 0;
+  }
+  var m: MeshRecord* = mesh_slot(ms, ms->count);
+  if (m == 0) {
+    return 0;
+  }
+  memset((cstring)m, 0, mesh_row_bytes());
+  m->vert_cap = 8;
+  m->tri_cap = 12;
+  m->verts = (float64*)malloc((int64)m->vert_cap * (int64)3 * (int64)8);
+  m->tris = (int32*)malloc((int64)m->tri_cap * (int64)3 * (int64)4);
+  if (m->verts == 0 || m->tris == 0) {
+    if (m->verts != 0) { free((cstring)m->verts); }
+    if (m->tris != 0) { free((cstring)m->tris); }
+    memset((cstring)m, 0, mesh_row_bytes());
+    return 0;
+  }
+  mesh_copy_cstr((cstring)((int64)(&(m->path[0]))), 520, path);
+  mesh_add_vertex(m, -1.0, -1.0, -1.0);
+  mesh_add_vertex(m, 1.0, -1.0, -1.0);
+  mesh_add_vertex(m, 1.0, 1.0, -1.0);
+  mesh_add_vertex(m, -1.0, 1.0, -1.0);
+  mesh_add_vertex(m, -1.0, -1.0, 1.0);
+  mesh_add_vertex(m, 1.0, -1.0, 1.0);
+  mesh_add_vertex(m, 1.0, 1.0, 1.0);
+  mesh_add_vertex(m, -1.0, 1.0, 1.0);
+  mesh_add_tri(m, 0, 1, 2);
+  mesh_add_tri(m, 0, 2, 3);
+  mesh_add_tri(m, 4, 6, 5);
+  mesh_add_tri(m, 4, 7, 6);
+  mesh_add_tri(m, 0, 4, 5);
+  mesh_add_tri(m, 0, 5, 1);
+  mesh_add_tri(m, 1, 5, 6);
+  mesh_add_tri(m, 1, 6, 2);
+  mesh_add_tri(m, 2, 6, 7);
+  mesh_add_tri(m, 2, 7, 3);
+  mesh_add_tri(m, 3, 7, 4);
+  mesh_add_tri(m, 3, 4, 0);
+  m->half = 1.0;
+  var id: int32 = ms->next_id;
+  m->id = id;
+  ms->next_id = id + 1;
+  ms->count = ms->count + 1;
+  return id;
+}
+
+export function mesh_store_import_mesh(ms: MeshStore*, path: cstring) -> int32 {
+  if (path == 0) {
+    return 0;
+  }
+  if (mesh_ext_matches(path, ".obj") != 0) {
+    return mesh_store_import_obj(ms, path);
+  }
+  if (mesh_ext_matches(path, ".gltf") != 0 || mesh_ext_matches(path, ".glb") != 0) {
+    return mesh_store_import_gltf_proxy(ms, path);
+  }
+  return mesh_store_import_obj(ms, path);
+}

@@ -1,0 +1,1646 @@
+// VS-flavored editor chrome: framebuffer panels + fixed GDI text overlay.
+//
+// Panel layout (left to right):
+//   [explorer] | [assets] | [viewport (Vulkan child)] | [inspector]
+// All widths come from EDITOR_PANEL_W / EDITOR_ASSET_W / EDITOR_INSPECTOR_W so
+// tweaks live in one place. A status strip runs along the bottom and shows
+// transient messages (save state, Lua compile errors, etc).
+import "std/conv";
+import "engine_assets";
+import "engine_explorer";
+import "engine_fs_win32";
+import "engine_lua";
+import "engine_mesh";
+import "engine_output_log";
+import "engine_project";
+import "engine_scene";
+import "engine_scene_io";
+import "engine_viewport";
+import "game_gdi_win32";
+import "std/io";
+import "std/mem";
+
+extern function editor_atof(s: cstring) -> float64 = "atof";
+
+export function EDITOR_PANEL_W() -> int32 {
+  return 312;
+}
+
+export function EDITOR_ASSET_W() -> int32 {
+  return 328;
+}
+
+export function EDITOR_INSPECTOR_W() -> int32 {
+  return 344;
+}
+
+export function EDITOR_LINE_H() -> int32 {
+  return 16;
+}
+
+export function EDITOR_TOPBAR_H() -> int32 {
+  return 30;
+}
+
+export function EDITOR_BODY_TOP() -> int32 {
+  return EDITOR_TOPBAR_H() + (int32)54;
+}
+
+// Height of the Output panel that runs along the bottom between the explorer
+// and inspector splits. Includes its title row.
+export function EDITOR_OUTPUT_H() -> int32 {
+  return 168;
+}
+
+export function EDITOR_FOCUS_PROJECT_FILES() -> int32 { return 1; }
+export function EDITOR_FOCUS_ASSETS() -> int32 { return 2; }
+export function EDITOR_FOCUS_VIEWPORT() -> int32 { return 3; }
+export function EDITOR_FOCUS_INSPECTOR() -> int32 { return 4; }
+
+export struct EditorUiState {
+  key_prev: uint8[256];
+  edit_buf: uint8[128];
+  scene_path: uint8[800];
+  status: uint8[128];
+  editing_field: int32;
+  scene_scroll: int32;
+  left_was_down: int32;
+  status_frames: int32;
+  active_panel: int32;
+  project_settings_open: int32;
+}
+
+function editor_ui_bytes() -> int64 {
+  return (int64)1408;
+}
+
+export function editor_ui_create() -> EditorUiState* {
+  var raw: cstring = calloc((int64)1, editor_ui_bytes());
+  if (raw == 0) {
+    return 0;
+  }
+  return (EditorUiState*)raw;
+}
+
+export function editor_ui_destroy(ui: EditorUiState*) {
+  if (ui != 0) {
+    free((cstring)ui);
+  }
+}
+
+export function editor_ui_keyboard_captured(ui: EditorUiState*) -> int32 {
+  if (ui == 0) {
+    return 0;
+  }
+  if (ui->editing_field != 0) {
+    return 1;
+  }
+  return 0;
+}
+
+export function editor_ui_project_files_focused(ui: EditorUiState*) -> int32 {
+  if (ui == 0) {
+    return 0;
+  }
+  if (ui->active_panel == EDITOR_FOCUS_PROJECT_FILES()) {
+    return 1;
+  }
+  return 0;
+}
+
+export function editor_ui_reset_input_edges(ui: EditorUiState*) {
+  if (ui == 0) {
+    return;
+  }
+  var i: int32 = 0;
+  while (i < 256) {
+    if (game_input_key_held(i) != 0) {
+      ui->key_prev[i] = (uint8)1;
+    } else {
+      ui->key_prev[i] = (uint8)0;
+    }
+    i = i + 1;
+  }
+  ui->left_was_down = game_input_key_held(1);
+}
+
+function fb_fill_rect(px: uint32*, fw: int32, fh: int32, ax0: int32, ay0: int32, ax1: int32, ay1: int32, c: uint32) {
+  var x0: int32 = ax0;
+  var y0: int32 = ay0;
+  var x1: int32 = ax1;
+  var y1: int32 = ay1;
+  if (x0 < 0) {
+    x0 = 0;
+  }
+  if (y0 < 0) {
+    y0 = 0;
+  }
+  if (x1 > fw) {
+    x1 = fw;
+  }
+  if (y1 > fh) {
+    y1 = fh;
+  }
+  if (x1 <= x0) {
+    return;
+  }
+  if (y1 <= y0) {
+    return;
+  }
+  var yy: int32 = y0;
+  while (yy < y1) {
+    var xx: int32 = x0;
+    while (xx < x1) {
+      var idx: int32 = yy * fw + xx;
+      px[idx] = c;
+      xx = xx + 1;
+    }
+    yy = yy + 1;
+  }
+}
+
+function editor_text_out(dc: int64, x: int32, y: int32, txt: cstring) {
+  if (txt == 0) {
+    return;
+  }
+  var L: int32 = (int32)strlen(txt);
+  Win32_TextOutA(dc, x, y, txt, L);
+}
+
+// Append src to dst starting at offset pos; returns the new offset (NUL is not
+// written here so callers can keep appending, then terminate once).
+function fs_copy_into(dst: cstring, dst_cap: int32, pos: int32, src: cstring) -> int32 {
+  if (dst == 0 || src == 0) {
+    return pos;
+  }
+  var j: int32 = pos;
+  var k: int32 = 0;
+  while (j + 1 < dst_cap) {
+    var ch: uint8 = (uint8)(src[k]);
+    if (ch == (uint8)0) {
+      return j;
+    }
+    dst[j] = ch;
+    j = j + 1;
+    k = k + 1;
+  }
+  return j;
+}
+
+function editor_viewport_region(g: GameWin32*, vp: EngineViewport*, sc: Scene*, x0: int32, frame: int32, vk_active: int32) {
+  var fw: int32 = g->width;
+  var fh: int32 = g->height;
+  var px: uint32* = g->pixels;
+  var bottom: int32 = fh - EDITOR_OUTPUT_H();
+  var right_x: int32 = fw - EDITOR_INSPECTOR_W();
+  if (right_x < x0 + (int32)160) {
+    right_x = fw - (int32)8;
+  }
+  var view_w: int32 = right_x - x0 - (int32)8;
+  if (view_w < 1) {
+    view_w = 1;
+  }
+  if (bottom < EDITOR_BODY_TOP() + (int32)20) {
+    bottom = fh - (int32)24;
+  }
+  // When Vulkan owns the viewport, a child window covers this rect and the GPU
+  // renders the scene. Skip the CPU wireframe entirely; drawing it under the
+  // child wastes a frame and bleeds through during resize/paint races (the
+  // "renders inside itself" artifact).
+  if (vk_active != 0) {
+    return;
+  }
+  engine_viewport_render(vp, sc, g, x0, EDITOR_BODY_TOP(), view_w, bottom - EDITOR_BODY_TOP());
+}
+
+function editor_copy_trunc_to_buf(dst: uint8*, dst_cap: int32, src: cstring) {
+  if (dst_cap <= 1) {
+    return;
+  }
+  if (src == 0) {
+    dst[0] = 0;
+    return;
+  }
+  var ji: int32 = 0;
+  while (ji + 1 < dst_cap && (uint8)(src[ji]) != (uint8)0) {
+    dst[ji] = (uint8)(src[ji]);
+    ji = ji + 1;
+  }
+  dst[ji] = 0;
+}
+
+function editor_copy_cstr(dst: cstring, dst_cap: int32, src: cstring) {
+  if (dst == 0 || dst_cap <= 0) {
+    return;
+  }
+  if (src == 0) {
+    dst[0] = 0;
+    return;
+  }
+  var i: int32 = 0;
+  while (i + 1 < dst_cap) {
+    var b: uint8 = (uint8)(src[i]);
+    dst[i] = b;
+    if (b == (uint8)0) {
+      return;
+    }
+    i = i + 1;
+  }
+  dst[dst_cap - 1] = 0;
+}
+
+function editor_status(ui: EditorUiState*, msg: string) {
+  if (ui == 0) {
+    return;
+  }
+  editor_copy_cstr((cstring)((int64)(&(ui->status[0]))), 128, msg.chars);
+  ui->status_frames = 180;
+  // Mirror transient status into the Output panel so there's a scrollback of
+  // save/load/script actions, not just the fading bottom-right strip.
+  output_log_info(msg.chars);
+}
+
+function editor_scene_path(ui: EditorUiState*, es: ExplorerState*) -> cstring {
+  if (ui == 0) {
+    return (cstring)0;
+  }
+  if (ui->scene_path[0] == (uint8)0) {
+    fs_path_join_child((cstring)((int64)(&(ui->scene_path[0]))), 800, explorer_root_ptr(es), cstr("scene.mscene"));
+  }
+  return (cstring)((int64)(&(ui->scene_path[0])));
+}
+
+export function editor_ui_default_scene_path(ui: EditorUiState*, es: ExplorerState*) -> cstring {
+  return editor_scene_path(ui, es);
+}
+
+// Lets the editor shell override the scene path with one resolved from the
+// project info (rather than the explorer cwd). Once set, the UI uses this for
+// all subsequent saves/loads.
+export function editor_ui_set_scene_path(ui: EditorUiState*, path: cstring) {
+  if (ui == 0 || path == 0) {
+    return;
+  }
+  editor_copy_cstr((cstring)((int64)(&(ui->scene_path[0]))), 800, path);
+}
+
+function editor_key_edge(ui: EditorUiState*, vkey: int32) -> int32 {
+  if (ui == 0 || vkey < 0 || vkey >= 256) {
+    return 0;
+  }
+  if (game_input_key_held(vkey) != 0 && ui->key_prev[vkey] == (uint8)0) {
+    return 1;
+  }
+  return 0;
+}
+
+function editor_snapshot_keys(ui: EditorUiState*) {
+  if (ui == 0) {
+    return;
+  }
+  var i: int32 = 0;
+  while (i < 256) {
+    if (game_input_key_held(i) != 0) {
+      ui->key_prev[i] = (uint8)1;
+    } else {
+      ui->key_prev[i] = (uint8)0;
+    }
+    i = i + 1;
+  }
+}
+
+function editor_buf_len(buf: cstring, cap: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < cap) {
+    if ((uint8)(buf[i]) == (uint8)0) {
+      return i;
+    }
+    i = i + 1;
+  }
+  return cap;
+}
+
+function editor_buf_append(ui: EditorUiState*, ch: uint8) {
+  if (ui == 0) {
+    return;
+  }
+  var buf: cstring = (cstring)((int64)(&(ui->edit_buf[0])));
+  var L: int32 = editor_buf_len(buf, 128);
+  if (L + 1 < 128) {
+    buf[L] = ch;
+    buf[L + 1] = 0;
+  }
+}
+
+function editor_buf_backspace(ui: EditorUiState*) {
+  if (ui == 0) {
+    return;
+  }
+  var buf: cstring = (cstring)((int64)(&(ui->edit_buf[0])));
+  var L: int32 = editor_buf_len(buf, 128);
+  if (L > 0) {
+    buf[L - 1] = 0;
+  }
+}
+
+function editor_format_fixed(buf: cstring, cap: int32, v: float64, scale: int64, decimals: int32) {
+  if (buf == 0 || cap <= 0) {
+    return;
+  }
+  var scaled: int64 = 0;
+  if (v >= 0.0) {
+    scaled = (int64)(v * (float64)scale + 0.5);
+  } else {
+    scaled = (int64)(v * (float64)scale - 0.5);
+  }
+  var neg: int32 = 0;
+  if (scaled < 0) {
+    neg = 1;
+    scaled = 0 - scaled;
+  }
+  var whole: int64 = scaled / scale;
+  var frac: int64 = scaled - whole * scale;
+  var pos: int32 = 0;
+  if (neg != 0 && pos + 1 < cap) {
+    buf[pos] = 45;
+    pos = pos + 1;
+  }
+  var tmp: uint8[32];
+  int_to_dec((cstring)((int64)(&(tmp[0]))), whole);
+  pos = fs_copy_into(buf, cap, pos, (cstring)((int64)(&(tmp[0]))));
+  if (decimals > 0 && pos + 1 < cap) {
+    buf[pos] = 46;
+    pos = pos + 1;
+    var div: int64 = scale / (int64)10;
+    var d: int32 = 0;
+    while (d < decimals && pos + 1 < cap) {
+      var digit: int64 = 0;
+      if (div > 0) {
+        digit = frac / div;
+        frac = frac - digit * div;
+        div = div / (int64)10;
+      }
+      buf[pos] = (uint8)(48 + (int32)digit);
+      pos = pos + 1;
+      d = d + 1;
+    }
+  }
+  buf[pos] = 0;
+}
+
+function editor_value_to_buf(buf: cstring, cap: int32, e: Entity*, field: int32) {
+  if (buf == 0 || cap <= 0) {
+    return;
+  }
+  buf[0] = 0;
+  if (e == 0) {
+    return;
+  }
+  if (field == 1) {
+    editor_copy_cstr(buf, cap, scene_entity_name(e));
+  } else {
+    if (field == 2) { editor_format_fixed(buf, cap, e->pos_x, (int64)1000, 3); }
+    if (field == 3) { editor_format_fixed(buf, cap, e->pos_y, (int64)1000, 3); }
+    if (field == 4) { editor_format_fixed(buf, cap, e->pos_z, (int64)1000, 3); }
+    if (field == 5) { editor_format_fixed(buf, cap, e->rot_x, (int64)1000000, 6); }
+    if (field == 6) { editor_format_fixed(buf, cap, e->rot_y, (int64)1000000, 6); }
+    if (field == 7) { editor_format_fixed(buf, cap, e->rot_z, (int64)1000000, 6); }
+    if (field == 8) { editor_format_fixed(buf, cap, e->rot_w, (int64)1000000, 6); }
+    if (field == 9) { editor_format_fixed(buf, cap, e->scale, (int64)1000, 3); }
+    if (field == 10) { int_to_dec(buf, (int64)e->kind); }
+    if (field == 11) { int_to_dec(buf, (int64)e->parent_id); }
+    if (field == 12) {
+      // Lua script path. Show "(none)" instead of an empty string so the user
+      // can clearly see the slot is unbound.
+      var lp: cstring = scene_entity_lua_script(e);
+      if (lp == 0 || (uint8)(lp[0]) == (uint8)0) {
+        editor_copy_cstr(buf, cap, cstr("(none)"));
+      } else {
+        editor_copy_cstr(buf, cap, lp);
+      }
+    }
+  }
+}
+
+function editor_field_to_buf(ui: EditorUiState*, e: Entity*, field: int32) {
+  if (ui == 0) {
+    return;
+  }
+  editor_value_to_buf((cstring)((int64)(&(ui->edit_buf[0]))), 128, e, field);
+}
+
+function editor_project_field_to_buf(ui: EditorUiState*, proj: ProjectInfo*, field: int32) {
+  if (ui == 0) {
+    return;
+  }
+  var dst: cstring = (cstring)((int64)(&(ui->edit_buf[0])));
+  if (field == -1) {
+    editor_copy_cstr(dst, 128, project_name_ptr(proj));
+  } else {
+    if (field == -2) {
+      editor_copy_cstr(dst, 128, project_scene_path_ptr(proj));
+    } else {
+      if (field == -3) {
+        editor_copy_cstr(dst, 128, project_assets_subdir_ptr(proj));
+      }
+    }
+  }
+}
+
+function editor_begin_project_edit(ui: EditorUiState*, proj: ProjectInfo*, field: int32) {
+  if (ui == 0 || proj == 0) {
+    return;
+  }
+  ui->editing_field = field;
+  editor_project_field_to_buf(ui, proj, field);
+  editor_snapshot_keys(ui);
+}
+
+function editor_apply_project_field(ui: EditorUiState*, proj: ProjectInfo*) -> int32 {
+  if (ui == 0 || proj == 0) {
+    return 0;
+  }
+  var buf: cstring = (cstring)((int64)(&(ui->edit_buf[0])));
+  var field: int32 = ui->editing_field;
+  if (field == -1) {
+    project_set_name(proj, buf);
+    editor_status(ui, "Project name updated");
+  }
+  if (field == -2) {
+    project_set_scene_path(proj, buf);
+    var scene_abs: uint8[1024];
+    project_resolve_scene_abs(proj, (cstring)((int64)(&(scene_abs[0]))), 1024);
+    editor_ui_set_scene_path(ui, (cstring)((int64)(&(scene_abs[0]))));
+    editor_status(ui, "Project scene path updated");
+  }
+  if (field == -3) {
+    project_set_assets_subdir(proj, buf);
+    editor_status(ui, "Project asset folder updated");
+  }
+  ui->editing_field = 0;
+  return 1;
+}
+
+function editor_apply_field(ui: EditorUiState*, sc: Scene*, proj: ProjectInfo*) -> int32 {
+  if (ui == 0 || ui->editing_field == 0) {
+    return 0;
+  }
+  if (ui->editing_field < 0) {
+    return editor_apply_project_field(ui, proj);
+  }
+  if (sc == 0) {
+    return 0;
+  }
+  var e: Entity* = scene_selected_row(sc);
+  if (e == 0) {
+    ui->editing_field = 0;
+    return 0;
+  }
+  var buf: cstring = (cstring)((int64)(&(ui->edit_buf[0])));
+  var field: int32 = ui->editing_field;
+  if (field == 1) {
+    scene_set_name(sc, e->id, buf);
+  } else {
+    var fv: float64 = editor_atof(buf);
+    if (field == 2) { e->pos_x = fv; }
+    if (field == 3) { e->pos_y = fv; }
+    if (field == 4) { e->pos_z = fv; }
+    if (field == 5) { e->rot_x = fv; scene_entity_normalize_rotation(e); }
+    if (field == 6) { e->rot_y = fv; scene_entity_normalize_rotation(e); }
+    if (field == 7) { e->rot_z = fv; scene_entity_normalize_rotation(e); }
+    if (field == 8) { e->rot_w = fv; scene_entity_normalize_rotation(e); }
+    if (field == 9) {
+      if (fv < 0.05) { fv = 0.05; }
+      if (fv > 40.0) { fv = 40.0; }
+      e->scale = fv;
+    }
+    if (field == 10) { e->kind = atoi(buf); }
+    if (field == 11) { scene_set_parent(sc, e->id, atoi(buf)); }
+    // field == 12 (Script) is no longer text-editable; binding happens via
+    // Ctrl+L (assign selected .lua asset) or Ctrl+Shift+L (clear). The inline
+    // text edit is suppressed in editor_begin_edit below.
+  }
+  ui->editing_field = 0;
+  return 1;
+}
+
+function editor_process_text_key(ui: EditorUiState*) {
+  var shift: int32 = game_input_key_held(16);
+  var d: int32 = 48;
+  while (d <= 57) {
+    if (editor_key_edge(ui, d) != 0) {
+      editor_buf_append(ui, (uint8)d);
+    }
+    d = d + 1;
+  }
+  var nd: int32 = 96;
+  while (nd <= 105) {
+    if (editor_key_edge(ui, nd) != 0) {
+      editor_buf_append(ui, (uint8)(48 + nd - 96));
+    }
+    nd = nd + 1;
+  }
+  if (editor_key_edge(ui, 190) != 0 || editor_key_edge(ui, 110) != 0) {
+    editor_buf_append(ui, (uint8)46);
+  }
+  if (editor_key_edge(ui, 189) != 0 || editor_key_edge(ui, 109) != 0) {
+    editor_buf_append(ui, (uint8)45);
+  }
+  if (ui->editing_field == 1 || ui->editing_field < 0) {
+    var k: int32 = 65;
+    while (k <= 90) {
+      if (editor_key_edge(ui, k) != 0) {
+        var ch: int32 = k;
+        if (shift == 0) {
+          ch = ch + 32;
+        }
+        editor_buf_append(ui, (uint8)ch);
+      }
+      k = k + 1;
+    }
+    if (editor_key_edge(ui, 32) != 0) { editor_buf_append(ui, (uint8)32); }
+    if (editor_key_edge(ui, 186) != 0) { editor_buf_append(ui, (uint8)95); }
+    if (ui->editing_field < 0) {
+      if (editor_key_edge(ui, 191) != 0) { editor_buf_append(ui, (uint8)47); }
+      if (editor_key_edge(ui, 220) != 0) { editor_buf_append(ui, (uint8)92); }
+      if (editor_key_edge(ui, 186) != 0 && shift != 0) { editor_buf_append(ui, (uint8)58); }
+    }
+  }
+  if (editor_key_edge(ui, 8) != 0) {
+    editor_buf_backspace(ui);
+  }
+}
+
+function editor_hit(mx: int32, my: int32, x: int32, y: int32, w: int32, h: int32) -> int32 {
+  if (mx >= x && mx < x + w && my >= y && my < y + h) {
+    return 1;
+  }
+  return 0;
+}
+
+function editor_kind_label(kind: int32) -> cstring {
+  if (kind == SK_CUBE()) {
+    var a: string = "cube";
+    return a.chars;
+  }
+  if (kind == SK_BOX()) {
+    var b: string = "box";
+    return b.chars;
+  }
+  if (kind == SK_MESH()) {
+    var c: string = "mesh";
+    return c.chars;
+  }
+  var d: string = "?";
+  return d.chars;
+}
+
+function editor_clamp_scene_scroll(ui: EditorUiState*, sc: Scene*) {
+  if (ui == 0) {
+    return;
+  }
+  var n: int32 = scene_count(sc);
+  var max_scroll: int32 = n - 14;
+  if (max_scroll < 0) {
+    max_scroll = 0;
+  }
+  if (ui->scene_scroll < 0) {
+    ui->scene_scroll = 0;
+  }
+  if (ui->scene_scroll > max_scroll) {
+    ui->scene_scroll = max_scroll;
+  }
+}
+
+function editor_begin_edit(ui: EditorUiState*, sc: Scene*, field: int32) {
+  if (ui == 0 || sc == 0) {
+    return;
+  }
+  // Field 12 (lua script) is bind-by-asset, not inline text. Skip.
+  if (field == 12) {
+    return;
+  }
+  var e: Entity* = scene_selected_row(sc);
+  if (e == 0) {
+    return;
+  }
+  ui->editing_field = field;
+  editor_field_to_buf(ui, e, field);
+}
+
+// Bind the currently-selected .lua asset (if any) to the currently-selected
+// entity. Returns 1 on success.
+function editor_assign_selected_script(ui: EditorUiState*, am: AssetManager*, sc: Scene*, lua_reg: LuaScriptRegistry*) -> int32 {
+  if (ui == 0 || am == 0 || sc == 0) {
+    return 0;
+  }
+  var e: Entity* = scene_selected_row(sc);
+  if (e == 0) {
+    editor_status(ui, "No entity selected");
+    return 0;
+  }
+  var sel: int32 = asset_selected_index(am);
+  if (sel < 0 || sel >= asset_manager_count(am)) {
+    editor_status(ui, "No asset selected");
+    return 0;
+  }
+  if (asset_row_kind(am, sel) != AK_LUA()) {
+    editor_status(ui, "Selected asset is not a .lua script");
+    return 0;
+  }
+  var path: cstring = asset_row_full_cstr(am, sel);
+  var ok: int32 = lua_bind_entity_script(lua_reg, e, path);
+  if (ok != 0) {
+    editor_status(ui, "Script bound");
+    return 1;
+  }
+  var err: cstring = lua_registry_last_error(lua_reg);
+  if (err != 0 && (uint8)(err[0]) != (uint8)0) {
+    editor_copy_cstr((cstring)((int64)(&(ui->status[0]))), 128, err);
+    ui->status_frames = 360;
+  } else {
+    editor_status(ui, "Script bound (no registry)");
+  }
+  return 1;
+}
+
+function editor_clear_entity_script(ui: EditorUiState*, sc: Scene*, lua_reg: LuaScriptRegistry*) -> int32 {
+  if (ui == 0 || sc == 0) {
+    return 0;
+  }
+  var e: Entity* = scene_selected_row(sc);
+  if (e == 0) {
+    return 0;
+  }
+  lua_clear_entity_script(lua_reg, e);
+  editor_status(ui, "Script cleared");
+  return 1;
+}
+
+function editor_reload_entity_script(ui: EditorUiState*, sc: Scene*, lua_reg: LuaScriptRegistry*) -> int32 {
+  if (ui == 0 || sc == 0 || lua_reg == 0) {
+    return 0;
+  }
+  var e: Entity* = scene_selected_row(sc);
+  if (e == 0) {
+    return 0;
+  }
+  if (lua_registry_reload_entity(lua_reg, e->id) != 0) {
+    editor_status(ui, "Script reloaded");
+    return 1;
+  }
+  var err: cstring = lua_registry_last_error(lua_reg);
+  if (err != 0 && (uint8)(err[0]) != (uint8)0) {
+    editor_copy_cstr((cstring)((int64)(&(ui->status[0]))), 128, err);
+    ui->status_frames = 360;
+  }
+  return 0;
+}
+
+function editor_import_selected_asset(ui: EditorUiState*, am: AssetManager*, sc: Scene*, meshes: MeshStore*, vp: EngineViewport*) -> int32 {
+  if (ui == 0 || am == 0 || sc == 0 || meshes == 0) {
+    return 0;
+  }
+  var sel: int32 = asset_selected_index(am);
+  if (sel < 0 || sel >= asset_manager_count(am)) {
+    editor_status(ui, "No asset selected");
+    return 0;
+  }
+  if (asset_row_kind(am, sel) != AK_MESH()) {
+    editor_status(ui, "Selected asset is not a mesh");
+    return 0;
+  }
+  var path: cstring = asset_row_full_cstr(am, sel);
+  var mid: int32 = mesh_store_import_mesh(meshes, path);
+  if (mid == 0) {
+    editor_status(ui, "Mesh import failed");
+    return 0;
+  }
+  var mr: MeshRecord* = mesh_store_find(meshes, mid);
+  var half: float64 = mesh_record_half(mr);
+  var eid: int32 = scene_add(sc, SK_MESH(), 0.0, half, 0.0, half);
+  if (eid == 0) {
+    editor_status(ui, "Scene is full");
+    return 0;
+  }
+  scene_set_mesh_ref(sc, eid, mid, path, half);
+  scene_set_name(sc, eid, asset_row_vfs_cstr(am, sel));
+  scene_set_selected(sc, eid);
+  engine_viewport_sync_scene(vp, sc);
+  engine_viewport_frame_selection(vp, sc);
+  editor_status(ui, "Imported mesh asset");
+  return 1;
+}
+
+export function editor_ui_input_tick(ui: EditorUiState*, g: GameWin32*, proj: ProjectInfo*, es: ExplorerState*, am: AssetManager*, sc: Scene*, meshes: MeshStore*, vp: EngineViewport*, lua_reg: LuaScriptRegistry*) -> int32 {
+  if (ui == 0 || g == 0) {
+    return 0;
+  }
+  var dirty: int32 = 0;
+  if (ui->status_frames > 0) {
+    ui->status_frames = ui->status_frames - 1;
+    dirty = 1;
+  }
+  editor_clamp_scene_scroll(ui, sc);
+  var mx: int32 = game_win32_mouse_x(g);
+  var my: int32 = game_win32_mouse_y(g);
+  var left_down: int32 = game_input_key_held(1);
+  var click: int32 = 0;
+  if (left_down != 0 && ui->left_was_down == 0) {
+    click = 1;
+  }
+  var rx: int32 = g->width - EDITOR_INSPECTOR_W();
+  var ax0: int32 = EDITOR_PANEL_W() + (int32)4;
+  var ax1: int32 = ax0 + EDITOR_ASSET_W();
+  if (rx < ax1 + (int32)160) {
+    rx = ax1 + (int32)160;
+  }
+
+  if (click != 0 && my < EDITOR_TOPBAR_H()) {
+    ui->active_panel = 0;
+    if (editor_hit(mx, my, 8, 4, 152, 20) != 0) {
+      if (ui->project_settings_open == 0) {
+        ui->project_settings_open = 1;
+      } else {
+        ui->project_settings_open = 0;
+      }
+      dirty = 1;
+    } else {
+      if (editor_hit(mx, my, 176, 4, 116, 20) != 0) {
+        if (project_save_manifest(proj) != 0) {
+          editor_status(ui, "Project settings saved");
+        } else {
+          editor_status(ui, "Project save failed");
+        }
+        dirty = 1;
+      }
+    }
+  } else {
+  if (click != 0 && ui->project_settings_open != 0) {
+    var px0: int32 = 40;
+    var py0: int32 = EDITOR_BODY_TOP() + (int32)28;
+    var pw: int32 = 560;
+    if (editor_hit(mx, my, px0 + pw - (int32)72, py0 + (int32)10, 54, 22) != 0) {
+      ui->project_settings_open = 0;
+      ui->editing_field = 0;
+      dirty = 1;
+    } else {
+      if (editor_hit(mx, my, px0 + (int32)16, py0 + (int32)170, 116, 22) != 0) {
+        if (project_save_manifest(proj) != 0) {
+          editor_status(ui, "Project settings saved");
+        } else {
+          editor_status(ui, "Project save failed");
+        }
+        dirty = 1;
+      } else {
+        if (editor_hit(mx, my, px0 + (int32)104, py0 + (int32)60, 390, 20) != 0) {
+          editor_begin_project_edit(ui, proj, -1);
+          dirty = 1;
+        } else {
+          if (editor_hit(mx, my, px0 + (int32)104, py0 + (int32)84, 390, 20) != 0) {
+            editor_begin_project_edit(ui, proj, -2);
+            dirty = 1;
+          } else {
+            if (editor_hit(mx, my, px0 + (int32)104, py0 + (int32)108, 390, 20) != 0) {
+              editor_begin_project_edit(ui, proj, -3);
+              dirty = 1;
+            }
+          }
+        }
+      }
+    }
+  } else {
+  if (click != 0) {
+    if (mx >= 0 && mx < EDITOR_PANEL_W()) {
+      ui->active_panel = EDITOR_FOCUS_PROJECT_FILES();
+      var prow: int32 = (my - EDITOR_BODY_TOP()) / EDITOR_LINE_H();
+      if (my >= EDITOR_BODY_TOP() && prow >= 0 && prow < EXPLORER_VISIBLE_LINES()) {
+        var pidx: int32 = explorer_scroll(es) + prow;
+        if (pidx >= 0 && pidx < explorer_entry_count(es)) {
+          explorer_select_index(es, pidx);
+          dirty = 1;
+        }
+      }
+    } else {
+      if (mx >= ax0 && mx < ax1) {
+        ui->active_panel = EDITOR_FOCUS_ASSETS();
+      } else {
+        if (mx >= rx) {
+          ui->active_panel = EDITOR_FOCUS_INSPECTOR();
+        } else {
+          ui->active_panel = EDITOR_FOCUS_VIEWPORT();
+        }
+      }
+    }
+  }
+  }
+  }
+
+  if (es != 0 && mx >= 0 && mx < EDITOR_PANEL_W()) {
+    var pwh: int32 = game_mouse_consume_wheel();
+    if (pwh != 0) {
+      explorer_scroll_add(es, 0 - pwh);
+      dirty = 1;
+    }
+  }
+
+  if (am != 0 && mx >= ax0 && mx < ax1) {
+    if (click != 0) {
+      // The filter row sits one EDITOR_LINE_H above the list (+20px), so the
+      // clickable list starts EDITOR_BODY_TOP + 20.
+      var list_top: int32 = EDITOR_BODY_TOP() + (int32)20;
+      var arel: int32 = (my - list_top) / EDITOR_LINE_H();
+      if (my >= list_top && arel >= 0 && arel < 28) {
+        // Walk the rows past asset_scroll, skipping non-matching, until we
+        // reach the visual-row index. This keeps click semantics correct
+        // regardless of filter.
+        var fk2: int32 = asset_manager_filter(am);
+        var scanned: int32 = 0;
+        var visidx: int32 = 0;
+        var found: int32 = 0 - 1;
+        var total: int32 = asset_manager_count(am);
+        var probe: int32 = asset_scroll(am);
+        while (probe < total) {
+          var pk: int32 = asset_row_kind(am, probe);
+          var keep: int32 = 1;
+          if (fk2 != AK_ANY() && pk != fk2) {
+            keep = 0;
+          }
+          if (keep != 0) {
+            if (visidx == arel) {
+              found = probe;
+              break;
+            }
+            visidx = visidx + 1;
+          }
+          probe = probe + 1;
+          scanned = scanned + 1;
+          if (scanned > 4096) {
+            break;
+          }
+        }
+        if (found >= 0) {
+          asset_select(am, found);
+          dirty = 1;
+        }
+      }
+    }
+    var awh: int32 = game_mouse_consume_wheel();
+    if (awh != 0) {
+      asset_scroll_add(am, 0 - awh);
+      dirty = 1;
+    }
+  }
+
+  if (ui->editing_field != 0) {
+    editor_process_text_key(ui);
+    if (editor_key_edge(ui, 13) != 0) {
+    if (editor_apply_field(ui, sc, proj) != 0) {
+        engine_viewport_sync_scene(vp, sc);
+        dirty = 1;
+      }
+    }
+    if (editor_key_edge(ui, 27) != 0) {
+      ui->editing_field = 0;
+      dirty = 1;
+    }
+    ui->left_was_down = left_down;
+    editor_snapshot_keys(ui);
+    return dirty;
+  }
+
+  var ctrl: int32 = game_input_key_held(17);
+  if (ctrl != 0 && editor_key_edge(ui, 83) != 0) {
+    if (scene_io_save(editor_scene_path(ui, es), sc) != 0) {
+      editor_status(ui, "Scene saved");
+    } else {
+      editor_status(ui, "Scene save failed");
+    }
+    dirty = 1;
+  }
+  if (ctrl != 0 && editor_key_edge(ui, 79) != 0) {
+    if (scene_io_load(editor_scene_path(ui, es), sc, meshes) != 0) {
+      engine_viewport_sync_scene(vp, sc);
+      engine_viewport_frame_selection(vp, sc);
+      editor_status(ui, "Scene loaded");
+    } else {
+      editor_status(ui, "Scene load failed");
+    }
+    dirty = 1;
+  }
+  if (ctrl != 0 && editor_key_edge(ui, 73) != 0) {
+    dirty = dirty | editor_import_selected_asset(ui, am, sc, meshes, vp);
+  }
+  var shift_held: int32 = game_input_key_held(16);
+  // Ctrl+L: bind selected .lua to selected entity. Ctrl+Shift+L: clear.
+  if (ctrl != 0 && editor_key_edge(ui, 76) != 0) {
+    if (shift_held != 0) {
+      dirty = dirty | editor_clear_entity_script(ui, sc, lua_reg);
+    } else {
+      dirty = dirty | editor_assign_selected_script(ui, am, sc, lua_reg);
+    }
+  }
+  // Ctrl+R: reload selected entity's script.
+  if (ctrl != 0 && editor_key_edge(ui, 82) != 0) {
+    dirty = dirty | editor_reload_entity_script(ui, sc, lua_reg);
+  }
+  // F4: cycle asset kind filter (All -> Lua -> Mesh -> Texture -> Scene -> All).
+  if (editor_key_edge(ui, 115) != 0) {
+    var cur: int32 = asset_manager_filter(am);
+    var nxt: int32 = AK_ANY();
+    if (cur == AK_ANY()) {
+      nxt = AK_LUA();
+    } else {
+      if (cur == AK_LUA()) {
+        nxt = AK_MESH();
+      } else {
+        if (cur == AK_MESH()) {
+          nxt = AK_TEXTURE();
+        } else {
+          if (cur == AK_TEXTURE()) {
+            nxt = AK_SCENE();
+          } else {
+            nxt = AK_ANY();
+          }
+        }
+      }
+    }
+    asset_manager_set_filter(am, nxt);
+    dirty = 1;
+  }
+  if (editor_key_edge(ui, 46) != 0 && scene_selected_id(sc) != 0) {
+    scene_remove(sc, scene_selected_id(sc));
+    engine_viewport_sync_scene(vp, sc);
+    dirty = 1;
+  }
+  if (editor_key_edge(ui, 113) != 0) {
+    editor_begin_edit(ui, sc, 1);
+    dirty = 1;
+  }
+
+  if (mx >= rx && click != 0) {
+    var iy0: int32 = EDITOR_TOPBAR_H();
+    if (editor_hit(mx, my, rx + 12, iy0 + 28, 54, 22) != 0) {
+      if (scene_io_save(editor_scene_path(ui, es), sc) != 0) { editor_status(ui, "Scene saved"); } else { editor_status(ui, "Scene save failed"); }
+      dirty = 1;
+    } else {
+      if (editor_hit(mx, my, rx + 72, iy0 + 28, 54, 22) != 0) {
+        if (scene_io_load(editor_scene_path(ui, es), sc, meshes) != 0) { engine_viewport_sync_scene(vp, sc); engine_viewport_frame_selection(vp, sc); editor_status(ui, "Scene loaded"); } else { editor_status(ui, "Scene load failed"); }
+        dirty = 1;
+      } else {
+        if (editor_hit(mx, my, rx + 132, iy0 + 28, 70, 22) != 0) {
+          dirty = dirty | editor_import_selected_asset(ui, am, sc, meshes, vp);
+        } else {
+          if (editor_hit(mx, my, rx + 208, iy0 + 28, 50, 22) != 0) {
+            var nid: int32 = scene_add(sc, SK_CUBE(), 0.0, 1.0, 0.0, 1.0);
+            if (nid != 0) { scene_set_selected(sc, nid); engine_viewport_sync_scene(vp, sc); }
+            dirty = 1;
+          } else {
+            if (editor_hit(mx, my, rx + 264, iy0 + 28, 54, 22) != 0) {
+              if (scene_selected_id(sc) != 0) { scene_remove(sc, scene_selected_id(sc)); engine_viewport_sync_scene(vp, sc); dirty = 1; }
+            } else {
+              var row0: int32 = iy0 + 78;
+              var rel: int32 = (my - row0) / EDITOR_LINE_H();
+              if (my >= row0 && rel >= 0 && rel < 14) {
+                var idx: int32 = ui->scene_scroll + rel;
+                if (idx >= 0 && idx < scene_count(sc)) {
+                  var re: Entity* = scene_row(sc, idx);
+                  if (re != 0) {
+                    scene_set_selected(sc, re->id);
+                    engine_viewport_sync_scene(vp, sc);
+                    dirty = 1;
+                  }
+                }
+              } else {
+                var py: int32 = iy0 + 326;
+                var pf: int32 = (my - py) / 20;
+                if (my >= py && pf >= 0 && pf < 12) {
+                  editor_begin_edit(ui, sc, pf + 1);
+                  dirty = 1;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Output panel: bottom strip between the explorer and inspector splits.
+  // Wheel here scrolls the log history (and pauses tail-follow); a click
+  // anywhere in it snaps back to following the newest output.
+  var out_y0: int32 = g->height - EDITOR_OUTPUT_H();
+  var out_x0: int32 = EDITOR_PANEL_W() + (int32)4;
+  if (mx >= out_x0 && mx < rx && my >= out_y0) {
+    var out_rows: int32 = (g->height - (out_y0 + (int32)26)) / EDITOR_LINE_H();
+    if (out_rows < 1) {
+      out_rows = 1;
+    }
+    var owh: int32 = game_mouse_consume_wheel();
+    if (owh != 0) {
+      output_log_scroll_add(owh, out_rows);
+      dirty = 1;
+    }
+    if (click != 0) {
+      // A click on a filter tab switches the filter; a click anywhere else in
+      // the panel snaps back to following the newest output.
+      var hit_f: int32 = editor_output_tab_hit(mx, my, out_x0, out_y0);
+      if (hit_f >= 0) {
+        output_log_set_filter(hit_f);
+      } else {
+        output_log_scroll_add(0 - output_log_scroll(), out_rows);
+      }
+      dirty = 1;
+    }
+  } else {
+    if (mx >= rx) {
+      var wh: int32 = game_mouse_consume_wheel();
+      if (wh != 0) {
+        ui->scene_scroll = ui->scene_scroll - wh;
+        editor_clamp_scene_scroll(ui, sc);
+        dirty = 1;
+      }
+    }
+  }
+
+  ui->left_was_down = left_down;
+  editor_snapshot_keys(ui);
+  return dirty;
+}
+
+function editor_draw_button(mdc: int64, x: int32, y: int32, label: string) {
+  editor_text_out(mdc, x + 8, y + 4, label.chars);
+}
+
+function editor_prop_label(field: int32) -> cstring {
+  if (field == 1) { var a: string = "Name"; return a.chars; }
+  if (field == 2) { var b: string = "Pos X"; return b.chars; }
+  if (field == 3) { var c: string = "Pos Y"; return c.chars; }
+  if (field == 4) { var d: string = "Pos Z"; return d.chars; }
+  if (field == 5) { var e: string = "Quat X"; return e.chars; }
+  if (field == 6) { var f: string = "Quat Y"; return f.chars; }
+  if (field == 7) { var g: string = "Quat Z"; return g.chars; }
+  if (field == 8) { var h: string = "Quat W"; return h.chars; }
+  if (field == 9) { var i: string = "Scale"; return i.chars; }
+  if (field == 10) { var j: string = "Kind"; return j.chars; }
+  if (field == 11) { var k: string = "Parent"; return k.chars; }
+  var l: string = "Script";
+  return l.chars;
+}
+
+function editor_draw_inspector(g: GameWin32*, ui: EditorUiState*, sc: Scene*, mdc: int64) {
+  if (g == 0 || ui == 0 || mdc == 0) {
+    return;
+  }
+  var ww: int32 = g->width;
+  var hh: int32 = g->height;
+  var yoff: int32 = EDITOR_TOPBAR_H();
+  var rx: int32 = ww - EDITOR_INSPECTOR_W();
+  if (rx < EDITOR_PANEL_W() + EDITOR_ASSET_W() + (int32)164) {
+    rx = EDITOR_PANEL_W() + EDITOR_ASSET_W() + (int32)164;
+  }
+  var px: uint32* = g->pixels;
+  var panel: uint32 = swizzle_bgra8(43, 43, 53, 255);
+  var split: uint32 = swizzle_bgra8(18, 18, 21, 255);
+  var hi: uint32 = swizzle_bgra8(70, 80, 120, 255);
+  var edit_hi: uint32 = swizzle_bgra8(92, 90, 62, 255);
+  var field_bg: uint32 = swizzle_bgra8(34, 34, 42, 255);
+  var button_bg: uint32 = swizzle_bgra8(55, 55, 66, 255);
+  fb_fill_rect(px, ww, hh, rx - 4, yoff, rx, hh, split);
+  fb_fill_rect(px, ww, hh, rx, yoff, ww, hh, panel);
+  var title: string = "Scene";
+  editor_text_out(mdc, rx + 14, yoff + 10, title.chars);
+  fb_fill_rect(px, ww, hh, rx + 12, yoff + 28, rx + 66, yoff + 50, button_bg);
+  fb_fill_rect(px, ww, hh, rx + 72, yoff + 28, rx + 126, yoff + 50, button_bg);
+  fb_fill_rect(px, ww, hh, rx + 132, yoff + 28, rx + 202, yoff + 50, button_bg);
+  fb_fill_rect(px, ww, hh, rx + 208, yoff + 28, rx + 258, yoff + 50, button_bg);
+  fb_fill_rect(px, ww, hh, rx + 264, yoff + 28, rx + 318, yoff + 50, button_bg);
+  editor_draw_button(mdc, rx + 12, yoff + 28, "Save");
+  editor_draw_button(mdc, rx + 72, yoff + 28, "Load");
+  editor_draw_button(mdc, rx + 132, yoff + 28, "Import");
+  editor_draw_button(mdc, rx + 208, yoff + 28, "Cube");
+  editor_draw_button(mdc, rx + 264, yoff + 28, "Delete");
+  var hdr: string = "Objects";
+  editor_text_out(mdc, rx + 14, yoff + 58, hdr.chars);
+  var n: int32 = scene_count(sc);
+  var sel_id: int32 = scene_selected_id(sc);
+  var row: int32 = 0;
+  var num: uint8[32];
+  var line: uint8[220];
+  while (row < 14 && ui->scene_scroll + row < n) {
+    var idx: int32 = ui->scene_scroll + row;
+    var e: Entity* = scene_row(sc, idx);
+    var y: int32 = yoff + 78 + row * EDITOR_LINE_H();
+    if (e != 0) {
+      if (e->id == sel_id) {
+        fb_fill_rect(px, ww, hh, rx + 8, y - 2, ww - 10, y + EDITOR_LINE_H(), hi);
+      }
+      var lb: cstring = (cstring)((int64)(&(line[0])));
+      var p: int32 = 0;
+      var hash: string = "#";
+      p = fs_copy_into(lb, 220, p, hash.chars);
+      int_to_dec((cstring)((int64)(&(num[0]))), (int64)e->id);
+      p = fs_copy_into(lb, 220, p, (cstring)((int64)(&(num[0]))));
+      var sp: string = "  ";
+      p = fs_copy_into(lb, 220, p, sp.chars);
+      p = fs_copy_into(lb, 220, p, editor_kind_label(e->kind));
+      p = fs_copy_into(lb, 220, p, sp.chars);
+      if (e->parent_id != 0) {
+        var lp: string = "(p ";
+        p = fs_copy_into(lb, 220, p, lp.chars);
+        int_to_dec((cstring)((int64)(&(num[0]))), (int64)e->parent_id);
+        p = fs_copy_into(lb, 220, p, (cstring)((int64)(&(num[0]))));
+        var rp: string = ") ";
+        p = fs_copy_into(lb, 220, p, rp.chars);
+      }
+      p = fs_copy_into(lb, 220, p, scene_entity_name(e));
+      lb[p] = 0;
+      editor_text_out(mdc, rx + 14, y, lb);
+    }
+    row = row + 1;
+  }
+  var prop: string = "Properties";
+  editor_text_out(mdc, rx + 14, yoff + 304, prop.chars);
+  var se: Entity* = scene_selected_row(sc);
+  if (se == 0) {
+    var none: string = "No selection";
+    editor_text_out(mdc, rx + 14, yoff + 326, none.chars);
+  } else {
+    var f: int32 = 1;
+    while (f <= 12) {
+      var fy: int32 = yoff + 326 + (f - 1) * 20;
+      fb_fill_rect(px, ww, hh, rx + 86, fy - 2, ww - 14, fy + 17, field_bg);
+      if (ui->editing_field == f) {
+        fb_fill_rect(px, ww, hh, rx + 86, fy - 2, ww - 14, fy + 17, edit_hi);
+      }
+      editor_text_out(mdc, rx + 14, fy, editor_prop_label(f));
+      var vb: cstring = (cstring)((int64)(&(line[0])));
+      if (ui->editing_field == f) {
+        editor_copy_cstr(vb, 220, (cstring)((int64)(&(ui->edit_buf[0]))));
+      } else {
+        editor_value_to_buf(vb, 220, se, f);
+      }
+      editor_text_out(mdc, rx + 96, fy, vb);
+      f = f + 1;
+    }
+    var kind_help: string = "kind: 0 cube, 1 box, 2 mesh   Script: pick a .lua in Assets, Ctrl+L to bind";
+    editor_text_out(mdc, rx + 14, yoff + 574, kind_help.chars);
+    var script_help: string = "Ctrl+Shift+L clear  Ctrl+R reload  F4 cycle asset filter";
+    editor_text_out(mdc, rx + 14, yoff + 592, script_help.chars);
+  }
+  // Status strip across the bottom of the inspector. When status_frames is 0
+  // we still show a faint hint, which keeps the line from blinking empty.
+  if (ui->status_frames > 0 && ui->status[0] != (uint8)0) {
+    Win32_SetTextColor(mdc, COLORREF_WHITE());
+    editor_text_out(mdc, rx + 14, hh - 28, (cstring)((int64)(&(ui->status[0]))));
+    Win32_SetTextColor(mdc, COLORREF_DIM_TEXT());
+  }
+  var path_label: string = "Ctrl+S/O, F2 rename, Del delete, Ctrl+L assign script";
+  editor_text_out(mdc, rx + 14, hh - 48, path_label.chars);
+}
+
+// Text colors are GDI COLORREFs (0x00BBGGRR), NOT framebuffer pixels.
+// swizzle_bgra8 produces 0xAARRGGBB; feeding that to Win32_SetTextColor sets
+// the high byte and GDI renders the text black — that was the "black text"
+// bug. colorref_rgb builds the correct value.
+function editor_output_level_color(level: int32) -> uint32 {
+  if (level == OUT_ERROR()) {
+    return colorref_rgb(240, 110, 110);
+  }
+  if (level == OUT_WARN()) {
+    return colorref_rgb(234, 198, 100);
+  }
+  if (level == OUT_LUA()) {
+    return colorref_rgb(120, 200, 255);
+  }
+  return colorref_rgb(208, 208, 214);
+}
+
+function editor_output_source_color(source: int32) -> uint32 {
+  if (source == OUT_SRC_SERVER()) {
+    return colorref_rgb(150, 220, 150);
+  }
+  if (source == OUT_SRC_CLIENT()) {
+    return colorref_rgb(210, 170, 240);
+  }
+  return colorref_rgb(150, 160, 175);
+}
+
+function editor_output_level_tag(level: int32) -> cstring {
+  if (level == OUT_ERROR()) { var a: string = "[err] "; return a.chars; }
+  if (level == OUT_WARN())  { var b: string = "[warn] "; return b.chars; }
+  if (level == OUT_LUA())   { var c: string = "[lua] "; return c.chars; }
+  var d: string = "[info] ";
+  return d.chars;
+}
+
+function editor_output_source_tag(source: int32) -> cstring {
+  if (source == OUT_SRC_SERVER()) { var a: string = "server"; return a.chars; }
+  if (source == OUT_SRC_CLIENT()) { var b: string = "client"; return b.chars; }
+  var c: string = "engine";
+  return c.chars;
+}
+
+// Filter tabs live in the panel title bar. Each tab is a fixed-width cell so
+// the renderer and the click hit-test (editor_output_tab_hit) stay in sync.
+function editor_output_tab_w() -> int32 { return 64; }
+
+// Returns the filter index for a click at (mx,my), or -1 if no tab was hit.
+// x0 is the panel's left edge; bar_y0 the top of the title bar.
+function editor_output_tab_hit(mx: int32, my: int32, x0: int32, bar_y0: int32) -> int32 {
+  if (my < bar_y0 + (int32)2 || my >= bar_y0 + (int32)22) {
+    return 0 - 1;
+  }
+  var tx: int32 = x0 + (int32)64;
+  var f: int32 = 0;
+  while (f < OUT_FILTER_COUNT()) {
+    var tx1: int32 = tx + editor_output_tab_w();
+    if (mx >= tx && mx < tx1) {
+      return f;
+    }
+    tx = tx1;
+    f = f + 1;
+  }
+  return 0 - 1;
+}
+
+// The Output panel: spans from the explorer split to the inspector split along
+// the bottom of the window. Newest line is at the bottom; the wheel scrolls
+// back through history when the cursor is over it.
+function editor_draw_output(g: GameWin32*, mdc: int64) {
+  if (g == 0 || mdc == 0) {
+    return;
+  }
+  var ww: int32 = g->width;
+  var hh: int32 = g->height;
+  var px: uint32* = g->pixels;
+  var x0: int32 = EDITOR_PANEL_W() + (int32)4;
+  var x1: int32 = ww - EDITOR_INSPECTOR_W() - (int32)4;
+  if (x1 < x0 + (int32)80) {
+    x1 = ww - (int32)4;
+  }
+  var y0: int32 = hh - EDITOR_OUTPUT_H();
+  if (y0 < EDITOR_BODY_TOP()) {
+    y0 = EDITOR_BODY_TOP();
+  }
+  var panel: uint32 = swizzle_bgra8(24, 25, 30, 255);
+  var bar: uint32 = swizzle_bgra8(43, 43, 53, 255);
+  var split: uint32 = swizzle_bgra8(18, 18, 21, 255);
+  fb_fill_rect(px, ww, hh, x0, y0, x1, y0 + (int32)2, split);
+  fb_fill_rect(px, ww, hh, x0, y0 + (int32)2, x1, y0 + (int32)22, bar);
+  fb_fill_rect(px, ww, hh, x0, y0 + (int32)22, x1, hh, panel);
+
+  Win32_SetTextColor(mdc, COLORREF_WHITE());
+  var title: string = "Output";
+  editor_text_out(mdc, x0 + (int32)10, y0 + (int32)4, title.chars);
+
+  // Filter tab strip. The active tab is highlighted; clicking one is handled
+  // in editor_ui_input_tick via the matching editor_output_tab_hit geometry.
+  var active_f: int32 = output_log_filter();
+  var tab_hi: uint32 = swizzle_bgra8(70, 80, 120, 255);
+  var tx: int32 = x0 + (int32)64;
+  var tf: int32 = 0;
+  while (tf < OUT_FILTER_COUNT()) {
+    var tx1: int32 = tx + editor_output_tab_w();
+    if (tx1 <= x1 - (int32)96) {
+      if (tf == active_f) {
+        fb_fill_rect(px, ww, hh, tx, y0 + (int32)3, tx1 - (int32)2, y0 + (int32)21, tab_hi);
+        Win32_SetTextColor(mdc, COLORREF_WHITE());
+      } else {
+        Win32_SetTextColor(mdc, COLORREF_DIM_TEXT());
+      }
+      editor_text_out(mdc, tx + (int32)8, y0 + (int32)4, output_log_filter_label(tf));
+    }
+    tx = tx1;
+    tf = tf + 1;
+  }
+
+  var total: int32 = output_log_count();
+  var shown: int32 = output_log_visible_count();
+  var line_h: int32 = EDITOR_LINE_H();
+  var avail: int32 = hh - (y0 + (int32)26);
+  var rows: int32 = avail / line_h;
+  if (rows < 1) {
+    rows = 1;
+  }
+  // Right-aligned status in the title bar: visible/total line count + state.
+  var sbuf: uint8[64];
+  var scz: cstring = (cstring)((int64)(&(sbuf[0])));
+  var ntmp: uint8[24];
+  var ntp: cstring = (cstring)((int64)(&(ntmp[0])));
+  int_to_dec(ntp, (int64)shown);
+  var sp: int32 = fs_copy_into(scz, 64, 0, ntp);
+  if (active_f != OUT_FILTER_ALL()) {
+    var slash: string = "/";
+    sp = fs_copy_into(scz, 64, sp, slash.chars);
+    int_to_dec(ntp, (int64)total);
+    sp = fs_copy_into(scz, 64, sp, ntp);
+  }
+  var ll: string = " lines";
+  sp = fs_copy_into(scz, 64, sp, ll.chars);
+  if (output_log_scroll() != 0) {
+    var pd: string = "  (paused)";
+    sp = fs_copy_into(scz, 64, sp, pd.chars);
+  }
+  scz[sp] = 0;
+  Win32_SetTextColor(mdc, COLORREF_DIM_TEXT());
+  editor_text_out(mdc, x1 - (int32)92, y0 + (int32)4, scz);
+
+  // Walk live lines newest→oldest, skipping filtered-out ones, until we've
+  // gathered `rows` visible lines past the scroll offset. scroll counts
+  // visible (filtered) lines hidden below the bottom; 0 = following the tail.
+  var skip: int32 = output_log_scroll();
+  var drawn: int32 = 0;
+  var ry: int32 = hh - line_h - (int32)4;
+  var i: int32 = total - 1;
+  while (i >= 0 && drawn < rows) {
+    if (output_log_line_visible(i) != 0) {
+      if (skip > 0) {
+        skip = skip - 1;
+      } else {
+        var lv: int32 = output_log_line_level(i);
+        var src: int32 = output_log_line_source(i);
+        var txt: cstring = output_log_line(i);
+        if (txt != 0) {
+          Win32_SetTextColor(mdc, editor_output_source_color(src));
+          editor_text_out(mdc, x0 + (int32)10, ry, editor_output_source_tag(src));
+          Win32_SetTextColor(mdc, editor_output_level_color(lv));
+          editor_text_out(mdc, x0 + (int32)62, ry, editor_output_level_tag(lv));
+          editor_text_out(mdc, x0 + (int32)116, ry, txt);
+        }
+        ry = ry - line_h;
+        drawn = drawn + 1;
+      }
+    }
+    i = i - 1;
+  }
+  // Restore the editor's default text color so subsequent draws (and the next
+  // frame) don't inherit a per-line color — this is what left other widgets
+  // black before.
+  Win32_SetTextColor(mdc, COLORREF_WHITE());
+}
+
+function editor_draw_topbar(g: GameWin32*, mdc: int64, proj: ProjectInfo*) {
+  if (g == 0 || mdc == 0) {
+    return;
+  }
+  var px: uint32* = g->pixels;
+  var ww: int32 = g->width;
+  var bar: uint32 = swizzle_bgra8(32, 34, 42, 255);
+  var button: uint32 = swizzle_bgra8(54, 58, 72, 255);
+  var split: uint32 = swizzle_bgra8(18, 18, 21, 255);
+  fb_fill_rect(px, ww, g->height, 0, 0, ww, EDITOR_TOPBAR_H(), bar);
+  fb_fill_rect(px, ww, g->height, 0, EDITOR_TOPBAR_H() - (int32)2, ww, EDITOR_TOPBAR_H(), split);
+  fb_fill_rect(px, ww, g->height, 8, 4, 160, 24, button);
+  fb_fill_rect(px, ww, g->height, 176, 4, 292, 24, button);
+  Win32_SetTextColor(mdc, COLORREF_WHITE());
+  editor_text_out(mdc, 18, 7, cstr("Project Settings"));
+  editor_text_out(mdc, 188, 7, cstr("Save Project"));
+  Win32_SetTextColor(mdc, COLORREF_DIM_TEXT());
+  var label: uint8[360];
+  var lc: cstring = (cstring)((int64)(&(label[0])));
+  var pos: int32 = fs_copy_into(lc, 360, 0, cstr("Project: "));
+  pos = fs_copy_into(lc, 360, pos, project_name_ptr(proj));
+  pos = fs_copy_into(lc, 360, pos, cstr("   Root: "));
+  pos = fs_copy_into(lc, 360, pos, project_root_ptr(proj));
+  lc[pos] = 0;
+  editor_text_out(mdc, 316, 7, lc);
+}
+
+function editor_project_value(ui: EditorUiState*, proj: ProjectInfo*, field: int32, out: cstring, cap: int32) {
+  if (out == 0 || cap <= 0) {
+    return;
+  }
+  out[0] = 0;
+  if (ui != 0 && ui->editing_field == field) {
+    editor_copy_cstr(out, cap, (cstring)((int64)(&(ui->edit_buf[0]))));
+    return;
+  }
+  if (field == -1) {
+    editor_copy_cstr(out, cap, project_name_ptr(proj));
+  }
+  if (field == -2) {
+    editor_copy_cstr(out, cap, project_scene_path_ptr(proj));
+  }
+  if (field == -3) {
+    editor_copy_cstr(out, cap, project_assets_subdir_ptr(proj));
+  }
+}
+
+function editor_draw_project_settings(g: GameWin32*, ui: EditorUiState*, proj: ProjectInfo*, mdc: int64) {
+  if (g == 0 || ui == 0 || proj == 0 || mdc == 0) {
+    return;
+  }
+  if (ui->project_settings_open == 0) {
+    return;
+  }
+  var px: uint32* = g->pixels;
+  // Keep the popup on the GDI-owned project/assets panels. The Vulkan viewport
+  // is a native child HWND and will otherwise sit above parent-window drawing.
+  var x0: int32 = 40;
+  var y0: int32 = EDITOR_BODY_TOP() + (int32)28;
+  var w: int32 = 560;
+  var h: int32 = 210;
+  var panel: uint32 = swizzle_bgra8(38, 40, 50, 255);
+  var border: uint32 = swizzle_bgra8(88, 96, 122, 255);
+  var field_bg: uint32 = swizzle_bgra8(24, 25, 31, 255);
+  var edit_bg: uint32 = swizzle_bgra8(92, 90, 62, 255);
+  var button: uint32 = swizzle_bgra8(54, 58, 72, 255);
+  fb_fill_rect(px, g->width, g->height, x0 - 2, y0 - 2, x0 + w + 2, y0 + h + 2, border);
+  fb_fill_rect(px, g->width, g->height, x0, y0, x0 + w, y0 + h, panel);
+  fb_fill_rect(px, g->width, g->height, x0 + w - 72, y0 + 10, x0 + w - 18, y0 + 32, button);
+  fb_fill_rect(px, g->width, g->height, x0 + 16, y0 + 170, x0 + 132, y0 + 192, button);
+
+  Win32_SetTextColor(mdc, COLORREF_WHITE());
+  editor_text_out(mdc, x0 + 16, y0 + 12, cstr("Project Settings"));
+  editor_draw_button(mdc, x0 + w - 72, y0 + 10, "Close");
+  editor_draw_button(mdc, x0 + 16, y0 + 170, "Save Project");
+
+  Win32_SetTextColor(mdc, COLORREF_DIM_TEXT());
+  editor_text_out(mdc, x0 + 16, y0 + 38, cstr("Root"));
+  editor_text_out(mdc, x0 + 104, y0 + 38, project_root_ptr(proj));
+  editor_text_out(mdc, x0 + 16, y0 + 62, cstr("Name"));
+  editor_text_out(mdc, x0 + 16, y0 + 86, cstr("Scene"));
+  editor_text_out(mdc, x0 + 16, y0 + 110, cstr("Assets"));
+
+  var val: uint8[220];
+  var vc: cstring = (cstring)((int64)(&(val[0])));
+  var fy: int32 = y0 + 60;
+  fb_fill_rect(px, g->width, g->height, x0 + 104, fy - 2, x0 + 494, fy + 18, field_bg);
+  if (ui->editing_field == -1) { fb_fill_rect(px, g->width, g->height, x0 + 104, fy - 2, x0 + 494, fy + 18, edit_bg); }
+  editor_project_value(ui, proj, -1, vc, 220);
+  editor_text_out(mdc, x0 + 112, fy, vc);
+  fy = y0 + 84;
+  fb_fill_rect(px, g->width, g->height, x0 + 104, fy - 2, x0 + 494, fy + 18, field_bg);
+  if (ui->editing_field == -2) { fb_fill_rect(px, g->width, g->height, x0 + 104, fy - 2, x0 + 494, fy + 18, edit_bg); }
+  editor_project_value(ui, proj, -2, vc, 220);
+  editor_text_out(mdc, x0 + 112, fy, vc);
+  fy = y0 + 108;
+  fb_fill_rect(px, g->width, g->height, x0 + 104, fy - 2, x0 + 494, fy + 18, field_bg);
+  if (ui->editing_field == -3) { fb_fill_rect(px, g->width, g->height, x0 + 104, fy - 2, x0 + 494, fy + 18, edit_bg); }
+  editor_project_value(ui, proj, -3, vc, 220);
+  editor_text_out(mdc, x0 + 112, fy, vc);
+
+  Win32_SetTextColor(mdc, COLORREF_DIM_TEXT());
+  editor_text_out(mdc, x0 + 16, y0 + 140, cstr("Launch with --project <folder> to open an explicit project root."));
+}
+
+export function engine_editor_present(g: GameWin32*, ui: EditorUiState*, proj: ProjectInfo*, es: ExplorerState*, am: AssetManager*, vp: EngineViewport*, sc: Scene*, frame: int32, vk_active: int32, play_mode: int32) -> int32 {
+  if (g == 0) {
+    return 0;
+  }
+  var px: uint32* = g->pixels;
+  var ww: int32 = g->width;
+  var hh: int32 = g->height;
+  if (px == 0) {
+    return 0;
+  }
+  var npx: int32 = ww * hh;
+  var bg_base: uint32 = swizzle_bgra8(30, 30, 37, 255);
+  game_win32_clear_rgba_pixels(px, npx, bg_base);
+  var panel: uint32 = swizzle_bgra8(43, 43, 53, 255);
+  var split: uint32 = swizzle_bgra8(18, 18, 21, 255);
+  var hi: uint32 = swizzle_bgra8(70, 80, 120, 255);
+  var asset_x: int32 = EDITOR_PANEL_W() + (int32)4;
+  var asset_r: int32 = asset_x + EDITOR_ASSET_W();
+  var view_x: int32 = asset_r + (int32)8;
+  fb_fill_rect(px, ww, hh, 0, 0, EDITOR_PANEL_W(), hh, panel);
+  fb_fill_rect(px, ww, hh, EDITOR_PANEL_W(), 0, EDITOR_PANEL_W() + (int32)4, hh, split);
+  fb_fill_rect(px, ww, hh, asset_x, 0, asset_r, hh, swizzle_bgra8(36, 38, 48, 255));
+  fb_fill_rect(px, ww, hh, asset_r, 0, asset_r + (int32)4, hh, split);
+  editor_viewport_region(g, vp, sc, view_x, frame, vk_active);
+  var ec: int32 = explorer_entry_count(es);
+  var sel: int32 = explorer_selection(es);
+  var scr: int32 = explorer_scroll(es);
+  if (ec > 0 && sel >= 0 && sel < ec) {
+    var row_rel: int32 = sel - scr;
+    if (row_rel >= 0 && row_rel < EXPLORER_VISIBLE_LINES()) {
+      var ry0: int32 = EDITOR_BODY_TOP() - (int32)4 + row_rel * EDITOR_LINE_H();
+      var ry1: int32 = ry0 + EDITOR_LINE_H() + (int32)2;
+      fb_fill_rect(px, ww, hh, (int32)8, ry0, EDITOR_PANEL_W() - (int32)12, ry1, hi);
+    }
+  }
+  // Draw labels into the DIB (mem DC), not on the window DC. WM_PAINT only
+  // BitBlt's mem_dc; text on the HWND was missing on repaints → flicker.
+  var mdc: int64 = g->mem_dc;
+  if (mdc == 0) {
+    return 0;
+  }
+  Win32_SelectObject(mdc, Win32_GetStockObject(SYSTEM_FIXED_FONT_STOCK()));
+  Win32_SetBkMode(mdc, GDI_BKMODE_TRANSPARENT());
+  Win32_SetTextColor(mdc, COLORREF_WHITE());
+  var title: string = "Project Files";
+  editor_text_out(mdc, (int32)14, EDITOR_TOPBAR_H() + (int32)14, title.chars);
+  var ar: string = "Assets";
+  editor_text_out(mdc, asset_x + (int32)16, EDITOR_TOPBAR_H() + (int32)14, ar.chars);
+  var vt: string = "Viewport";
+  editor_text_out(mdc, view_x + (int32)12, EDITOR_TOPBAR_H() + (int32)14, vt.chars);
+  Win32_SetTextColor(mdc, COLORREF_DIM_TEXT());
+  var scene_buf: uint8[64];
+  var sb: cstring = (cstring)((int64)(&(scene_buf[0])));
+  var sn_pre: string = "scene ";
+  var sj: int32 = fs_copy_into(sb, 64, 0, sn_pre.chars);
+  var numtmp: uint8[24];
+  var nt: cstring = (cstring)((int64)(&(numtmp[0])));
+  int_to_dec(nt, (int64)scene_count(sc));
+  sj = fs_copy_into(sb, 64, sj, nt);
+  var sn_sel: string = "  sel #";
+  sj = fs_copy_into(sb, 64, sj, sn_sel.chars);
+  int_to_dec(nt, (int64)scene_selected_id(sc));
+  sj = fs_copy_into(sb, 64, sj, nt);
+  if (play_mode != 0) {
+    var pm: string = "  PLAY";
+    sj = fs_copy_into(sb, 64, sj, pm.chars);
+  }
+  sb[sj] = 0;
+  editor_text_out(mdc, view_x + (int32)100, EDITOR_TOPBAR_H() + (int32)14, sb);
+  var help: string = "Viewport: WASD move  E/Q up/down  RMB+mouse look  Shift boost  wheel speed   LMB edit  F focus   F5 play/stop";
+  editor_text_out(mdc, view_x + (int32)12, hh - (int32)72, help.chars);
+  var lh: uint8[640];
+  var line_buf: uint8[680];
+  var prep: string = "> ";
+  var prep_c: cstring = prep.chars;
+  var prep_len: int32 = (int32)strlen(prep_c);
+  editor_copy_trunc_to_buf(&(lh[0]), 640, explorer_cwd_ptr(es));
+  editor_text_out(mdc, (int32)14, EDITOR_TOPBAR_H() + (int32)34, (cstring)((int64)(&(lh[0]))));
+  var vis: int32 = EXPLORER_VISIBLE_LINES();
+  if (vis > 32) {
+    vis = 32;
+  }
+  var kk: int32 = 0;
+  while (kk < vis && kk + scr < ec) {
+    var idx_line: int32 = scr + kk;
+    var yl: int32 = EDITOR_BODY_TOP() + kk * EDITOR_LINE_H();
+    var nm: cstring = explorer_entry_name_ptr(es, idx_line);
+    if (explorer_entry_is_dir(es, idx_line) != 0) {
+      Win32_TextOutA(mdc, (int32)10, yl, prep_c, prep_len);
+      Win32_TextOutA(mdc, (int32)30, yl, nm, (int32)strlen(nm));
+    } else {
+      Win32_TextOutA(mdc, (int32)26, yl, nm, (int32)strlen(nm));
+    }
+    kk = kk + 1;
+  }
+  var ac: int32 = asset_manager_count(am);
+  editor_copy_trunc_to_buf(&(line_buf[0]), 680, asset_manager_project_root(am));
+  Win32_TextOutA(mdc, asset_x + (int32)16, EDITOR_TOPBAR_H() + (int32)34, (cstring)((int64)(&(line_buf[0]))), (int32)strlen((cstring)((int64)(&(line_buf[0])))));
+  // Filter label (cycled with F4)
+  var fk: int32 = asset_manager_filter(am);
+  var fbuf: uint8[80];
+  var fb_c: cstring = (cstring)((int64)(&(fbuf[0])));
+  var fp_pre: string = "Filter ";
+  var fjpos: int32 = fs_copy_into(fb_c, 80, 0, fp_pre.chars);
+  if (fk == AK_ANY()) {
+    var fall: string = "All  (F4)";
+    fjpos = fs_copy_into(fb_c, 80, fjpos, fall.chars);
+  } else {
+    fjpos = fs_copy_into(fb_c, 80, fjpos, asset_kind_label_cstr(fk));
+    var fsuf: string = "  (F4)";
+    fjpos = fs_copy_into(fb_c, 80, fjpos, fsuf.chars);
+  }
+  fb_c[fjpos] = 0;
+  editor_text_out(mdc, asset_x + (int32)16, EDITOR_TOPBAR_H() + (int32)50, fb_c);
+
+  var ai: int32 = 0;
+  var asc: int32 = asset_scroll(am);
+  var asel: int32 = asset_selected_index(am);
+  var ymax: int32 = hh / EDITOR_LINE_H() - (int32)6;
+  if (ymax > (int32)28) {
+    ymax = (int32)28;
+  }
+  // Walk all rows; only render those matching the filter. Use a separate visual
+  // index so the filtered list stays contiguous on screen. The selection still
+  // refers to the underlying row index in the manager.
+  var visible: int32 = 0;
+  var asset_idx: int32 = asc;
+  while (visible < ymax && asset_idx < ac) {
+    var kid: int32 = asset_row_kind(am, asset_idx);
+    var skip: int32 = 0;
+    if (fk != AK_ANY() && kid != fk) {
+      skip = 1;
+    }
+    if (skip == 0) {
+      var y2: int32 = EDITOR_BODY_TOP() + (int32)20 + visible * EDITOR_LINE_H();
+      if (asset_idx == asel) {
+        fb_fill_rect(px, ww, hh, asset_x + (int32)8, y2 - (int32)2, asset_r - (int32)8, y2 + EDITOR_LINE_H(), hi);
+      }
+      var vf: cstring = asset_row_vfs_cstr(am, asset_idx);
+      var kt: cstring = asset_kind_label_cstr(kid);
+      Win32_TextOutA(mdc, asset_x + (int32)14, y2, kt, (int32)strlen(kt));
+      Win32_TextOutA(mdc, asset_x + (int32)72, y2, vf, (int32)strlen(vf));
+      visible = visible + 1;
+    }
+    asset_idx = asset_idx + 1;
+  }
+  if (asel >= 0 && asel < ac) {
+    Win32_SetTextColor(mdc, COLORREF_DIM_TEXT());
+    var ap: string = "Selected";
+    editor_text_out(mdc, asset_x + (int32)16, hh - (int32)68, ap.chars);
+    Win32_TextOutA(mdc, asset_x + (int32)16, hh - (int32)50, asset_row_vfs_cstr(am, asel), (int32)strlen(asset_row_vfs_cstr(am, asel)));
+  }
+  editor_draw_inspector(g, ui, sc, mdc);
+  editor_draw_output(g, mdc);
+  editor_draw_topbar(g, mdc, proj);
+  editor_draw_project_settings(g, ui, proj, mdc);
+  game_win32_present(g);
+  return 0;
+}

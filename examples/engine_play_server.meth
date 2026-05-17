@@ -1,0 +1,425 @@
+// Headless playtest server for Roblox-style local server/client simulation.
+//
+// Entry point: engine_play_server.exe --playtest <manifest_path>
+//
+// Responsibilities:
+// - Parse manifest (session_id, project_root, scene_snapshot, services_snapshot, port, tick_hz)
+// - Load authoritative Scene from snapshot
+// - Load ServiceModel from services_snapshot
+// - Create server-side LuaScriptVm (role-aware)
+// - Register ServerScriptService scripts + migrated entity scripts as SERVER role
+// - Register ReplicatedStorage ModuleScripts for server cache
+// - Bind localhost TCP, accept one client
+// - Send full snapshot (WELCOME + SCENE_BEGIN + ENTITY lines + SCRIPT lines + SCENE_END)
+// - Fixed tick loop at tick_hz:
+//     - drain INPUT packets from client
+//     - tick server-side Lua + built-in entity scripts
+//     - broadcast authoritative XFORMs for the replicated Workspace
+// - Handle STOP / disconnect gracefully
+// - Log to server.log next to manifest
+//
+// This binary has no window. It uses std/net for sockets and the engine_lua
+// server VM. It does not depend on GDI/Vulkan.
+import "../engine/engine_lua";
+import "../engine/engine_input";
+import "../engine/engine_play_manifest";
+import "../engine/engine_play_protocol";
+import "../engine/engine_scene";
+import "../engine/engine_scene_io";
+import "../engine/engine_scripts";
+import "../engine/engine_services";
+import "../engine/engine_services_io";
+import "std/io";
+import "std/mem";
+import "std/net";
+import "std/thread";
+
+extern function ioctlsocket(s: int64, cmd: int32, argp: uint32*) -> int32 = "ioctlsocket";
+
+function server_log(s: string) {
+  fputs(s.chars, get_stdout());
+}
+
+function server_trace(msg: cstring) {
+  if (msg == 0) {
+    return;
+  }
+  fputs(cstr("[server] "), get_stdout());
+  fputs(msg, get_stdout());
+  fputs(cstr("\n"), get_stdout());
+}
+
+function parse_manifest(path: cstring, mani: PlayManifest*) -> int32 {
+  // reuse engine_play_manifest logic; assume it populates fields
+  return play_manifest_load(path, mani);
+}
+
+function server_clear_input_edges(input: InputMap*) {
+  if (input == 0) {
+    return;
+  }
+  var i: int32 = 0;
+  while (i < IA_COUNT()) {
+    input->pressed[i] = (uint8)0;
+    input->released[i] = (uint8)0;
+    i = i + 1;
+  }
+}
+
+function server_apply_input_packet(input: InputMap*, pkt: PlayPacket*) {
+  if (input == 0 || pkt == 0) {
+    return;
+  }
+  var action: int32 = pkt->i1;
+  if (action < 0 || action >= IA_COUNT()) {
+    return;
+  }
+  input->held[action] = (uint8)0;
+  input->pressed[action] = (uint8)0;
+  input->released[action] = (uint8)0;
+  if (pkt->i2 != 0) {
+    input->held[action] = (uint8)1;
+  }
+  if (pkt->i3 != 0) {
+    input->pressed[action] = (uint8)1;
+  }
+  if (pkt->i4 != 0) {
+    input->released[action] = (uint8)1;
+  }
+}
+
+function server_process_client_line(input: InputMap*, line: cstring, running: int32*) {
+  var pkt: PlayPacket;
+  var typ: int32 = play_decode_line(line, &pkt);
+  if (typ == PLAY_PKT_INPUT()) {
+    server_apply_input_packet(input, &pkt);
+    return;
+  }
+  if (typ == PLAY_PKT_STOP()) {
+    if (running != 0) {
+      *running = 0;
+    }
+  }
+}
+
+function server_process_client_bytes(input: InputMap*, data: cstring, n: int32, line: cstring, line_len: int32*, running: int32*) {
+  var i: int32 = 0;
+  while (i < n) {
+    var b: uint8 = (uint8)(data[i]);
+    if (b == (uint8)10) {
+      line[*line_len] = 0;
+      server_process_client_line(input, line, running);
+      *line_len = 0;
+    } else {
+      if (b != (uint8)13) {
+        if (*line_len + 1 < 2048) {
+          line[*line_len] = b;
+          *line_len = *line_len + 1;
+        } else {
+          *line_len = 0;
+        }
+      }
+    }
+    i = i + 1;
+  }
+}
+
+// recv() returns -1 (0xFFFFFFFF) on a non-blocking socket with no data
+// (WSAEWOULDBLOCK). A plain `if (n > 0)` does NOT reject that here: the int32
+// is compared unsigned, so -1 reads as ~4 billion and the byte loop runs off
+// the end of the buffer (the playtest crash). Treat the recv result via its
+// unsigned bit pattern: 0xFFFFFFFF = error/would-block, 0 = peer closed, and
+// clamp any positive count to the buffer size as defense-in-depth.
+function server_drain_client_input(sock: int64, input: InputMap*, line: cstring, line_len: int32*, running: int32*) {
+  var buf: uint8[4096];
+  var draining: int32 = 1;
+  while (draining != 0 && running != 0 && *running != 0) {
+    var n: int32 = recv(sock, (cstring)((int64)(&(buf[0]))), 4096, 0);
+    var nu: uint32 = (uint32)n;
+    if (nu == (uint32)4294967295) {
+      // would-block / error: nothing to read this tick, keep the session.
+      draining = 0;
+    } else {
+      if (nu == (uint32)0) {
+        // orderly shutdown by the peer.
+        *running = 0;
+        draining = 0;
+      } else {
+        var got: int32 = (int32)nu;
+        if (got > 4096) {
+          got = 4096;
+        }
+        server_process_client_bytes(input, (cstring)((int64)(&(buf[0]))), got, line, line_len, running);
+      }
+    }
+  }
+}
+
+function server_send_scene_xforms(sock: int64, sc: Scene*, tick: int32) {
+  if (sc == 0) {
+    return;
+  }
+  var buf: uint8[2048];
+  var i: int32 = 0;
+  while (i < scene_count(sc)) {
+    var e: Entity* = scene_row(sc, i);
+    if (e != 0) {
+      var nbytes: int32 = play_encode_xform((cstring)((int64)(&(buf[0]))), 2048, tick, e->id, (int32)(e->pos_x * 1000.0), (int32)(e->pos_y * 1000.0), (int32)(e->pos_z * 1000.0), (int32)(e->rot_x * 1000000.0), (int32)(e->rot_y * 1000000.0), (int32)(e->rot_z * 1000000.0), (int32)(e->rot_w * 1000000.0), (int32)(e->scale * 1000000.0));
+      if (nbytes > 0) {
+        send(sock, (cstring)((int64)(&(buf[0]))), nbytes, 0);
+      }
+    }
+    i = i + 1;
+  }
+}
+
+export function main() -> int32 {
+  var argc: int32 = 0; // placeholder; real argv parsing later
+  var manifest_path: cstring = cstr("");
+  // simplistic: assume second arg is manifest for now
+  // In real build we would use std/process argv helpers if present.
+  // For first cut, hard-code a test manifest path or expect --playtest arg.
+  // To keep it building, we accept a single arg after exe name.
+  // For now we will use a fixed test path during smoke; production uses argv.
+
+  // Placeholder: in practice the editor writes the manifest and passes the path.
+  // For standalone test we can create a minimal manifest on disk.
+  // Here we assume the caller (editor or test) has written it.
+
+  // To make it self-contained for first build, we will accept a path via
+  // a simple convention: if argv[1] exists use it, else exit with usage.
+  // Since Methlang main() signature is ()->int32, we use Win32 GetCommandLine
+  // or a tiny arg parser. For brevity in this revision we require the manifest
+  // path to be passed as a literal for smoke tests.
+
+  // In the final integration the editor will launch with the generated path.
+  // For now we hard-require a manifest file named "playtest.manifest" in cwd
+  // so the binary can be launched manually for testing.
+
+  var mani: PlayManifest* = play_manifest_create();
+  if (mani == 0) {
+    server_trace(cstr("manifest alloc failed"));
+    return 1;
+  }
+  var mpath: uint8[800];
+  if (play_manifest_arg_path((cstring)((int64)(&(mpath[0]))), 800) == 0) {
+    mpath[0] = 46; mpath[1] = 92; mpath[2] = 46; mpath[3] = 109; mpath[4] = 101;
+    mpath[5] = 116; mpath[6] = 104; mpath[7] = 112; mpath[8] = 108; mpath[9] = 97;
+    mpath[10] = 121; mpath[11] = 92; mpath[12] = 112; mpath[13] = 108; mpath[14] = 97;
+    mpath[15] = 121; mpath[16] = 116; mpath[17] = 101; mpath[18] = 115; mpath[19] = 116;
+    mpath[20] = 46; mpath[21] = 109; mpath[22] = 97; mpath[23] = 110; mpath[24] = 105;
+    mpath[25] = 102; mpath[26] = 101; mpath[27] = 115; mpath[28] = 116; mpath[29] = 0;
+  }
+  var okm: int32 = play_manifest_load((cstring)((int64)(&(mpath[0]))), mani);
+  if (okm == 0) {
+    server_trace(cstr("manifest load failed - create one or pass via editor"));
+    play_manifest_destroy(mani);
+    return 2;
+  }
+
+  server_trace(cstr("manifest loaded"));
+
+  var sc: Scene* = scene_create(4096);
+  if (sc == 0) {
+    play_manifest_destroy(mani);
+    return 3;
+  }
+  var sm: ServiceModel* = service_model_create(1024);
+  if (sm == 0) {
+    scene_destroy(sc);
+    play_manifest_destroy(mani);
+    return 4;
+  }
+
+  // Load snapshots
+  var scene_path: cstring = play_manifest_scene_snapshot(mani);
+  if (scene_io_load(scene_path, sc, (MeshStore*)0) == 0) {
+    server_trace(cstr("scene snapshot load failed"));
+    service_model_destroy(sm);
+    scene_destroy(sc);
+    play_manifest_destroy(mani);
+    return 5; 
+  }
+
+  var svc_path: cstring = play_manifest_services_snapshot(mani);
+  if (svc_path != 0 && (uint8)(svc_path[0]) != (uint8)0) {
+    if (service_io_load(svc_path, sm) != 0) {
+      server_trace(cstr("services snapshot loaded"));
+    } else {
+      server_trace(cstr("services snapshot missing or empty"));
+    }
+  }
+
+  // Migration: turn entity lua_script into transient server script records.
+  // This is additive on top of services.msvc so per-entity scripts assigned
+  // via the editor's Ctrl+L still run alongside ServerScriptService scripts.
+  var n: int32 = scene_count(sc);
+  var i: int32 = 0;
+  while (i < n) {
+    var e: Entity* = scene_row(sc, i);
+    if (e != 0 && (uint8)(e->lua_script[0]) != (uint8)0) {
+      service_model_add_script(sm, SVC_WORKSPACE(), SCRIPT_ROLE_SERVER(), e->id, (cstring)((int64)(&(e->lua_script[0]))), scene_entity_name(e));
+    }
+    i = i + 1;
+  }
+
+  // Create server Lua VM
+  var lua_vm: LuaScriptVm* = lua_vm_create_server(sc, sm);
+  if (lua_vm == 0) {
+    service_model_destroy(sm);
+    scene_destroy(sc);
+    play_manifest_destroy(mani);
+    return 6;
+  }
+  var server_input: InputMap* = input_map_create();
+  if (server_input == 0) {
+    lua_vm_destroy(lua_vm);
+    service_model_destroy(sm);
+    scene_destroy(sc);
+    play_manifest_destroy(mani);
+    return 12;
+  }
+  lua_vm->input = server_input;
+
+  // Register server-side scripts from ServiceModel
+  lua_vm_load_service_scripts(lua_vm, SVC_SERVER_SCRIPT_SERVICE(), SCRIPT_ROLE_SERVER());
+  lua_vm_load_service_scripts(lua_vm, SVC_REPLICATED_STORAGE(), SCRIPT_ROLE_MODULE());
+
+  server_trace(cstr("server Lua VM initialized"));
+
+  // Networking
+  net_init();
+  var listen_sock: int64 = socket_tcp();
+  if (listen_sock == INVALID_SOCKET()) {
+    server_trace(cstr("socket failed"));
+    input_map_destroy(server_input);
+    lua_vm_destroy(lua_vm);
+    service_model_destroy(sm);
+    scene_destroy(sc);
+    play_manifest_destroy(mani);
+    net_cleanup();
+    return 7;
+  }
+
+  var port: int32 = play_manifest_port(mani);
+  var addr: cstring = sockaddr_in_any(port);
+  if (addr == 0) {
+    closesocket(listen_sock);
+    input_map_destroy(server_input);
+    lua_vm_destroy(lua_vm);
+    service_model_destroy(sm);
+    scene_destroy(sc);
+    play_manifest_destroy(mani);
+    net_cleanup();
+    return 8;
+  }
+
+  set_reuseaddr(listen_sock, 1);
+  if (bind(listen_sock, addr, 16) == SOCKET_ERROR()) {
+    free(addr);
+    closesocket(listen_sock);
+    input_map_destroy(server_input);
+    lua_vm_destroy(lua_vm);
+    service_model_destroy(sm);
+    scene_destroy(sc);
+    play_manifest_destroy(mani);
+    net_cleanup();
+    return 9;
+  }
+  free(addr);
+
+  if (listen(listen_sock, 1) == SOCKET_ERROR()) {
+    closesocket(listen_sock);
+    input_map_destroy(server_input);
+    lua_vm_destroy(lua_vm);
+    service_model_destroy(sm);
+    scene_destroy(sc);
+    play_manifest_destroy(mani);
+    net_cleanup();
+    return 10;
+  }
+
+  server_trace(cstr("listening for client"));
+
+  var client_sock: int64 = accept(listen_sock, (cstring)0, (cstring)0);
+  if (client_sock == INVALID_SOCKET()) {
+    closesocket(listen_sock);
+    input_map_destroy(server_input);
+    lua_vm_destroy(lua_vm);
+    service_model_destroy(sm);
+    scene_destroy(sc);
+    play_manifest_destroy(mani);
+    net_cleanup();
+    return 11;
+  }
+
+  server_trace(cstr("client connected"));
+
+  // Send WELCOME + full snapshot
+  var buf: uint8[2048];
+  var nbytes: int32 = play_encode_welcome((cstring)((int64)(&(buf[0]))), 2048, play_manifest_session_id(mani), play_manifest_tick_hz(mani));
+  send(client_sock, (cstring)((int64)(&(buf[0]))), nbytes, 0);
+
+  // SCENE_BEGIN + all entities + scripts + SCENE_END
+  nbytes = play_encode_scene_begin((cstring)((int64)(&(buf[0]))), 2048, scene_count(sc));
+  send(client_sock, (cstring)((int64)(&(buf[0]))), nbytes, 0);
+
+  var si: int32 = 0;
+  while (si < scene_count(sc)) {
+    var se: Entity* = scene_row(sc, si);
+    if (se != 0) {
+      nbytes = play_encode_entity((cstring)((int64)(&(buf[0]))), 2048, se->id, se->kind, se->parent_id, (int32)(se->pos_x * 1000.0), (int32)(se->pos_y * 1000.0), (int32)(se->pos_z * 1000.0), (int32)(se->rot_x * 1000000.0), (int32)(se->rot_y * 1000000.0), (int32)(se->rot_z * 1000000.0), (int32)(se->rot_w * 1000000.0), (int32)(se->scale * 1000000.0), scene_entity_mesh_path(se), scene_entity_name(se));
+      if (nbytes > 0) {
+        send(client_sock, (cstring)((int64)(&(buf[0]))), nbytes, 0);
+      }
+    }
+    si = si + 1;
+  }
+  nbytes = play_encode_scene_end((cstring)((int64)(&(buf[0]))), 2048);
+  send(client_sock, (cstring)((int64)(&(buf[0]))), nbytes, 0);
+
+  server_trace(cstr("snapshot sent"));
+  var nb: uint32 = 1;
+  ioctlsocket(client_sock, (int32)-2147195266, &nb);
+
+  // Main tick loop
+  var running: int32 = 1;
+  var tick: int32 = 0;
+  var accum: float64 = 0.0;
+  var fixed_dt: float64 = 1.0 / (float64)play_manifest_tick_hz(mani);
+  var last_time: float64 = 0.0; // would use high-res timer in real build
+  var input_line: uint8[2048];
+  var input_line_len: int32 = 0;
+
+  while (running != 0) {
+    thread_sleep_ms((uint32)16);
+
+    server_clear_input_edges(server_input);
+    server_drain_client_input(client_sock, server_input, (cstring)((int64)(&(input_line[0]))), &input_line_len, &running);
+
+    lua_vm_tick(lua_vm, fixed_dt, (float64)tick * fixed_dt);
+    script_tick_scene(sc, server_input, fixed_dt, (float64)tick * fixed_dt);
+
+    server_send_scene_xforms(client_sock, sc, tick);
+
+    tick = tick + 1;
+    if (tick > 10000) {
+      running = 0;
+    }
+  }
+
+  // Shutdown
+  var stop_buf: uint8[64];
+  nbytes = play_encode_stop((cstring)((int64)(&(stop_buf[0]))), 64, cstr("normal"));
+  send(client_sock, (cstring)((int64)(&(stop_buf[0]))), nbytes, 0);
+
+  closesocket(client_sock);
+  closesocket(listen_sock);
+  input_map_destroy(server_input);
+  lua_vm_destroy(lua_vm);
+  service_model_destroy(sm);
+  scene_destroy(sc);
+  play_manifest_destroy(mani);
+  net_cleanup();
+  return 0;
+}

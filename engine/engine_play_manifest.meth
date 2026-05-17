@@ -1,0 +1,373 @@
+// Playtest manifest read/write.
+//
+// The editor writes this file under .methplay/session_<id>/ before launching
+// the server and client. Runners load it to agree on snapshot paths, localhost
+// endpoint, tick rate, and log files.
+import "std/conv";
+import "std/io";
+import "std/mem";
+
+extern function Win32_GetCommandLineA() -> cstring = "GetCommandLineA";
+
+export struct PlayManifest {
+  session_id: int32;
+  port: int32;
+  tick_hz: int32;
+  _pad: int32;
+  project_root: uint8[800];
+  scene_snapshot: uint8[800];
+  services_snapshot: uint8[800];
+  server_log: uint8[800];
+  client_log: uint8[800];
+  host: uint8[64];
+}
+
+function play_manifest_bytes() -> int64 {
+  return (int64)4096;
+}
+
+export function play_manifest_create() -> PlayManifest* {
+  var raw: cstring = calloc((int64)1, play_manifest_bytes());
+  if (raw == 0) {
+    return (PlayManifest*)0;
+  }
+  var m: PlayManifest* = (PlayManifest*)raw;
+  play_manifest_defaults(m);
+  return m;
+}
+
+export function play_manifest_destroy(m: PlayManifest*) {
+  if (m != 0) {
+    free((cstring)m);
+  }
+}
+
+export function play_manifest_defaults(m: PlayManifest*) {
+  if (m == 0) {
+    return;
+  }
+  m->session_id = 1;
+  m->port = 39555;
+  m->tick_hz = 60;
+  pm_copy((cstring)((int64)(&(m->host[0]))), 64, cstr("127.0.0.1"));
+  m->project_root[0] = 0;
+  m->scene_snapshot[0] = 0;
+  m->services_snapshot[0] = 0;
+  m->server_log[0] = 0;
+  m->client_log[0] = 0;
+}
+
+export function play_manifest_session_id(m: PlayManifest*) -> int32 {
+  if (m == 0) { return 0; }
+  return m->session_id;
+}
+
+export function play_manifest_port(m: PlayManifest*) -> int32 {
+  if (m == 0) { return 0; }
+  return m->port;
+}
+
+export function play_manifest_tick_hz(m: PlayManifest*) -> int32 {
+  if (m == 0 || m->tick_hz <= 0) { return 60; }
+  return m->tick_hz;
+}
+
+export function play_manifest_host(m: PlayManifest*) -> cstring {
+  if (m == 0) { return (cstring)0; }
+  return (cstring)((int64)(&(m->host[0])));
+}
+
+export function play_manifest_project_root(m: PlayManifest*) -> cstring {
+  if (m == 0) { return (cstring)0; }
+  return (cstring)((int64)(&(m->project_root[0])));
+}
+
+export function play_manifest_scene_snapshot(m: PlayManifest*) -> cstring {
+  if (m == 0) { return (cstring)0; }
+  return (cstring)((int64)(&(m->scene_snapshot[0])));
+}
+
+export function play_manifest_services_snapshot(m: PlayManifest*) -> cstring {
+  if (m == 0) { return (cstring)0; }
+  return (cstring)((int64)(&(m->services_snapshot[0])));
+}
+
+export function play_manifest_server_log(m: PlayManifest*) -> cstring {
+  if (m == 0) { return (cstring)0; }
+  return (cstring)((int64)(&(m->server_log[0])));
+}
+
+export function play_manifest_client_log(m: PlayManifest*) -> cstring {
+  if (m == 0) { return (cstring)0; }
+  return (cstring)((int64)(&(m->client_log[0])));
+}
+
+export function play_manifest_load(path: cstring, m: PlayManifest*) -> int32 {
+  if (path == 0 || m == 0) {
+    return 0;
+  }
+  play_manifest_defaults(m);
+  var fp: cstring = fopen(path, cstr("r"));
+  if (fp == 0) {
+    return 0;
+  }
+  var line: uint8[1024];
+  while (fgets((cstring)((int64)(&(line[0]))), 1024, fp) != 0) {
+    var lc: cstring = (cstring)((int64)(&(line[0])));
+    var tmp: uint8[800];
+    var t: cstring = (cstring)((int64)(&(tmp[0])));
+    if (pm_parse_kv(lc, "session_id", t, 800) != 0) {
+      m->session_id = (int32)atol(t);
+      continue;
+    }
+    if (pm_parse_kv(lc, "port", t, 800) != 0) {
+      m->port = (int32)atol(t);
+      continue;
+    }
+    if (pm_parse_kv(lc, "tick_hz", t, 800) != 0) {
+      m->tick_hz = (int32)atol(t);
+      continue;
+    }
+    if (pm_parse_kv(lc, "project_root", (cstring)((int64)(&(m->project_root[0]))), 800) != 0) {
+      continue;
+    }
+    if (pm_parse_kv(lc, "scene_snapshot", (cstring)((int64)(&(m->scene_snapshot[0]))), 800) != 0) {
+      continue;
+    }
+    if (pm_parse_kv(lc, "services_snapshot", (cstring)((int64)(&(m->services_snapshot[0]))), 800) != 0) {
+      continue;
+    }
+    if (pm_parse_kv(lc, "server_log", (cstring)((int64)(&(m->server_log[0]))), 800) != 0) {
+      continue;
+    }
+    if (pm_parse_kv(lc, "client_log", (cstring)((int64)(&(m->client_log[0]))), 800) != 0) {
+      continue;
+    }
+    pm_parse_kv(lc, "host", (cstring)((int64)(&(m->host[0]))), 64);
+  }
+  fclose(fp);
+  if ((uint8)(m->scene_snapshot[0]) == (uint8)0) {
+    return 0;
+  }
+  if (m->port <= 0 || m->tick_hz <= 0) {
+    return 0;
+  }
+  return 1;
+}
+
+export function play_manifest_save(path: cstring, m: PlayManifest*) -> int32 {
+  if (path == 0 || m == 0) {
+    return 0;
+  }
+  var fp: cstring = fopen(path, cstr("w"));
+  if (fp == 0) {
+    return 0;
+  }
+  pm_write_i32(fp, "session_id = ", m->session_id);
+  pm_write_s(fp, "project_root = ", (cstring)((int64)(&(m->project_root[0]))));
+  pm_write_s(fp, "scene_snapshot = ", (cstring)((int64)(&(m->scene_snapshot[0]))));
+  pm_write_s(fp, "services_snapshot = ", (cstring)((int64)(&(m->services_snapshot[0]))));
+  pm_write_s(fp, "server_log = ", (cstring)((int64)(&(m->server_log[0]))));
+  pm_write_s(fp, "client_log = ", (cstring)((int64)(&(m->client_log[0]))));
+  pm_write_s(fp, "host = ", (cstring)((int64)(&(m->host[0]))));
+  pm_write_i32(fp, "port = ", m->port);
+  pm_write_i32(fp, "tick_hz = ", m->tick_hz);
+  fclose(fp);
+  return 1;
+}
+
+export function play_manifest_set_paths(m: PlayManifest*, project_root: cstring, scene_snapshot: cstring, services_snapshot: cstring, server_log_path: cstring, client_log_path: cstring) {
+  if (m == 0) {
+    return;
+  }
+  pm_copy((cstring)((int64)(&(m->project_root[0]))), 800, project_root);
+  pm_copy((cstring)((int64)(&(m->scene_snapshot[0]))), 800, scene_snapshot);
+  pm_copy((cstring)((int64)(&(m->services_snapshot[0]))), 800, services_snapshot);
+  pm_copy((cstring)((int64)(&(m->server_log[0]))), 800, server_log_path);
+  pm_copy((cstring)((int64)(&(m->client_log[0]))), 800, client_log_path);
+}
+
+export function play_manifest_set_session(m: PlayManifest*, session_id: int32, port: int32, tick_hz: int32) {
+  if (m == 0) {
+    return;
+  }
+  m->session_id = session_id;
+  m->port = port;
+  m->tick_hz = tick_hz;
+  pm_copy((cstring)((int64)(&(m->host[0]))), 64, cstr("127.0.0.1"));
+}
+
+export function play_manifest_arg_path(out: cstring, out_cap: int32) -> int32 {
+  if (out == 0 || out_cap <= 0) {
+    return 0;
+  }
+  out[0] = 0;
+  var cmd: cstring = Win32_GetCommandLineA();
+  if (cmd == 0) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < 4096 && (uint8)(cmd[i]) != (uint8)0) {
+    if (pm_cmd_matches(cmd, i, "--playtest") != 0) {
+      i = i + 10;
+      while (i < 4096 && pm_is_space((uint8)(cmd[i])) != 0) {
+        i = i + 1;
+      }
+      var quote: uint8 = 0;
+      if ((uint8)(cmd[i]) == (uint8)34) {
+        quote = 34;
+        i = i + 1;
+      }
+      var j: int32 = 0;
+      while (j + 1 < out_cap && i < 4096) {
+        var b: uint8 = (uint8)(cmd[i]);
+        if (b == (uint8)0) {
+          break;
+        }
+        if (quote != 0) {
+          if (b == quote) {
+            break;
+          }
+        } else {
+          if (pm_is_space(b) != 0) {
+            break;
+          }
+        }
+        out[j] = b;
+        j = j + 1;
+        i = i + 1;
+      }
+      out[j] = 0;
+      if (j > 0) {
+        return 1;
+      }
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+function pm_write_i32(fp: cstring, label: string, v: int32) {
+  var buf: uint8[32];
+  int_to_dec((cstring)((int64)(&(buf[0]))), (int64)v);
+  fputs(label.chars, fp);
+  fputs((cstring)((int64)(&(buf[0]))), fp);
+  fputs(cstr("\n"), fp);
+}
+
+function pm_write_s(fp: cstring, label: string, s: cstring) {
+  fputs(label.chars, fp);
+  if (s != 0) {
+    fputs(s, fp);
+  }
+  fputs(cstr("\n"), fp);
+}
+
+function pm_copy(dst: cstring, cap: int32, src: cstring) {
+  if (dst == 0 || cap <= 0) {
+    return;
+  }
+  if (src == 0) {
+    dst[0] = 0;
+    return;
+  }
+  var i: int32 = 0;
+  while (i + 1 < cap) {
+    var b: uint8 = (uint8)(src[i]);
+    dst[i] = b;
+    if (b == (uint8)0) {
+      return;
+    }
+    i = i + 1;
+  }
+  dst[cap - 1] = 0;
+}
+
+function pm_is_space(c: uint8) -> int32 {
+  if (c == (uint8)32 || c == (uint8)9 || c == (uint8)13 || c == (uint8)10) {
+    return 1;
+  }
+  return 0;
+}
+
+function pm_skip_ws(line: cstring, pos: int32) -> int32 {
+  while (pos < 1024 && pm_is_space((uint8)(line[pos])) != 0) {
+    pos = pos + 1;
+  }
+  return pos;
+}
+
+function pm_trim_tail(buf: cstring, length: int32) -> int32 {
+  var n: int32 = length;
+  while (n > 0 && pm_is_space((uint8)(buf[n - 1])) != 0) {
+    n = n - 1;
+  }
+  buf[n] = 0;
+  return n;
+}
+
+function pm_parse_kv(line: cstring, key: string, dst: cstring, dst_cap: int32) -> int32 {
+  if (line == 0 || dst == 0 || dst_cap <= 0) {
+    return 0;
+  }
+  var p: int32 = pm_skip_ws(line, 0);
+  var i: int32 = 0;
+  while (i < key.length) {
+    if ((uint8)(line[p + i]) != (uint8)(key.chars[i])) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  p = p + key.length;
+  p = pm_skip_ws(line, p);
+  if ((uint8)(line[p]) != (uint8)61) {
+    return 0;
+  }
+  p = p + 1;
+  p = pm_skip_ws(line, p);
+  var j: int32 = 0;
+  while (j + 1 < dst_cap) {
+    var b: uint8 = (uint8)(line[p + j]);
+    if (b == (uint8)0 || b == (uint8)10 || b == (uint8)13) {
+      break;
+    }
+    dst[j] = b;
+    j = j + 1;
+  }
+  dst[j] = 0;
+  pm_trim_tail(dst, j);
+  return 1;
+}
+
+function pm_cmd_matches(cmd: cstring, pos: int32, needle: string) -> int32 {
+  var i: int32 = 0;
+  while (i < needle.length) {
+    if ((uint8)(cmd[pos + i]) != (uint8)(needle.chars[i])) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+function atol(s: cstring) -> int64 {
+  if (s == 0) {
+    return 0;
+  }
+  var neg: int32 = 0;
+  var v: int64 = 0;
+  var i: int32 = 0;
+  if ((uint8)(s[0]) == (uint8)45) {
+    neg = 1;
+    i = 1;
+  }
+  while ((uint8)(s[i]) >= (uint8)48 && (uint8)(s[i]) <= (uint8)57) {
+    v = v * 10 + ((int64)((uint8)(s[i]) - 48));
+    i = i + 1;
+  }
+  if (neg != 0) {
+    v = 0 - v;
+  }
+  return v;
+}

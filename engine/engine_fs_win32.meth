@@ -1,0 +1,230 @@
+// Windows directory enumeration + path helpers for the editor / asset pipeline.
+import "std/mem";
+
+export function FS_FILE_ATTRIBUTE_DIRECTORY() -> uint32 {
+  return (uint32)16;
+}
+
+export function FS_INVALID_HANDLE_VALUE() -> int64 {
+  var z: int64 = 0;
+  return z - (int64)1;
+}
+
+// Layout matches MSVC WIN32_FIND_DATAA for x64 (cFileName begins at offset 44).
+export struct Win32FindDataA {
+  dw_file_attributes: uint32;
+  ft_create_lo: uint32;
+  ft_create_hi: uint32;
+  ft_access_lo: uint32;
+  ft_access_hi: uint32;
+  ft_write_lo: uint32;
+  ft_write_hi: uint32;
+  n_file_size_high: uint32;
+  n_file_size_low: uint32;
+  dw_reserved0: uint32;
+  dw_reserved1: uint32;
+  c_file_name: uint8[260];
+  c_alternate: uint8[14];
+  _struct_pad: uint8[2];
+}
+
+export extern function Win32_FindFirstFileA(pattern: cstring, find_data: Win32FindDataA*) -> int64 = "FindFirstFileA";
+export extern function Win32_FindNextFileA(find_handle: int64, find_data: Win32FindDataA*) -> int32 = "FindNextFileA";
+export extern function Win32_FindClose(find_handle: int64) -> int32 = "FindClose";
+
+export extern function Win32_GetCurrentDirectoryA(buf_len: uint32, buf: cstring) -> uint32 = "GetCurrentDirectoryA";
+// module = NULL -> path of the current process's .exe. Used to anchor project
+// resolution to the executable's directory instead of a fluctuating cwd.
+export extern function Win32_GetModuleFileNameA(module: int64, buf: cstring, buf_len: uint32) -> uint32 = "GetModuleFileNameA";
+
+export function fs_find_data_is_dir(fd: Win32FindDataA*) -> int32 {
+  if (fd == 0) {
+    return 0;
+  }
+  var mask: uint32 = FS_FILE_ATTRIBUTE_DIRECTORY();
+  if (((fd->dw_file_attributes) & mask) != (uint32)0) {
+    return 1;
+  }
+  return 0;
+}
+
+export function fs_find_data_name_c(fd: Win32FindDataA*) -> cstring {
+  if (fd == 0) {
+    return (cstring)0;
+  }
+  return (cstring)((int64)(&(fd->c_file_name[0])));
+}
+
+export function fs_copy_nul_terminated(dst: cstring, dst_cap: int32, src: cstring) -> int32 {
+  if (dst == 0) {
+    return -1;
+  }
+  if (src == 0) {
+    dst[0] = 0;
+    return 0;
+  }
+  if (dst_cap <= 0) {
+    return -1;
+  }
+  var i: int32 = 0;
+  while (i + 1 < dst_cap) {
+    var b: uint8 = (uint8)(src[i]);
+    dst[i] = b;
+    if (b == (uint8)0) {
+      return i;
+    }
+    i = i + 1;
+  }
+  dst[dst_cap - 1] = 0;
+  return dst_cap - 1;
+}
+
+export function fs_path_append_sep_and_wild(out: cstring, out_cap: int32, cwd: cstring) -> int32 {
+  if (out == 0) {
+    return -1;
+  }
+  if (fs_copy_nul_terminated(out, out_cap, cwd) < 0) {
+    return -1;
+  }
+  var L: int32 = 0;
+  while (L + 1 < out_cap) {
+    if ((uint8)(out[L]) == (uint8)0) {
+      break;
+    }
+    L = L + 1;
+  }
+  if (L <= 0) {
+    return -1;
+  }
+  var tail: uint8 = (uint8)(out[L - 1]);
+  if (tail != (uint8)92) {
+    if (L + 2 >= out_cap) {
+      return -1;
+    }
+    out[L] = 92;
+    L = L + 1;
+    out[L] = 0;
+  }
+  if (L + 2 > out_cap) {
+    return -1;
+  }
+  out[L] = 42;
+  out[L + 1] = 0;
+  return 0;
+}
+
+export function fs_path_parent_inplace(path: cstring) -> int32 {
+  if (path == 0) {
+    return -1;
+  }
+  var len: int32 = 0;
+  while (len < 4096) {
+    if ((uint8)(path[len]) == (uint8)0) {
+      break;
+    }
+    len = len + 1;
+  }
+  if (len <= 0) {
+    return -1;
+  }
+  var pos: int32 = len - 1;
+  while (pos > 0) {
+    if ((uint8)(path[pos]) == (uint8)92) {
+      break;
+    }
+    pos = pos - 1;
+  }
+  if (pos <= 0) {
+    path[0] = 0;
+    return 0;
+  }
+  path[pos] = 0;
+  if (pos == 1 && (uint8)(path[0]) == (uint8)92) {
+    return 0;
+  }
+  return 0;
+}
+
+export function fs_path_join_child(out: cstring, out_cap: int32, parent: cstring, child: cstring) -> int32 {
+  if (out == 0) {
+    return -1;
+  }
+  if (fs_copy_nul_terminated(out, out_cap, parent) < 0) {
+    return -1;
+  }
+  var L: int32 = 0;
+  while (L + 1 < out_cap) {
+    if ((uint8)(out[L]) == (uint8)0) {
+      break;
+    }
+    L = L + 1;
+  }
+  if (L <= 0) {
+    return -1;
+  }
+  var tail: uint8 = (uint8)(out[L - 1]);
+  if (tail != (uint8)92) {
+    if (L + 2 >= out_cap) {
+      return -1;
+    }
+    out[L] = 92;
+    L = L + 1;
+    out[L] = 0;
+  }
+  var ci: int64 = 0;
+  while (L + 1 < out_cap) {
+    var bc: uint8 = (uint8)(child[ci]);
+    if (bc == (uint8)0) {
+      out[L] = 0;
+      return 0;
+    }
+    out[L] = bc;
+    L = L + 1;
+    out[L] = 0;
+    ci = ci + 1;
+  }
+  out[out_cap - 1] = 0;
+  return -1;
+}
+
+export function fs_dot_or_dotdot(name: cstring) -> int32 {
+  if (name == 0) {
+    return 0;
+  }
+  if ((uint8)(name[0]) == (uint8)46) {
+    if ((uint8)(name[1]) == (uint8)0) {
+      return 1;
+    }
+    if ((uint8)(name[1]) == (uint8)46) {
+      if ((uint8)(name[2]) == (uint8)0) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+export function fs_name_cmp_lex(a: cstring, b: cstring) -> int32 {
+  var i: int64 = 0;
+  while ((uint8)(a[i]) != (uint8)0 && (uint8)(b[i]) != (uint8)0) {
+    if (a[i] != b[i]) {
+      return (int32)((int32)a[i] - (int32)b[i]);
+    }
+    i = i + 1;
+  }
+  if ((uint8)(a[i]) == (uint8)0 && (uint8)(b[i]) == (uint8)0) {
+    return 0;
+  }
+  if ((uint8)(a[i]) == (uint8)0) {
+    return -1;
+  }
+  return 1;
+}
+
+export function fs_combine_size64(size_high: uint32, size_low: uint32) -> int64 {
+  var hi: int64 = (int64)(size_high);
+  var lo: int64 = (int64)(size_low);
+  var scale: int64 = (int64)65536;
+  scale = scale * scale;
+  return hi * scale + lo;
+}

@@ -1,0 +1,103 @@
+// Runtime-facing input abstraction: game code asks for actions, not Win32 keys.
+import "game_gdi_win32";
+import "std/mem";
+
+export function IA_MOVE_FORWARD() -> int32 { return 0; }
+export function IA_MOVE_BACK() -> int32 { return 1; }
+export function IA_MOVE_LEFT() -> int32 { return 2; }
+export function IA_MOVE_RIGHT() -> int32 { return 3; }
+export function IA_MOVE_UP() -> int32 { return 4; }
+export function IA_MOVE_DOWN() -> int32 { return 5; }
+export function IA_FIRE() -> int32 { return 6; }
+export function IA_PLAY_TOGGLE() -> int32 { return 7; }
+export function IA_COUNT() -> int32 { return 16; }
+
+export struct InputMap {
+  action_vk: int32[16];
+  held: uint8[16];
+  pressed: uint8[16];
+  released: uint8[16];
+}
+
+function input_map_bytes() -> int64 {
+  return (int64)256;
+}
+
+export function input_map_create() -> InputMap* {
+  var raw: cstring = calloc((int64)1, input_map_bytes());
+  if (raw == 0) {
+    return 0;
+  }
+  var im: InputMap* = (InputMap*)raw;
+  im->action_vk[IA_MOVE_FORWARD()] = 87;
+  im->action_vk[IA_MOVE_BACK()] = 83;
+  im->action_vk[IA_MOVE_LEFT()] = 65;
+  im->action_vk[IA_MOVE_RIGHT()] = 68;
+  im->action_vk[IA_MOVE_UP()] = 32;
+  im->action_vk[IA_MOVE_DOWN()] = 17;
+  im->action_vk[IA_FIRE()] = 1;
+  im->action_vk[IA_PLAY_TOGGLE()] = 116;
+  return im;
+}
+
+export function input_map_destroy(im: InputMap*) {
+  if (im != 0) {
+    free((cstring)im);
+  }
+}
+
+export function input_bind_key(im: InputMap*, action: int32, vkey: int32) {
+  if (im == 0 || action < 0 || action >= IA_COUNT()) {
+    return;
+  }
+  im->action_vk[action] = vkey;
+}
+
+export function input_map_update(im: InputMap*, g: GameWin32*) {
+  if (im == 0) {
+    return;
+  }
+  var i: int32 = 0;
+  while (i < IA_COUNT()) {
+    var was: int32 = (int32)im->held[i];
+    var now: int32 = 0;
+    if (im->action_vk[i] > 0) {
+      now = game_input_key_held(im->action_vk[i]);
+    }
+    im->held[i] = (uint8)0;
+    im->pressed[i] = (uint8)0;
+    im->released[i] = (uint8)0;
+    if (now != 0) {
+      im->held[i] = (uint8)1;
+      if (was == 0) {
+        im->pressed[i] = (uint8)1;
+      }
+    } else {
+      if (was != 0) {
+        im->released[i] = (uint8)1;
+      }
+    }
+    i = i + 1;
+  }
+}
+
+export function input_action_held(im: InputMap*, action: int32) -> int32 {
+  if (im == 0 || action < 0 || action >= IA_COUNT()) {
+    return 0;
+  }
+  return (int32)im->held[action];
+}
+
+export function input_action_pressed(im: InputMap*, action: int32) -> int32 {
+  if (im == 0 || action < 0 || action >= IA_COUNT()) {
+    return 0;
+  }
+  return (int32)im->pressed[action];
+}
+
+export function input_action_released(im: InputMap*, action: int32) -> int32 {
+  if (im == 0 || action < 0 || action >= IA_COUNT()) {
+    return 0;
+  }
+  return (int32)im->released[action];
+}

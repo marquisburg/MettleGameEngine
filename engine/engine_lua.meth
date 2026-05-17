@@ -1,0 +1,857 @@
+// Lua 5.5 scripting integration for the Methlang game engine.
+//
+// Owns a single shared lua_State and a fixed-size table of (entity_id, script
+// path) -> chunk-reference slots. Per tick the runtime sets a context (scene,
+// input, self entity id, dt, time) into a module-level static, then calls the
+// per-entity on_tick function (or re-executes the chunk if no on_tick was
+// defined).
+//
+// Linking: build with --link-arg -llua55. lua55.dll must be on PATH at link
+// time (the Methlang internal linker probes named DLLs by exports) and on
+// PATH at run time.
+//
+// Scripts get one global table `engine`:
+//   engine.self_id()                       -> int
+//   engine.dt()                            -> seconds
+//   engine.time()                          -> seconds
+//   engine.get_pos(id?)                    -> x,y,z   (id defaults to self)
+//   engine.set_pos([id,] x, y, z)
+//   engine.translate([id,] dx, dy, dz)     (world-space, respects parent)
+//   engine.rotate_world([id,] axis, rad)   (axis: 1=X, 2=Y, 3=Z)
+//   engine.get_scale(id?)                  -> number
+//   engine.set_scale([id,] s)
+//   engine.input_held(action)              -> bool
+//   engine.input_pressed(action)           -> bool
+//   engine.input_released(action)          -> bool
+//   engine.IA = { FORWARD=0, BACK=1, LEFT=2, RIGHT=3,
+//                 UP=4, DOWN=5, FIRE=6, PLAY_TOGGLE=7 }
+//   engine.log(msg)
+//
+// Per-script lifecycle:
+//   * On first tick (or after a "reload"), the chunk is loaded and its top
+//     level is run once. If it defined a global `function on_tick(dt)`, that
+//     function is captured (registry ref) and the runtime calls it each step.
+//   * If on_tick is not defined, the chunk's top-level code is run each tick.
+//   * `on_tick` is wiped from globals after each load so the next script's
+//     on_tick doesn't bleed in across loads on the same shared state.
+import "engine_input";
+import "engine_output_log";
+import "engine_scene";
+import "engine_services";
+import "std/io";
+import "std/mem";
+
+// ---- Lua C API bindings (lua55.dll) ----------------------------------------
+// Lua 5.5 changed the pseudo-index formula:
+//   #define LUA_REGISTRYINDEX  (-(INT_MAX/2 + 1000))
+// INT_MAX/2 = 1073741823, so LUA_REGISTRYINDEX = -1073742823. This is NOT the
+// older Lua 5.1-5.4 value (-LUAI_MAXSTACK - 1000); cross-checked against
+// lua.h in Lua 5.5.0.
+function LUA_REGISTRYINDEX() -> int32 { return 0 - 1073742823; }
+function LUA_OK() -> int32             { return 0; }
+function LUA_TNIL() -> int32           { return 0; }
+function LUA_TBOOLEAN() -> int32       { return 1; }
+function LUA_TNUMBER() -> int32        { return 3; }
+function LUA_TSTRING() -> int32        { return 4; }
+function LUA_TFUNCTION() -> int32      { return 6; }
+function LUA_MULTRET() -> int32        { return 0 - 1; }
+function LUA_NOREF() -> int32          { return 0 - 2; }
+function LUA_REFNIL() -> int32         { return 0 - 1; }
+
+extern function luaL_newstate() -> cstring = "luaL_newstate";
+extern function lua_close(L: cstring) = "lua_close";
+// Lua 5.5 replaced luaL_openlibs() with luaL_openselectedlibs(L, load, preload).
+// load = ~0, preload = 0 means "open every standard library, preload none",
+// which matches the classic luaL_openlibs() macro behaviour.
+extern function luaL_openselectedlibs(L: cstring, load: int32, preload: int32) = "luaL_openselectedlibs";
+extern function luaL_loadfilex(L: cstring, path: cstring, mode: cstring) -> int32 = "luaL_loadfilex";
+extern function lua_pcallk(L: cstring, nargs: int32, nresults: int32, errfunc: int32, ctx: int64, k: cstring) -> int32 = "lua_pcallk";
+extern function lua_gettop(L: cstring) -> int32 = "lua_gettop";
+extern function lua_settop(L: cstring, idx: int32) = "lua_settop";
+extern function lua_pushnil(L: cstring) = "lua_pushnil";
+extern function lua_pushinteger(L: cstring, n: int64) = "lua_pushinteger";
+extern function lua_pushnumber(L: cstring, n: float64) = "lua_pushnumber";
+extern function lua_pushboolean(L: cstring, b: int32) = "lua_pushboolean";
+extern function lua_pushstring(L: cstring, s: cstring) -> cstring = "lua_pushstring";
+extern function lua_pushcclosure(L: cstring, fn_ptr: fn(cstring) -> int32, n: int32) = "lua_pushcclosure";
+extern function lua_pushvalue(L: cstring, idx: int32) = "lua_pushvalue";
+extern function lua_setfield(L: cstring, idx: int32, k: cstring) = "lua_setfield";
+extern function lua_setglobal(L: cstring, name: cstring) = "lua_setglobal";
+extern function lua_getglobal(L: cstring, name: cstring) -> int32 = "lua_getglobal";
+extern function lua_createtable(L: cstring, narr: int32, nrec: int32) = "lua_createtable";
+extern function lua_rawgeti(L: cstring, idx: int32, n: int64) -> int32 = "lua_rawgeti";
+extern function luaL_ref(L: cstring, t: int32) -> int32 = "luaL_ref";
+extern function luaL_unref(L: cstring, t: int32, refn: int32) = "luaL_unref";
+extern function lua_type(L: cstring, idx: int32) -> int32 = "lua_type";
+extern function lua_tolstring(L: cstring, idx: int32, len: int64*) -> cstring = "lua_tolstring";
+extern function lua_tointegerx(L: cstring, idx: int32, isnum: int32*) -> int64 = "lua_tointegerx";
+extern function lua_tonumberx(L: cstring, idx: int32, isnum: int32*) -> float64 = "lua_tonumberx";
+
+// Helpers mirroring Lua's lua.h macros (no #define in Methlang). These are
+// engine-prefixed to avoid any collision with C API symbols that the linker
+// might also resolve from lua55.dll.
+export function eng_lua_pcall(L: cstring, nargs: int32, nresults: int32, errfunc: int32) -> int32 {
+  return lua_pcallk(L, nargs, nresults, errfunc, (int64)0, (cstring)0);
+}
+
+export function eng_lua_pop(L: cstring, n: int32) {
+  lua_settop(L, 0 - n - 1);
+}
+
+export function eng_lua_pushcfunction(L: cstring, fn_ptr: fn(cstring) -> int32) {
+  lua_pushcclosure(L, fn_ptr, 0);
+}
+
+export function eng_lua_tostring(L: cstring, idx: int32) -> cstring {
+  return lua_tolstring(L, idx, (int64*)0);
+}
+
+export function eng_lua_tointeger(L: cstring, idx: int32) -> int64 {
+  return lua_tointegerx(L, idx, (int32*)0);
+}
+
+export function eng_lua_tonumber(L: cstring, idx: int32) -> float64 {
+  return lua_tonumberx(L, idx, (int32*)0);
+}
+
+// ---- Per-tick context (module-level static) --------------------------------
+// The C-callable functions need to reach back into the engine, but a Lua
+// CFunction takes only a lua_State*. Methlang module-level vars give us a
+// safe single-tick scratchpad: one Methlang process == one editor == one
+// scripting registry == this slot. lua_pcall is synchronous on this thread,
+// so the slot is filled before each call and read inside the callbacks.
+var lua_ctx_scene: Scene* = 0;
+var lua_ctx_input: InputMap* = 0;
+var lua_ctx_self_id: int32 = 0;
+var lua_ctx_dt: float64 = 0.0;
+var lua_ctx_time: float64 = 0.0;
+
+function lua_ctx_set(scene: Scene*, input: InputMap*, self_id: int32, dt: float64, t: float64) {
+  lua_ctx_scene = scene;
+  lua_ctx_input = input;
+  lua_ctx_self_id = self_id;
+  lua_ctx_dt = dt;
+  lua_ctx_time = t;
+}
+
+function lua_ctx_clear() {
+  lua_ctx_scene = 0;
+  lua_ctx_input = 0;
+  lua_ctx_self_id = 0;
+}
+
+// ---- Lua-callable C functions (lua_CFunction shape) ------------------------
+function lua_resolve_entity(L: cstring, arg_idx: int32) -> Entity* {
+  if (lua_ctx_scene == 0) {
+    return (Entity*)0;
+  }
+  var id: int32 = 0;
+  if (arg_idx > 0 && lua_type(L, arg_idx) == LUA_TNUMBER()) {
+    id = (int32)eng_lua_tointeger(L, arg_idx);
+  }
+  if (id == 0) {
+    id = lua_ctx_self_id;
+  }
+  if (id == 0) {
+    return (Entity*)0;
+  }
+  return scene_find(lua_ctx_scene, id);
+}
+
+function lua_api_self_id(L: cstring) -> int32 {
+  lua_pushinteger(L, (int64)lua_ctx_self_id);
+  return 1;
+}
+
+function lua_api_dt(L: cstring) -> int32 {
+  lua_pushnumber(L, lua_ctx_dt);
+  return 1;
+}
+
+function lua_api_time(L: cstring) -> int32 {
+  lua_pushnumber(L, lua_ctx_time);
+  return 1;
+}
+
+function lua_api_get_pos(L: cstring) -> int32 {
+  var e: Entity* = lua_resolve_entity(L, 1);
+  if (e == 0) {
+    lua_pushnil(L);
+    return 1;
+  }
+  lua_pushnumber(L, e->pos_x);
+  lua_pushnumber(L, e->pos_y);
+  lua_pushnumber(L, e->pos_z);
+  return 3;
+}
+
+function lua_api_set_pos(L: cstring) -> int32 {
+  // engine.set_pos(x, y, z)  (self)  OR  engine.set_pos(id, x, y, z)
+  var top: int32 = lua_gettop(L);
+  var e: Entity* = (Entity*)0;
+  var xi: int32 = 1;
+  if (top >= 4) {
+    e = lua_resolve_entity(L, 1);
+    xi = 2;
+  } else {
+    e = lua_resolve_entity(L, 0);
+  }
+  if (e == 0) {
+    return 0;
+  }
+  e->pos_x = eng_lua_tonumber(L, xi);
+  e->pos_y = eng_lua_tonumber(L, xi + 1);
+  e->pos_z = eng_lua_tonumber(L, xi + 2);
+  return 0;
+}
+
+function lua_api_translate(L: cstring) -> int32 {
+  var top: int32 = lua_gettop(L);
+  var e: Entity* = (Entity*)0;
+  var xi: int32 = 1;
+  if (top >= 4) {
+    e = lua_resolve_entity(L, 1);
+    xi = 2;
+  } else {
+    e = lua_resolve_entity(L, 0);
+  }
+  if (e == 0 || lua_ctx_scene == 0) {
+    return 0;
+  }
+  var dx: float64 = eng_lua_tonumber(L, xi);
+  var dy: float64 = eng_lua_tonumber(L, xi + 1);
+  var dz: float64 = eng_lua_tonumber(L, xi + 2);
+  scene_entity_translate_world(lua_ctx_scene, e, dx, dy, dz);
+  return 0;
+}
+
+function lua_api_rotate_world(L: cstring) -> int32 {
+  var top: int32 = lua_gettop(L);
+  var e: Entity* = (Entity*)0;
+  var ai: int32 = 1;
+  if (top >= 3) {
+    e = lua_resolve_entity(L, 1);
+    ai = 2;
+  } else {
+    e = lua_resolve_entity(L, 0);
+  }
+  if (e == 0) {
+    return 0;
+  }
+  var axis: int32 = (int32)eng_lua_tointeger(L, ai);
+  var rad: float64 = eng_lua_tonumber(L, ai + 1);
+  scene_entity_rotate_world_axis(e, axis, rad);
+  return 0;
+}
+
+function lua_api_get_scale(L: cstring) -> int32 {
+  var e: Entity* = lua_resolve_entity(L, 1);
+  if (e == 0) {
+    lua_pushnumber(L, 1.0);
+    return 1;
+  }
+  lua_pushnumber(L, e->scale);
+  return 1;
+}
+
+function lua_api_set_scale(L: cstring) -> int32 {
+  var top: int32 = lua_gettop(L);
+  var e: Entity* = (Entity*)0;
+  var si: int32 = 1;
+  if (top >= 2) {
+    e = lua_resolve_entity(L, 1);
+    si = 2;
+  } else {
+    e = lua_resolve_entity(L, 0);
+  }
+  if (e == 0) {
+    return 0;
+  }
+  var s: float64 = eng_lua_tonumber(L, si);
+  if (s < 0.01) { s = 0.01; }
+  if (s > 100.0) { s = 100.0; }
+  e->scale = s;
+  return 0;
+}
+
+function lua_api_input_held(L: cstring) -> int32 {
+  if (lua_ctx_input == 0) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  var a: int32 = (int32)eng_lua_tointeger(L, 1);
+  lua_pushboolean(L, input_action_held(lua_ctx_input, a));
+  return 1;
+}
+
+function lua_api_input_pressed(L: cstring) -> int32 {
+  if (lua_ctx_input == 0) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  var a: int32 = (int32)eng_lua_tointeger(L, 1);
+  lua_pushboolean(L, input_action_pressed(lua_ctx_input, a));
+  return 1;
+}
+
+function lua_api_input_released(L: cstring) -> int32 {
+  if (lua_ctx_input == 0) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  var a: int32 = (int32)eng_lua_tointeger(L, 1);
+  lua_pushboolean(L, input_action_released(lua_ctx_input, a));
+  return 1;
+}
+
+function lua_api_log(L: cstring) -> int32 {
+  var s: cstring = eng_lua_tostring(L, 1);
+  if (s != 0) {
+    fputs(cstr("[lua] "), get_stdout());
+    fputs(s, get_stdout());
+    fputs(cstr("\n"), get_stdout());
+    output_log_lua(s);
+  }
+  return 0;
+}
+
+// ---- Registry: one slot per (entity-id, file path) -------------------------
+function LUA_MAX_SCRIPTS() -> int32 { return 256; }
+
+export struct LuaScriptSlot {
+  path: uint8[260];
+  entity_id: int32;
+  chunk_ref: int32;
+  on_tick_ref: int32;
+  has_on_tick: int32;
+  in_use: int32;
+  _pad0: int32;
+  _pad1: int32;
+}
+
+export struct LuaScriptRegistry {
+  L: cstring;
+  slots: LuaScriptSlot*;
+  cap: int32;
+  initialised: int32;
+  last_error: uint8[256];
+}
+
+function lua_slot_bytes() -> int64 { return (int64)288; }
+
+function lua_slot_ptr(reg: LuaScriptRegistry*, i: int32) -> LuaScriptSlot* {
+  if (reg == 0 || i < 0 || i >= reg->cap) {
+    return (LuaScriptSlot*)0;
+  }
+  var base: LuaScriptSlot* = reg->slots;
+  if (base == 0) {
+    return (LuaScriptSlot*)0;
+  }
+  var off: int64 = (int64)i * lua_slot_bytes();
+  return (LuaScriptSlot*)((cstring)((int64)base + off));
+}
+
+function lua_install_api(L: cstring) {
+  lua_createtable(L, 0, 24);
+  eng_lua_pushcfunction(L, &lua_api_self_id);         lua_setfield(L, -2, cstr("self_id"));
+  eng_lua_pushcfunction(L, &lua_api_dt);              lua_setfield(L, -2, cstr("dt"));
+  eng_lua_pushcfunction(L, &lua_api_time);            lua_setfield(L, -2, cstr("time"));
+  eng_lua_pushcfunction(L, &lua_api_get_pos);         lua_setfield(L, -2, cstr("get_pos"));
+  eng_lua_pushcfunction(L, &lua_api_set_pos);         lua_setfield(L, -2, cstr("set_pos"));
+  eng_lua_pushcfunction(L, &lua_api_translate);       lua_setfield(L, -2, cstr("translate"));
+  eng_lua_pushcfunction(L, &lua_api_rotate_world);    lua_setfield(L, -2, cstr("rotate_world"));
+  eng_lua_pushcfunction(L, &lua_api_get_scale);       lua_setfield(L, -2, cstr("get_scale"));
+  eng_lua_pushcfunction(L, &lua_api_set_scale);       lua_setfield(L, -2, cstr("set_scale"));
+  eng_lua_pushcfunction(L, &lua_api_input_held);      lua_setfield(L, -2, cstr("input_held"));
+  eng_lua_pushcfunction(L, &lua_api_input_pressed);   lua_setfield(L, -2, cstr("input_pressed"));
+  eng_lua_pushcfunction(L, &lua_api_input_released);  lua_setfield(L, -2, cstr("input_released"));
+  eng_lua_pushcfunction(L, &lua_api_log);             lua_setfield(L, -2, cstr("log"));
+
+  lua_createtable(L, 0, 8);
+  lua_pushinteger(L, (int64)IA_MOVE_FORWARD()); lua_setfield(L, -2, cstr("FORWARD"));
+  lua_pushinteger(L, (int64)IA_MOVE_BACK());    lua_setfield(L, -2, cstr("BACK"));
+  lua_pushinteger(L, (int64)IA_MOVE_LEFT());    lua_setfield(L, -2, cstr("LEFT"));
+  lua_pushinteger(L, (int64)IA_MOVE_RIGHT());   lua_setfield(L, -2, cstr("RIGHT"));
+  lua_pushinteger(L, (int64)IA_MOVE_UP());      lua_setfield(L, -2, cstr("UP"));
+  lua_pushinteger(L, (int64)IA_MOVE_DOWN());    lua_setfield(L, -2, cstr("DOWN"));
+  lua_pushinteger(L, (int64)IA_FIRE());         lua_setfield(L, -2, cstr("FIRE"));
+  lua_pushinteger(L, (int64)IA_PLAY_TOGGLE());  lua_setfield(L, -2, cstr("PLAY_TOGGLE"));
+  lua_setfield(L, -2, cstr("IA"));
+
+  lua_setglobal(L, cstr("engine"));
+}
+
+export function lua_registry_create(cap: int32) -> LuaScriptRegistry* {
+  if (cap <= 0) {
+    cap = LUA_MAX_SCRIPTS();
+  }
+  var raw: cstring = calloc((int64)1, (int64)512);
+  if (raw == 0) {
+    return (LuaScriptRegistry*)0;
+  }
+  var reg: LuaScriptRegistry* = (LuaScriptRegistry*)raw;
+  reg->cap = cap;
+  reg->initialised = 0;
+  reg->L = luaL_newstate();
+  if (reg->L == 0) {
+    free(raw);
+    return (LuaScriptRegistry*)0;
+  }
+  luaL_openselectedlibs(reg->L, 0 - 1, 0);
+  lua_install_api(reg->L);
+  var slab: cstring = calloc((int64)cap, lua_slot_bytes());
+  if (slab == 0) {
+    lua_close(reg->L);
+    free(raw);
+    return (LuaScriptRegistry*)0;
+  }
+  reg->slots = (LuaScriptSlot*)slab;
+  var i: int32 = 0;
+  while (i < cap) {
+    var s: LuaScriptSlot* = lua_slot_ptr(reg, i);
+    if (s != 0) {
+      s->chunk_ref = LUA_NOREF();
+      s->on_tick_ref = LUA_NOREF();
+    }
+    i = i + 1;
+  }
+  reg->initialised = 1;
+  return reg;
+}
+
+export function lua_registry_destroy(reg: LuaScriptRegistry*) {
+  if (reg == 0) {
+    return;
+  }
+  if (reg->L != 0) {
+    lua_close(reg->L);
+    reg->L = 0;
+  }
+  if (reg->slots != 0) {
+    free((cstring)reg->slots);
+    reg->slots = 0;
+  }
+  free((cstring)reg);
+}
+
+function lua_path_eq(a: cstring, b: cstring) -> int32 {
+  if (a == 0 || b == 0) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < 260) {
+    var ca: uint8 = (uint8)(a[i]);
+    var cb: uint8 = (uint8)(b[i]);
+    if (ca != cb) {
+      return 0;
+    }
+    if (ca == (uint8)0) {
+      return 1;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+function lua_copy_path(dst: cstring, src: cstring) {
+  if (dst == 0) {
+    return;
+  }
+  if (src == 0) {
+    dst[0] = 0;
+    return;
+  }
+  var i: int32 = 0;
+  while (i + 1 < 260) {
+    var b: uint8 = (uint8)(src[i]);
+    dst[i] = b;
+    if (b == (uint8)0) {
+      return;
+    }
+    i = i + 1;
+  }
+  dst[259] = 0;
+}
+
+function lua_find_existing_slot(reg: LuaScriptRegistry*, entity_id: int32, path: cstring) -> LuaScriptSlot* {
+  if (reg == 0 || path == 0) {
+    return (LuaScriptSlot*)0;
+  }
+  var i: int32 = 0;
+  while (i < reg->cap) {
+    var s: LuaScriptSlot* = lua_slot_ptr(reg, i);
+    if (s != 0 && s->in_use != 0 && s->entity_id == entity_id) {
+      if (lua_path_eq((cstring)((int64)(&(s->path[0]))), path) != 0) {
+        return s;
+      }
+    }
+    i = i + 1;
+  }
+  return (LuaScriptSlot*)0;
+}
+
+function lua_alloc_slot(reg: LuaScriptRegistry*, entity_id: int32, path: cstring) -> LuaScriptSlot* {
+  if (reg == 0) {
+    return (LuaScriptSlot*)0;
+  }
+  var i: int32 = 0;
+  while (i < reg->cap) {
+    var s: LuaScriptSlot* = lua_slot_ptr(reg, i);
+    if (s != 0 && s->in_use == 0) {
+      s->in_use = 1;
+      s->entity_id = entity_id;
+      s->chunk_ref = LUA_NOREF();
+      s->on_tick_ref = LUA_NOREF();
+      s->has_on_tick = 0;
+      lua_copy_path((cstring)((int64)(&(s->path[0]))), path);
+      return s;
+    }
+    i = i + 1;
+  }
+  return (LuaScriptSlot*)0;
+}
+
+function lua_find_or_alloc_slot(reg: LuaScriptRegistry*, entity_id: int32, path: cstring) -> LuaScriptSlot* {
+  var existing: LuaScriptSlot* = lua_find_existing_slot(reg, entity_id, path);
+  if (existing != 0) {
+    return existing;
+  }
+  return lua_alloc_slot(reg, entity_id, path);
+}
+
+function lua_record_error(reg: LuaScriptRegistry*, prefix: cstring) {
+  if (reg == 0 || reg->L == 0) {
+    return;
+  }
+  var err: cstring = eng_lua_tostring(reg->L, -1);
+  var dst: cstring = (cstring)((int64)(&(reg->last_error[0])));
+  var pos: int32 = 0;
+  if (prefix != 0) {
+    while (pos + 1 < 256 && (uint8)(prefix[pos]) != (uint8)0) {
+      dst[pos] = (uint8)(prefix[pos]);
+      pos = pos + 1;
+    }
+  }
+  if (err != 0) {
+    var j: int32 = 0;
+    while (pos + 1 < 256 && (uint8)(err[j]) != (uint8)0) {
+      dst[pos] = (uint8)(err[j]);
+      pos = pos + 1;
+      j = j + 1;
+    }
+  }
+  dst[pos] = 0;
+  eng_lua_pop(reg->L, 1);
+  output_log_error(dst);
+}
+
+export function lua_registry_last_error(reg: LuaScriptRegistry*) -> cstring {
+  if (reg == 0) {
+    return (cstring)0;
+  }
+  return (cstring)((int64)(&(reg->last_error[0])));
+}
+
+function lua_load_chunk(reg: LuaScriptRegistry*, slot: LuaScriptSlot*) -> int32 {
+  if (reg == 0 || slot == 0 || reg->L == 0) {
+    return 0;
+  }
+  if (slot->chunk_ref != LUA_NOREF()) {
+    luaL_unref(reg->L, LUA_REGISTRYINDEX(), slot->chunk_ref);
+    slot->chunk_ref = LUA_NOREF();
+  }
+  if (slot->on_tick_ref != LUA_NOREF()) {
+    luaL_unref(reg->L, LUA_REGISTRYINDEX(), slot->on_tick_ref);
+    slot->on_tick_ref = LUA_NOREF();
+  }
+  slot->has_on_tick = 0;
+  lua_pushnil(reg->L);
+  lua_setglobal(reg->L, cstr("on_tick"));
+
+  var rc: int32 = luaL_loadfilex(reg->L, (cstring)((int64)(&(slot->path[0]))), (cstring)0);
+  if (rc != LUA_OK()) {
+    lua_record_error(reg, cstr("load: "));
+    return 0;
+  }
+  lua_pushvalue(reg->L, -1);
+  slot->chunk_ref = luaL_ref(reg->L, LUA_REGISTRYINDEX());
+  rc = eng_lua_pcall(reg->L, 0, 0, 0);
+  if (rc != LUA_OK()) {
+    lua_record_error(reg, cstr("init: "));
+    return 0;
+  }
+  var tt: int32 = lua_getglobal(reg->L, cstr("on_tick"));
+  if (tt == LUA_TFUNCTION()) {
+    slot->on_tick_ref = luaL_ref(reg->L, LUA_REGISTRYINDEX());
+    slot->has_on_tick = 1;
+  } else {
+    eng_lua_pop(reg->L, 1);
+  }
+  lua_pushnil(reg->L);
+  lua_setglobal(reg->L, cstr("on_tick"));
+  return 1;
+}
+
+export function lua_registry_attach(reg: LuaScriptRegistry*, entity_id: int32, path: cstring) -> int32 {
+  if (reg == 0 || entity_id == 0 || path == 0) {
+    return 0;
+  }
+  var slot: LuaScriptSlot* = lua_find_or_alloc_slot(reg, entity_id, path);
+  if (slot == 0) {
+    var nf: string = "no free script slot";
+    lua_copy_path((cstring)((int64)(&(reg->last_error[0]))), nf.chars);
+    return 0;
+  }
+  return lua_load_chunk(reg, slot);
+}
+
+export function lua_registry_detach_entity(reg: LuaScriptRegistry*, entity_id: int32) {
+  if (reg == 0) {
+    return;
+  }
+  var i: int32 = 0;
+  while (i < reg->cap) {
+    var s: LuaScriptSlot* = lua_slot_ptr(reg, i);
+    if (s != 0 && s->in_use != 0 && s->entity_id == entity_id) {
+      if (s->chunk_ref != LUA_NOREF()) {
+        luaL_unref(reg->L, LUA_REGISTRYINDEX(), s->chunk_ref);
+        s->chunk_ref = LUA_NOREF();
+      }
+      if (s->on_tick_ref != LUA_NOREF()) {
+        luaL_unref(reg->L, LUA_REGISTRYINDEX(), s->on_tick_ref);
+        s->on_tick_ref = LUA_NOREF();
+      }
+      s->in_use = 0;
+      s->path[0] = 0;
+    }
+    i = i + 1;
+  }
+}
+
+function lua_run_slot(reg: LuaScriptRegistry*, slot: LuaScriptSlot*, dt: float64) -> int32 {
+  if (reg == 0 || slot == 0 || reg->L == 0) {
+    return 0;
+  }
+  var fn_ref: int32 = slot->on_tick_ref;
+  if (slot->has_on_tick == 0) {
+    fn_ref = slot->chunk_ref;
+  }
+  if (fn_ref == LUA_NOREF()) {
+    return 0;
+  }
+  lua_rawgeti(reg->L, LUA_REGISTRYINDEX(), (int64)fn_ref);
+  lua_pushnumber(reg->L, dt);
+  var rc: int32 = eng_lua_pcall(reg->L, 1, 0, 0);
+  if (rc != LUA_OK()) {
+    lua_record_error(reg, cstr("tick: "));
+    return 0;
+  }
+  return 1;
+}
+
+export function lua_registry_tick_scene(reg: LuaScriptRegistry*, scene: Scene*, input: InputMap*, fixed_dt: float64, runtime_time: float64) -> int32 {
+  if (reg == 0 || scene == 0) {
+    return 0;
+  }
+  var changed: int32 = 0;
+  var n: int32 = scene_count(scene);
+  var i: int32 = 0;
+  while (i < n) {
+    var e: Entity* = scene_row(scene, i);
+    if (e != 0 && e->script_enabled != 0) {
+      var sp: cstring = (cstring)((int64)(&(e->lua_script[0])));
+      if ((uint8)(sp[0]) != (uint8)0) {
+        var slot: LuaScriptSlot* = lua_find_or_alloc_slot(reg, e->id, sp);
+        if (slot != 0 && slot->chunk_ref == LUA_NOREF()) {
+          lua_load_chunk(reg, slot);
+        }
+        if (slot != 0 && slot->chunk_ref != LUA_NOREF()) {
+          lua_ctx_set(scene, input, e->id, fixed_dt, runtime_time);
+          if (lua_run_slot(reg, slot, fixed_dt) != 0) {
+            changed = 1;
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  lua_ctx_clear();
+  return changed;
+}
+
+// Service-script tick path. Unlike lua_registry_tick_scene this walks the
+// ServiceModel, not the Scene: ServerScriptService / StarterPlayerScripts
+// scripts are not attached to a Workspace entity. For each record whose role
+// matches `role` we find the slot keyed by (rec->id, rec->path) — exactly the
+// key lua_vm_load_service_scripts used in lua_registry_attach — and run its
+// on_tick.
+//
+// `self_id` is the record's owner_entity_id (0 = "no self", correct for a
+// ServerScript that manages many entities; for a LocalScript bound to the
+// player this becomes the player entity id once gap 1.5 lands). Module-role
+// records are never ticked here — they are require()-able only.
+export function lua_registry_tick_service_scripts(reg: LuaScriptRegistry*, services: ServiceModel*, role: int32, scene: Scene*, input: InputMap*, fixed_dt: float64, runtime_time: float64) -> int32 {
+  if (reg == 0 || services == 0) {
+    return 0;
+  }
+  var changed: int32 = 0;
+  var i: int32 = 0;
+  while (i < services->script_count) {
+    var rec: ServiceScriptRecord* = service_script_record_ptr(services, i);
+    if (rec != 0 && rec->role == role && rec->enabled != 0) {
+      var sp: cstring = (cstring)((int64)(&(rec->path[0])));
+      var slot: LuaScriptSlot* = lua_find_existing_slot(reg, rec->id, sp);
+      if (slot == 0) {
+        // Not attached yet (e.g. records added after load) — attach lazily.
+        if (lua_registry_attach(reg, rec->id, sp) != 0) {
+          slot = lua_find_existing_slot(reg, rec->id, sp);
+        }
+      }
+      if (slot != 0 && slot->chunk_ref != LUA_NOREF()) {
+        lua_ctx_set(scene, input, rec->owner_entity_id, fixed_dt, runtime_time);
+        if (lua_run_slot(reg, slot, fixed_dt) != 0) {
+          changed = 1;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  lua_ctx_clear();
+  return changed;
+}
+
+// Convenience: bind path to entity AND attach. Called by the editor when the
+// inspector "Assign script" button is pressed, or when a .lua row is double-
+// clicked. Writes the path into the Entity, sets script_enabled, and tries to
+// compile + run the chunk. On failure the path is still bound but the slot's
+// chunk_ref stays LUA_NOREF and the next tick will skip it.
+export function lua_bind_entity_script(reg: LuaScriptRegistry*, e: Entity*, path: cstring) -> int32 {
+  if (e == 0) {
+    return 0;
+  }
+  scene_entity_set_lua_script(e, path);
+  if (reg == 0 || path == 0 || (uint8)(path[0]) == (uint8)0) {
+    return 0;
+  }
+  return lua_registry_attach(reg, e->id, path);
+}
+
+export function lua_clear_entity_script(reg: LuaScriptRegistry*, e: Entity*) {
+  if (e == 0) {
+    return;
+  }
+  scene_entity_clear_lua_script(e);
+  if (reg != 0) {
+    lua_registry_detach_entity(reg, e->id);
+  }
+}
+
+export function lua_registry_reload_entity(reg: LuaScriptRegistry*, entity_id: int32) -> int32 {
+  if (reg == 0 || entity_id == 0) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < reg->cap) {
+    var s: LuaScriptSlot* = lua_slot_ptr(reg, i);
+    if (s != 0 && s->in_use != 0 && s->entity_id == entity_id) {
+      return lua_load_chunk(reg, s);
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+// ---- Role-aware Lua VM (server/client) -------------------------------------
+// New structs for playtest. Old LuaScriptRegistry remains for compatibility.
+
+export struct LuaScriptVm {
+  reg: LuaScriptRegistry*;
+  scene: Scene*;
+  services: ServiceModel*;
+  input: InputMap*;
+  side: int32;           // 1=server, 2=client
+  last_error: uint8[256];
+}
+
+export function lua_vm_create_server(scene: Scene*, services: ServiceModel*) -> LuaScriptVm* {
+  var raw: cstring = calloc((int64)1, (int64)288);
+  if (raw == 0) {
+    return (LuaScriptVm*)0;
+  }
+  var vm: LuaScriptVm* = (LuaScriptVm*)raw;
+  vm->reg = lua_registry_create(256);
+  if (vm->reg == 0) {
+    free(raw);
+    return (LuaScriptVm*)0;
+  }
+  vm->side = 1;
+  vm->scene = scene;
+  vm->services = services;
+  return vm;
+}
+
+export function lua_vm_create_client(scene: Scene*, services: ServiceModel*) -> LuaScriptVm* {
+  var raw: cstring = calloc((int64)1, (int64)288);
+  if (raw == 0) {
+    return (LuaScriptVm*)0;
+  }
+  var vm: LuaScriptVm* = (LuaScriptVm*)raw;
+  vm->reg = lua_registry_create(256);
+  if (vm->reg == 0) {
+    free(raw);
+    return (LuaScriptVm*)0;
+  }
+  vm->side = 2;
+  vm->scene = scene;
+  vm->services = services;
+  return vm;
+}
+
+export function lua_vm_destroy(vm: LuaScriptVm*) {
+  if (vm == 0) {
+    return;
+  }
+  if (vm->reg != 0) {
+    lua_registry_destroy(vm->reg);
+  }
+  free((cstring)vm);
+}
+
+export function lua_vm_load_service_scripts(vm: LuaScriptVm*, service_id: int32, role: int32) {
+  if (vm == 0 || vm->services == 0) {
+    return;
+  }
+  var i: int32 = 0;
+  while (i < vm->services->script_count) {
+    var rec: ServiceScriptRecord* = service_script_record_ptr(vm->services, i);
+    if (rec != 0 && rec->service_id == service_id && rec->role == role && rec->enabled != 0) {
+      lua_registry_attach(vm->reg, rec->id, (cstring)((int64)(&(rec->path[0]))));
+    }
+    i = i + 1;
+  }
+}
+
+export function lua_vm_tick(vm: LuaScriptVm*, fixed_dt: float64, runtime_time: float64) {
+  if (vm == 0 || vm->scene == 0) {
+    return;
+  }
+  lua_registry_tick_scene(vm->reg, vm->scene, vm->input, fixed_dt, runtime_time);
+  // Service scripts: the server runs SERVER-role scripts, the client runs
+  // LOCAL-role scripts. MODULE-role scripts never tick (require-only).
+  if (vm->services != 0) {
+    if (vm->side == 1) {
+      lua_registry_tick_service_scripts(vm->reg, vm->services, SCRIPT_ROLE_SERVER(), vm->scene, vm->input, fixed_dt, runtime_time);
+    } else {
+      if (vm->side == 2) {
+        lua_registry_tick_service_scripts(vm->reg, vm->services, SCRIPT_ROLE_LOCAL(), vm->scene, vm->input, fixed_dt, runtime_time);
+      }
+    }
+  }
+}
+
+function lua_vm_load_script(vm: LuaScriptVm*, path: cstring, script_id: int32) {
+  if (vm == 0 || path == 0) {
+    return;
+  }
+  lua_registry_attach(vm->reg, script_id, path);
+}

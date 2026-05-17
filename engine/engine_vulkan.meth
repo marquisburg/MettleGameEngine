@@ -1,0 +1,2026 @@
+// Vulkan backend for the editor viewport. Windows + internal linker.
+// Build the host with:  --link-arg -lvulkan-1
+//
+// HARD RULE: declare every struct field in Vulkan spec order with the correct
+// type. Methlang lays fields out in declaration order and AUTO-ALIGNS them to
+// the target C ABI (verified empirically: a uint32 followed by an int64 places
+// the int64 at offset 8, exactly like C). So do NOT add manual padding fields
+// here -- doing so double-pads and shifts every pointer, which the driver
+// reports as VK_ERROR_INITIALIZATION_FAILED (a wrong offset never errors at
+// the language level, it just corrupts the call).
+//
+// No SPIR-V toolchain exists on the build machine, so the vertex/fragment
+// shaders are hand-assembled SPIR-V word arrays (see engine_vk_shaders).
+import "engine_vk_shaders";
+import "game_gdi_win32";
+import "std/io";
+import "std/mem";
+
+// Forward declaration: the flattened module can emit exported functions before
+// later-defined helpers, so calls to vk_say from the exported create functions
+// resolve only with this prototype (same pattern as game_gdi_win32).
+function vk_say(msg: string);
+
+// ---- Structure type enum values (subset we use) -----------------------------
+function VK_ST_APPLICATION_INFO() -> uint32 { return (uint32)0; }
+function VK_ST_INSTANCE_CREATE_INFO() -> uint32 { return (uint32)1; }
+function VK_ST_DEVICE_QUEUE_CREATE_INFO() -> uint32 { return (uint32)2; }
+function VK_ST_DEVICE_CREATE_INFO() -> uint32 { return (uint32)3; }
+function VK_ST_SUBMIT_INFO() -> uint32 { return (uint32)4; }
+function VK_ST_FENCE_CREATE_INFO() -> uint32 { return (uint32)8; }
+function VK_ST_SEMAPHORE_CREATE_INFO() -> uint32 { return (uint32)9; }
+function VK_ST_IMAGE_VIEW_CREATE_INFO() -> uint32 { return (uint32)15; }
+function VK_ST_SHADER_MODULE_CREATE_INFO() -> uint32 { return (uint32)16; }
+function VK_ST_PIPELINE_SHADER_STAGE_CREATE_INFO() -> uint32 { return (uint32)18; }
+function VK_ST_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO() -> uint32 { return (uint32)19; }
+function VK_ST_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO() -> uint32 { return (uint32)20; }
+function VK_ST_PIPELINE_VIEWPORT_STATE_CREATE_INFO() -> uint32 { return (uint32)22; }
+function VK_ST_PIPELINE_RASTERIZATION_STATE_CREATE_INFO() -> uint32 { return (uint32)23; }
+function VK_ST_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO() -> uint32 { return (uint32)24; }
+function VK_ST_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO() -> uint32 { return (uint32)26; }
+function VK_ST_GRAPHICS_PIPELINE_CREATE_INFO() -> uint32 { return (uint32)28; }
+function VK_ST_PIPELINE_LAYOUT_CREATE_INFO() -> uint32 { return (uint32)30; }
+function VK_ST_FRAMEBUFFER_CREATE_INFO() -> uint32 { return (uint32)37; }
+function VK_ST_RENDER_PASS_CREATE_INFO() -> uint32 { return (uint32)38; }
+function VK_ST_COMMAND_POOL_CREATE_INFO() -> uint32 { return (uint32)39; }
+function VK_ST_COMMAND_BUFFER_ALLOCATE_INFO() -> uint32 { return (uint32)40; }
+function VK_ST_COMMAND_BUFFER_BEGIN_INFO() -> uint32 { return (uint32)42; }
+function VK_ST_RENDER_PASS_BEGIN_INFO() -> uint32 { return (uint32)43; }
+function VK_ST_WIN32_SURFACE_CREATE_INFO_KHR() -> uint32 { return (uint32)1000009000; }
+function VK_ST_SWAPCHAIN_CREATE_INFO_KHR() -> uint32 { return (uint32)1000001000; }
+function VK_ST_PRESENT_INFO_KHR() -> uint32 { return (uint32)1000001001; }
+
+function VK_API_VERSION_1_0() -> uint32 { return (uint32)4194304; }
+function VK_FORMAT_B8G8R8A8_UNORM() -> uint32 { return (uint32)44; }
+function VK_SUCCESS() -> int32 { return 0; }
+
+// ---- Core structs (C ABI) ---------------------------------------------------
+export struct VkApplicationInfo {
+  s_type: uint32;
+  p_next: int64;
+  p_application_name: int64;
+  application_version: uint32;
+  p_engine_name: int64;
+  engine_version: uint32;
+  api_version: uint32;
+}
+
+export struct VkInstanceCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  p_application_info: int64;
+  enabled_layer_count: uint32;
+  pp_enabled_layer_names: int64;
+  enabled_extension_count: uint32;
+  pp_enabled_extension_names: int64;
+}
+
+// deviceName starts at offset 20 (5 * uint32, char array is 1-byte aligned).
+export struct VkPhysicalDeviceProperties {
+  api_version: uint32;
+  driver_version: uint32;
+  vendor_id: uint32;
+  device_id: uint32;
+  device_type: uint32;
+  device_name: uint8[256];
+  pipeline_cache_uuid: uint8[16];
+  limits_blob: uint8[504];
+  sparse_blob: uint8[32];
+}
+
+// VkQueueFamilyProperties: queueFlags(4) queueCount(4) timestampValidBits(4)
+// minImageTransferGranularity{w,h,d}(12) = 24 bytes, no internal padding.
+export struct VkQueueFamilyProperties {
+  queue_flags: uint32;
+  queue_count: uint32;
+  timestamp_valid_bits: uint32;
+  min_transfer_w: uint32;
+  min_transfer_h: uint32;
+  min_transfer_d: uint32;
+}
+
+export struct VkDeviceQueueCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  queue_family_index: uint32;
+  queue_count: uint32;
+  p_queue_priorities: int64;
+}
+
+export struct VkDeviceCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  queue_create_info_count: uint32;
+  p_queue_create_infos: int64;
+  enabled_layer_count: uint32;
+  pp_enabled_layer_names: int64;
+  enabled_extension_count: uint32;
+  pp_enabled_extension_names: int64;
+  p_enabled_features: int64;
+}
+
+// VkWin32SurfaceCreateInfoKHR: sType, pNext, flags, hinstance, hwnd.
+export struct VkWin32SurfaceCreateInfoKHR {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  hinstance: int64;
+  hwnd: int64;
+}
+
+// VkSurfaceCapabilitiesKHR (C ABI). minImageCount.. are uint32; the VkExtent2D
+// fields are two uint32 each.
+export struct VkSurfaceCapabilitiesKHR {
+  min_image_count: uint32;
+  max_image_count: uint32;
+  cur_extent_w: uint32;
+  cur_extent_h: uint32;
+  min_extent_w: uint32;
+  min_extent_h: uint32;
+  max_extent_w: uint32;
+  max_extent_h: uint32;
+  max_image_array_layers: uint32;
+  supported_transforms: uint32;
+  current_transform: uint32;
+  supported_composite_alpha: uint32;
+  supported_usage_flags: uint32;
+}
+
+// VkSurfaceFormatKHR: format(uint32) colorSpace(uint32).
+export struct VkSurfaceFormatKHR {
+  format: uint32;
+  color_space: uint32;
+}
+
+export struct VkSwapchainCreateInfoKHR {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  surface: int64;
+  min_image_count: uint32;
+  image_format: uint32;
+  image_color_space: uint32;
+  image_extent_w: uint32;
+  image_extent_h: uint32;
+  image_array_layers: uint32;
+  image_usage: uint32;
+  image_sharing_mode: uint32;
+  queue_family_index_count: uint32;
+  p_queue_family_indices: int64;
+  pre_transform: uint32;
+  composite_alpha: uint32;
+  present_mode: uint32;
+  clipped: uint32;
+  old_swapchain: int64;
+}
+
+// VkImageViewCreateInfo. components{r,g,b,a} are 4 uint32; subresourceRange is
+// aspectMask, baseMipLevel, levelCount, baseArrayLayer, layerCount (5 uint32).
+export struct VkImageViewCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  image: int64;
+  view_type: uint32;
+  format: uint32;
+  comp_r: uint32;
+  comp_g: uint32;
+  comp_b: uint32;
+  comp_a: uint32;
+  aspect_mask: uint32;
+  base_mip: uint32;
+  level_count: uint32;
+  base_array: uint32;
+  layer_count: uint32;
+}
+
+// VkAttachmentDescription (plain struct, no sType): flags, format, samples,
+// loadOp, storeOp, stencilLoadOp, stencilStoreOp, initialLayout, finalLayout.
+export struct VkAttachmentDescription {
+  flags: uint32;
+  format: uint32;
+  samples: uint32;
+  load_op: uint32;
+  store_op: uint32;
+  stencil_load_op: uint32;
+  stencil_store_op: uint32;
+  initial_layout: uint32;
+  final_layout: uint32;
+}
+
+export struct VkAttachmentReference {
+  attachment: uint32;
+  layout: uint32;
+}
+
+// VkSubpassDescription: flags, pipelineBindPoint, inputAttachmentCount,
+// pInputAttachments, colorAttachmentCount, pColorAttachments, pResolve,
+// pDepthStencil, preserveCount, pPreserve.
+export struct VkSubpassDescription {
+  flags: uint32;
+  pipeline_bind_point: uint32;
+  input_attachment_count: uint32;
+  p_input_attachments: int64;
+  color_attachment_count: uint32;
+  p_color_attachments: int64;
+  p_resolve_attachments: int64;
+  p_depth_stencil_attachment: int64;
+  preserve_attachment_count: uint32;
+  p_preserve_attachments: int64;
+}
+
+// VkSubpassDependency: srcSubpass, dstSubpass, srcStageMask, dstStageMask,
+// srcAccessMask, dstAccessMask, dependencyFlags (7 uint32).
+export struct VkSubpassDependency {
+  src_subpass: uint32;
+  dst_subpass: uint32;
+  src_stage_mask: uint32;
+  dst_stage_mask: uint32;
+  src_access_mask: uint32;
+  dst_access_mask: uint32;
+  dependency_flags: uint32;
+}
+
+export struct VkRenderPassCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  attachment_count: uint32;
+  p_attachments: int64;
+  subpass_count: uint32;
+  p_subpasses: int64;
+  dependency_count: uint32;
+  p_dependencies: int64;
+}
+
+export struct VkFramebufferCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  render_pass: int64;
+  attachment_count: uint32;
+  p_attachments: int64;
+  width: uint32;
+  height: uint32;
+  layers: uint32;
+}
+
+export struct VkCommandPoolCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  queue_family_index: uint32;
+}
+
+export struct VkCommandBufferAllocateInfo {
+  s_type: uint32;
+  p_next: int64;
+  command_pool: int64;
+  level: uint32;
+  command_buffer_count: uint32;
+}
+
+export struct VkSemaphoreCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+}
+
+export struct VkFenceCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+}
+
+export struct VkShaderModuleCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  code_size: int64;
+  p_code: int64;
+}
+
+// stage, module, pName, pSpecializationInfo. stage(uint32) then 4 pad then the
+// 8-byte module handle (auto-aligned).
+export struct VkPipelineShaderStageCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  stage: uint32;
+  module_handle: int64;
+  p_name: int64;
+  p_specialization_info: int64;
+}
+
+export struct VkPipelineVertexInputStateCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  vertex_binding_description_count: uint32;
+  p_vertex_binding_descriptions: int64;
+  vertex_attribute_description_count: uint32;
+  p_vertex_attribute_descriptions: int64;
+}
+
+export struct VkPipelineInputAssemblyStateCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  topology: uint32;
+  primitive_restart_enable: uint32;
+}
+
+// VkViewport is all float32: x,y,width,height,minDepth,maxDepth.
+export struct VkViewport {
+  x: float32;
+  y: float32;
+  width: float32;
+  height: float32;
+  min_depth: float32;
+  max_depth: float32;
+}
+
+// VkRect2D = offset{int32 x,y} + extent{uint32 w,h}.
+export struct VkRect2D {
+  offset_x: int32;
+  offset_y: int32;
+  extent_w: uint32;
+  extent_h: uint32;
+}
+
+export struct VkPipelineViewportStateCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  viewport_count: uint32;
+  p_viewports: int64;
+  scissor_count: uint32;
+  p_scissors: int64;
+}
+
+// depthClampEnable, rasterizerDiscardEnable, polygonMode, cullMode, frontFace,
+// depthBiasEnable, depthBiasConstantFactor, depthBiasClamp, depthBiasSlope,
+// lineWidth. The trailing 4 are float32.
+export struct VkPipelineRasterizationStateCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  depth_clamp_enable: uint32;
+  rasterizer_discard_enable: uint32;
+  polygon_mode: uint32;
+  cull_mode: uint32;
+  front_face: uint32;
+  depth_bias_enable: uint32;
+  depth_bias_constant_factor: float32;
+  depth_bias_clamp: float32;
+  depth_bias_slope_factor: float32;
+  line_width: float32;
+}
+
+export struct VkPipelineMultisampleStateCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  rasterization_samples: uint32;
+  sample_shading_enable: uint32;
+  min_sample_shading: float32;
+  p_sample_mask: int64;
+  alpha_to_coverage_enable: uint32;
+  alpha_to_one_enable: uint32;
+}
+
+// blendEnable, srcColor, dstColor, colorOp, srcAlpha, dstAlpha, alphaOp,
+// colorWriteMask (8 uint32, no padding).
+export struct VkPipelineColorBlendAttachmentState {
+  blend_enable: uint32;
+  src_color_blend_factor: uint32;
+  dst_color_blend_factor: uint32;
+  color_blend_op: uint32;
+  src_alpha_blend_factor: uint32;
+  dst_alpha_blend_factor: uint32;
+  alpha_blend_op: uint32;
+  color_write_mask: uint32;
+}
+
+export struct VkPipelineColorBlendStateCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  logic_op_enable: uint32;
+  logic_op: uint32;
+  attachment_count: uint32;
+  p_attachments: int64;
+  blend_constant0: float32;
+  blend_constant1: float32;
+  blend_constant2: float32;
+  blend_constant3: float32;
+}
+
+export struct VkPipelineDynamicStateCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  dynamic_state_count: uint32;
+  p_dynamic_states: int64;
+}
+
+export struct VkPipelineLayoutCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  set_layout_count: uint32;
+  p_set_layouts: int64;
+  push_constant_range_count: uint32;
+  p_push_constant_ranges: int64;
+}
+
+export struct VkGraphicsPipelineCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  stage_count: uint32;
+  p_stages: int64;
+  p_vertex_input_state: int64;
+  p_input_assembly_state: int64;
+  p_tessellation_state: int64;
+  p_viewport_state: int64;
+  p_rasterization_state: int64;
+  p_multisample_state: int64;
+  p_depth_stencil_state: int64;
+  p_color_blend_state: int64;
+  p_dynamic_state: int64;
+  layout: int64;
+  render_pass: int64;
+  subpass: uint32;
+  base_pipeline_handle: int64;
+  base_pipeline_index: int32;
+}
+
+export struct VkCommandBufferBeginInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  p_inheritance_info: int64;
+}
+
+// VkClearValue is a union; for a color clear it is 4 float32 (RGBA).
+export struct VkClearValue {
+  r: float32;
+  g: float32;
+  b: float32;
+  a: float32;
+}
+
+export struct VkRenderPassBeginInfo {
+  s_type: uint32;
+  p_next: int64;
+  render_pass: int64;
+  framebuffer: int64;
+  render_area_offset_x: int32;
+  render_area_offset_y: int32;
+  render_area_extent_w: uint32;
+  render_area_extent_h: uint32;
+  clear_value_count: uint32;
+  p_clear_values: int64;
+}
+
+// waitSemaphoreCount, pWaitSemaphores, pWaitDstStageMask, commandBufferCount,
+// pCommandBuffers, signalSemaphoreCount, pSignalSemaphores.
+export struct VkSubmitInfo {
+  s_type: uint32;
+  p_next: int64;
+  wait_semaphore_count: uint32;
+  p_wait_semaphores: int64;
+  p_wait_dst_stage_mask: int64;
+  command_buffer_count: uint32;
+  p_command_buffers: int64;
+  signal_semaphore_count: uint32;
+  p_signal_semaphores: int64;
+}
+
+export struct VkPresentInfoKHR {
+  s_type: uint32;
+  p_next: int64;
+  wait_semaphore_count: uint32;
+  p_wait_semaphores: int64;
+  swapchain_count: uint32;
+  p_swapchains: int64;
+  p_image_indices: int64;
+  p_results: int64;
+}
+
+// binding, stride, inputRate (3 uint32, no padding).
+export struct VkVertexInputBindingDescription {
+  binding: uint32;
+  stride: uint32;
+  input_rate: uint32;
+}
+
+// location, binding, format, offset (4 uint32).
+export struct VkVertexInputAttributeDescription {
+  location: uint32;
+  binding: uint32;
+  format: uint32;
+  offset: uint32;
+}
+
+// stageFlags, offset, size (3 uint32).
+export struct VkPushConstantRange {
+  stage_flags: uint32;
+  offset: uint32;
+  size: uint32;
+}
+
+export struct VkBufferCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  size: int64;
+  usage: uint32;
+  sharing_mode: uint32;
+  queue_family_index_count: uint32;
+  p_queue_family_indices: int64;
+}
+
+// VkMemoryRequirements: size(8) alignment(8) memoryTypeBits(4).
+export struct VkMemoryRequirements {
+  size: int64;
+  alignment: int64;
+  memory_type_bits: uint32;
+}
+
+export struct VkMemoryAllocateInfo {
+  s_type: uint32;
+  p_next: int64;
+  allocation_size: int64;
+  memory_type_index: uint32;
+}
+
+// VkMemoryType: propertyFlags(4) heapIndex(4). VkMemoryHeap: size(8) flags(4).
+// VkPhysicalDeviceMemoryProperties: memoryTypeCount(4), memoryTypes[32]
+// (8 bytes each = 256), memoryHeapCount(4), memoryHeaps[16] (16 bytes each =
+// 256). We over-size and read by manual offset to avoid struct-array nuance.
+export struct VkPhysicalDeviceMemoryProperties {
+  memory_type_count: uint32;
+  mem_types_blob: uint8[256];
+  memory_heap_count: uint32;
+  mem_heaps_blob: uint8[256];
+}
+
+export struct VkImageCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  image_type: uint32;
+  format: uint32;
+  extent_w: uint32;
+  extent_h: uint32;
+  extent_d: uint32;
+  mip_levels: uint32;
+  array_layers: uint32;
+  samples: uint32;
+  tiling: uint32;
+  usage: uint32;
+  sharing_mode: uint32;
+  queue_family_index_count: uint32;
+  p_queue_family_indices: int64;
+  initial_layout: uint32;
+}
+
+export struct VkPipelineDepthStencilStateCreateInfo {
+  s_type: uint32;
+  p_next: int64;
+  flags: uint32;
+  depth_test_enable: uint32;
+  depth_write_enable: uint32;
+  depth_compare_op: uint32;
+  depth_bounds_test_enable: uint32;
+  stencil_test_enable: uint32;
+  front_fail_op: uint32;
+  front_pass_op: uint32;
+  front_depth_fail_op: uint32;
+  front_compare_op: uint32;
+  front_compare_mask: uint32;
+  front_write_mask: uint32;
+  front_reference: uint32;
+  back_fail_op: uint32;
+  back_pass_op: uint32;
+  back_depth_fail_op: uint32;
+  back_compare_op: uint32;
+  back_compare_mask: uint32;
+  back_write_mask: uint32;
+  back_reference: uint32;
+  min_depth_bounds: float32;
+  max_depth_bounds: float32;
+}
+
+// ---- Extern entry points ----------------------------------------------------
+export extern function vkCreateInstance(create_info: VkInstanceCreateInfo*, allocator: int64, out_instance: int64*) -> int32 = "vkCreateInstance";
+export extern function vkDestroyInstance(instance: int64, allocator: int64) = "vkDestroyInstance";
+export extern function vkEnumeratePhysicalDevices(instance: int64, count: uint32*, devices: int64*) -> int32 = "vkEnumeratePhysicalDevices";
+export extern function vkGetPhysicalDeviceProperties(phys: int64, props: VkPhysicalDeviceProperties*) = "vkGetPhysicalDeviceProperties";
+export extern function vkGetPhysicalDeviceQueueFamilyProperties(phys: int64, count: uint32*, props: VkQueueFamilyProperties*) = "vkGetPhysicalDeviceQueueFamilyProperties";
+export extern function vkCreateDevice(phys: int64, create_info: VkDeviceCreateInfo*, allocator: int64, out_device: int64*) -> int32 = "vkCreateDevice";
+export extern function vkDestroyDevice(device: int64, allocator: int64) = "vkDestroyDevice";
+export extern function vkGetDeviceQueue(device: int64, family: uint32, index: uint32, out_queue: int64*) = "vkGetDeviceQueue";
+export extern function vkDeviceWaitIdle(device: int64) -> int32 = "vkDeviceWaitIdle";
+
+export extern function vkCreateWin32SurfaceKHR(instance: int64, info: VkWin32SurfaceCreateInfoKHR*, allocator: int64, out_surface: int64*) -> int32 = "vkCreateWin32SurfaceKHR";
+export extern function vkDestroySurfaceKHR(instance: int64, surface: int64, allocator: int64) = "vkDestroySurfaceKHR";
+export extern function vkGetPhysicalDeviceSurfaceSupportKHR(phys: int64, family: uint32, surface: int64, out_supported: uint32*) -> int32 = "vkGetPhysicalDeviceSurfaceSupportKHR";
+export extern function vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys: int64, surface: int64, out_caps: VkSurfaceCapabilitiesKHR*) -> int32 = "vkGetPhysicalDeviceSurfaceCapabilitiesKHR";
+export extern function vkGetPhysicalDeviceSurfaceFormatsKHR(phys: int64, surface: int64, count: uint32*, formats: VkSurfaceFormatKHR*) -> int32 = "vkGetPhysicalDeviceSurfaceFormatsKHR";
+export extern function vkGetPhysicalDeviceSurfacePresentModesKHR(phys: int64, surface: int64, count: uint32*, modes: uint32*) -> int32 = "vkGetPhysicalDeviceSurfacePresentModesKHR";
+export extern function vkCreateSwapchainKHR(device: int64, info: VkSwapchainCreateInfoKHR*, allocator: int64, out_swapchain: int64*) -> int32 = "vkCreateSwapchainKHR";
+export extern function vkDestroySwapchainKHR(device: int64, swapchain: int64, allocator: int64) = "vkDestroySwapchainKHR";
+export extern function vkGetSwapchainImagesKHR(device: int64, swapchain: int64, count: uint32*, images: int64*) -> int32 = "vkGetSwapchainImagesKHR";
+export extern function vkCreateImageView(device: int64, info: VkImageViewCreateInfo*, allocator: int64, out_view: int64*) -> int32 = "vkCreateImageView";
+export extern function vkDestroyImageView(device: int64, view: int64, allocator: int64) = "vkDestroyImageView";
+
+export extern function vkCreateRenderPass(device: int64, info: VkRenderPassCreateInfo*, allocator: int64, out_rp: int64*) -> int32 = "vkCreateRenderPass";
+export extern function vkDestroyRenderPass(device: int64, rp: int64, allocator: int64) = "vkDestroyRenderPass";
+export extern function vkCreateFramebuffer(device: int64, info: VkFramebufferCreateInfo*, allocator: int64, out_fb: int64*) -> int32 = "vkCreateFramebuffer";
+export extern function vkDestroyFramebuffer(device: int64, fb: int64, allocator: int64) = "vkDestroyFramebuffer";
+export extern function vkCreateCommandPool(device: int64, info: VkCommandPoolCreateInfo*, allocator: int64, out_pool: int64*) -> int32 = "vkCreateCommandPool";
+export extern function vkDestroyCommandPool(device: int64, pool: int64, allocator: int64) = "vkDestroyCommandPool";
+export extern function vkAllocateCommandBuffers(device: int64, info: VkCommandBufferAllocateInfo*, out_buffers: int64*) -> int32 = "vkAllocateCommandBuffers";
+export extern function vkCreateSemaphore(device: int64, info: VkSemaphoreCreateInfo*, allocator: int64, out_sem: int64*) -> int32 = "vkCreateSemaphore";
+export extern function vkDestroySemaphore(device: int64, sem: int64, allocator: int64) = "vkDestroySemaphore";
+export extern function vkCreateFence(device: int64, info: VkFenceCreateInfo*, allocator: int64, out_fence: int64*) -> int32 = "vkCreateFence";
+export extern function vkDestroyFence(device: int64, fence: int64, allocator: int64) = "vkDestroyFence";
+
+export extern function vkCreateShaderModule(device: int64, info: VkShaderModuleCreateInfo*, allocator: int64, out_mod: int64*) -> int32 = "vkCreateShaderModule";
+export extern function vkDestroyShaderModule(device: int64, mod: int64, allocator: int64) = "vkDestroyShaderModule";
+export extern function vkCreatePipelineLayout(device: int64, info: VkPipelineLayoutCreateInfo*, allocator: int64, out_layout: int64*) -> int32 = "vkCreatePipelineLayout";
+export extern function vkDestroyPipelineLayout(device: int64, layout: int64, allocator: int64) = "vkDestroyPipelineLayout";
+export extern function vkCreateGraphicsPipelines(device: int64, cache: int64, count: uint32, infos: VkGraphicsPipelineCreateInfo*, allocator: int64, out_pipelines: int64*) -> int32 = "vkCreateGraphicsPipelines";
+export extern function vkDestroyPipeline(device: int64, pipeline: int64, allocator: int64) = "vkDestroyPipeline";
+
+export extern function vkWaitForFences(device: int64, count: uint32, fences: int64*, wait_all: uint32, timeout: int64) -> int32 = "vkWaitForFences";
+export extern function vkResetFences(device: int64, count: uint32, fences: int64*) -> int32 = "vkResetFences";
+export extern function vkAcquireNextImageKHR(device: int64, swapchain: int64, timeout: int64, semaphore: int64, fence: int64, out_index: uint32*) -> int32 = "vkAcquireNextImageKHR";
+export extern function vkResetCommandBuffer(cmd: int64, flags: uint32) -> int32 = "vkResetCommandBuffer";
+export extern function vkBeginCommandBuffer(cmd: int64, info: VkCommandBufferBeginInfo*) -> int32 = "vkBeginCommandBuffer";
+export extern function vkEndCommandBuffer(cmd: int64) -> int32 = "vkEndCommandBuffer";
+export extern function vkCmdBeginRenderPass(cmd: int64, info: VkRenderPassBeginInfo*, contents: uint32) = "vkCmdBeginRenderPass";
+export extern function vkCmdEndRenderPass(cmd: int64) = "vkCmdEndRenderPass";
+export extern function vkCmdBindPipeline(cmd: int64, bind_point: uint32, pipeline: int64) = "vkCmdBindPipeline";
+export extern function vkCmdSetViewport(cmd: int64, first: uint32, count: uint32, viewports: VkViewport*) = "vkCmdSetViewport";
+export extern function vkCmdSetScissor(cmd: int64, first: uint32, count: uint32, scissors: VkRect2D*) = "vkCmdSetScissor";
+export extern function vkCmdDraw(cmd: int64, vertex_count: uint32, instance_count: uint32, first_vertex: uint32, first_instance: uint32) = "vkCmdDraw";
+export extern function vkQueueSubmit(queue: int64, count: uint32, submits: VkSubmitInfo*, fence: int64) -> int32 = "vkQueueSubmit";
+export extern function vkQueuePresentKHR(queue: int64, info: VkPresentInfoKHR*) -> int32 = "vkQueuePresentKHR";
+export extern function vkQueueWaitIdle(queue: int64) -> int32 = "vkQueueWaitIdle";
+
+export extern function vkCreateBuffer(device: int64, info: VkBufferCreateInfo*, allocator: int64, out_buf: int64*) -> int32 = "vkCreateBuffer";
+export extern function vkDestroyBuffer(device: int64, buf: int64, allocator: int64) = "vkDestroyBuffer";
+export extern function vkGetBufferMemoryRequirements(device: int64, buf: int64, out_req: VkMemoryRequirements*) = "vkGetBufferMemoryRequirements";
+export extern function vkGetImageMemoryRequirements(device: int64, img: int64, out_req: VkMemoryRequirements*) = "vkGetImageMemoryRequirements";
+export extern function vkGetPhysicalDeviceMemoryProperties(phys: int64, out_props: VkPhysicalDeviceMemoryProperties*) = "vkGetPhysicalDeviceMemoryProperties";
+export extern function vkAllocateMemory(device: int64, info: VkMemoryAllocateInfo*, allocator: int64, out_mem: int64*) -> int32 = "vkAllocateMemory";
+export extern function vkFreeMemory(device: int64, mem: int64, allocator: int64) = "vkFreeMemory";
+export extern function vkBindBufferMemory(device: int64, buf: int64, mem: int64, offset: int64) -> int32 = "vkBindBufferMemory";
+export extern function vkBindImageMemory(device: int64, img: int64, mem: int64, offset: int64) -> int32 = "vkBindImageMemory";
+export extern function vkMapMemory(device: int64, mem: int64, offset: int64, size: int64, flags: uint32, out_ptr: int64*) -> int32 = "vkMapMemory";
+export extern function vkUnmapMemory(device: int64, mem: int64) = "vkUnmapMemory";
+export extern function vkCreateImage(device: int64, info: VkImageCreateInfo*, allocator: int64, out_img: int64*) -> int32 = "vkCreateImage";
+export extern function vkDestroyImage(device: int64, img: int64, allocator: int64) = "vkDestroyImage";
+export extern function vkCmdBindVertexBuffers(cmd: int64, first: uint32, count: uint32, buffers: int64*, offsets: int64*) = "vkCmdBindVertexBuffers";
+export extern function vkCmdPushConstants(cmd: int64, layout: int64, stage_flags: uint32, offset: uint32, size: uint32, values: int64) = "vkCmdPushConstants";
+
+// ---- VkContext: handles produced by bring-up ---------------------------------
+// Max swapchain images we will ever track. NVIDIA mailbox typically gives 3-4;
+// 8 is a safe ceiling and keeps the arrays inline (no extra allocation).
+function VK_MAX_SC_IMAGES() -> int32 { return 8; }
+
+export struct VkContext {
+  instance: int64;
+  phys: int64;
+  device: int64;
+  graphics_queue: int64;
+  present_queue: int64;
+  surface: int64;
+  swapchain: int64;
+  render_pass: int64;
+  pipeline_layout: int64;
+  pipeline: int64;
+  solid_pipeline: int64;
+  command_pool: int64;
+  vert_module: int64;
+  frag_module: int64;
+  sem_image_available: int64;
+  sem_render_finished: int64;
+  in_flight_fence: int64;
+  vbuf_buffer: int64;
+  vbuf_memory: int64;
+  vbuf_mapped: int64;
+  vbuf_capacity_bytes: int64;
+  depth_image: int64;
+  depth_memory: int64;
+  depth_view: int64;
+  sc_images: int64[8];
+  sc_views: int64[8];
+  sc_framebuffers: int64[8];
+  cmd_buffers: int64[8];
+  graphics_family: uint32;
+  present_family: uint32;
+  sc_format: uint32;
+  sc_color_space: uint32;
+  sc_width: uint32;
+  sc_height: uint32;
+  sc_image_count: uint32;
+  depth_format: uint32;
+  vertex_count: uint32;
+  solid_vertex_count: uint32;
+  line_vertex_count: uint32;
+  ready: uint32;
+}
+
+function vkctx_bytes() -> int64 {
+  // ~23 int64 + 4*8 int64 arrays (256) + 10 uint32. Round up generously.
+  return (int64)1024;
+}
+
+function vk_say(msg: string) {
+  print(cstr(msg));
+  newline();
+  fflush(get_stdout());
+}
+
+function vk_create_depth(ctx: VkContext*, w: uint32, h: uint32) -> int32;
+function vk_destroy_depth(ctx: VkContext*);
+
+// QUEUE_GRAPHICS_BIT = 1.
+function vk_pick_graphics_family(phys: int64) -> int32 {
+  var n: uint32 = (uint32)0;
+  vkGetPhysicalDeviceQueueFamilyProperties(phys, &n, (VkQueueFamilyProperties*)0);
+  if (n == (uint32)0) {
+    return -1;
+  }
+  if (n > (uint32)16) {
+    n = (uint32)16;
+  }
+  var fams: VkQueueFamilyProperties[16];
+  vkGetPhysicalDeviceQueueFamilyProperties(phys, &n, (VkQueueFamilyProperties*)((int64)(&(fams[0]))));
+  var i: uint32 = (uint32)0;
+  while (i < n) {
+    var qf: uint32 = fams[i].queue_flags;
+    if ((qf & (uint32)1) != (uint32)0) {
+      return (int32)i;
+    }
+    i = i + (uint32)1;
+  }
+  return -1;
+}
+
+// Bring-up phase 1: instance, physical device, logical device, graphics queue.
+// Surface/swapchain/pipeline are added by later functions. Returns 0 on failure.
+export function vk_context_create_core() -> VkContext* {
+  var raw: cstring = calloc((int64)1, vkctx_bytes());
+  if (raw == 0) {
+    return 0;
+  }
+  var ctx: VkContext* = (VkContext*)raw;
+
+  var app: VkApplicationInfo;
+  app.s_type = VK_ST_APPLICATION_INFO();
+  app.p_next = (int64)0;
+  app.p_application_name = (int64)0;
+  app.application_version = (uint32)0;
+  app.p_engine_name = (int64)0;
+  app.engine_version = (uint32)0;
+  app.api_version = VK_API_VERSION_1_0();
+
+  // Surface presentation needs the WSI instance extensions.
+  var inst_exts: int64[2];
+  inst_exts[0] = (int64)cstr("VK_KHR_surface");
+  inst_exts[1] = (int64)cstr("VK_KHR_win32_surface");
+
+  var ci: VkInstanceCreateInfo;
+  ci.s_type = VK_ST_INSTANCE_CREATE_INFO();
+  ci.p_next = (int64)0;
+  ci.flags = (uint32)0;
+  ci.p_application_info = (int64)(&app);
+  ci.enabled_layer_count = (uint32)0;
+  ci.pp_enabled_layer_names = (int64)0;
+  ci.enabled_extension_count = (uint32)2;
+  ci.pp_enabled_extension_names = (int64)((int64)(&(inst_exts[0])));
+
+  var inst: int64 = 0;
+  if (vkCreateInstance(&ci, (int64)0, &inst) != VK_SUCCESS() || inst == 0) {
+    vk_say("vk: instance create failed");
+    free(raw);
+    return 0;
+  }
+  ctx->instance = inst;
+
+  var dn: uint32 = (uint32)0;
+  if (vkEnumeratePhysicalDevices(inst, &dn, (int64*)0) != VK_SUCCESS() || dn == (uint32)0) {
+    vk_say("vk: no physical devices");
+    vkDestroyInstance(inst, (int64)0);
+    free(raw);
+    return 0;
+  }
+  if (dn > (uint32)8) { dn = (uint32)8; }
+  var devs: int64[8];
+  if (vkEnumeratePhysicalDevices(inst, &dn, (int64*)((int64)(&(devs[0])))) != VK_SUCCESS()) {
+    vk_say("vk: enumerate devices failed");
+    vkDestroyInstance(inst, (int64)0);
+    free(raw);
+    return 0;
+  }
+  ctx->phys = devs[0];
+
+  var props: VkPhysicalDeviceProperties;
+  vkGetPhysicalDeviceProperties(ctx->phys, &props);
+  print(cstr("vk: GPU "));
+  print((cstring)((int64)(&(props.device_name[0]))));
+  newline();
+
+  var gfam: int32 = vk_pick_graphics_family(ctx->phys);
+  if (gfam < 0) {
+    vk_say("vk: no graphics queue family");
+    vkDestroyInstance(inst, (int64)0);
+    free(raw);
+    return 0;
+  }
+  ctx->graphics_family = (uint32)gfam;
+  ctx->present_family = (uint32)gfam;
+
+  var prio: float32 = 1.0;
+  var qci: VkDeviceQueueCreateInfo;
+  qci.s_type = VK_ST_DEVICE_QUEUE_CREATE_INFO();
+  qci.p_next = (int64)0;
+  qci.flags = (uint32)0;
+  qci.queue_family_index = (uint32)gfam;
+  qci.queue_count = (uint32)1;
+  qci.p_queue_priorities = (int64)(&prio);
+
+  var dev_exts: int64[1];
+  dev_exts[0] = (int64)cstr("VK_KHR_swapchain");
+
+  var dci: VkDeviceCreateInfo;
+  dci.s_type = VK_ST_DEVICE_CREATE_INFO();
+  dci.p_next = (int64)0;
+  dci.flags = (uint32)0;
+  dci.queue_create_info_count = (uint32)1;
+  dci.p_queue_create_infos = (int64)(&qci);
+  dci.enabled_layer_count = (uint32)0;
+  dci.pp_enabled_layer_names = (int64)0;
+  dci.enabled_extension_count = (uint32)1;
+  dci.pp_enabled_extension_names = (int64)((int64)(&(dev_exts[0])));
+  dci.p_enabled_features = (int64)0;
+
+  var dev: int64 = 0;
+  var dres: int32 = vkCreateDevice(ctx->phys, &dci, (int64)0, &dev);
+  if (dres != VK_SUCCESS() || dev == 0) {
+    print(cstr("vk: device create failed VkResult="));
+    print_int((int64)dres);
+    newline();
+    vkDestroyInstance(inst, (int64)0);
+    free(raw);
+    return 0;
+  }
+  ctx->device = dev;
+
+  var q: int64 = 0;
+  vkGetDeviceQueue(dev, (uint32)gfam, (uint32)0, &q);
+  ctx->graphics_queue = q;
+  ctx->present_queue = q;
+  ctx->ready = (uint32)0;
+
+  vk_say("vk: core bring-up OK (instance/device/queue)");
+  return ctx;
+}
+
+// Bring-up phase 2: Win32 surface, swapchain, image views. Requires a created
+// core context and the window's HWND/HINSTANCE. Returns 1 on success.
+// Build (or rebuild) the swapchain + image views for the existing surface at
+// the given size. Assumes ctx->surface is valid. Used both by initial
+// bring-up and by resize (after the old swapchain/views are destroyed).
+export function vk_build_swapchain(ctx: VkContext*, want_w: uint32, want_h: uint32) -> int32 {
+  if (ctx == 0 || ctx->surface == 0) {
+    return 0;
+  }
+  var surf: int64 = ctx->surface;
+  var caps: VkSurfaceCapabilitiesKHR;
+  if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(ctx->phys, surf, &caps) != VK_SUCCESS()) {
+    vk_say("vk: surface caps query failed");
+    return 0;
+  }
+  var u32_max: uint32 = (uint32)0 - (uint32)1;
+  var ext_w: uint32 = caps.cur_extent_w;
+  var ext_h: uint32 = caps.cur_extent_h;
+  if (ext_w == u32_max) {
+    ext_w = want_w;
+    ext_h = want_h;
+    if (ext_w < caps.min_extent_w) { ext_w = caps.min_extent_w; }
+    if (ext_h < caps.min_extent_h) { ext_h = caps.min_extent_h; }
+    if (ext_w > caps.max_extent_w) { ext_w = caps.max_extent_w; }
+    if (ext_h > caps.max_extent_h) { ext_h = caps.max_extent_h; }
+  }
+  if (ext_w == (uint32)0) { ext_w = (uint32)1; }
+  if (ext_h == (uint32)0) { ext_h = (uint32)1; }
+
+  var fmt_count: uint32 = (uint32)0;
+  vkGetPhysicalDeviceSurfaceFormatsKHR(ctx->phys, surf, &fmt_count, (VkSurfaceFormatKHR*)0);
+  if (fmt_count == (uint32)0) {
+    vk_say("vk: no surface formats");
+    return 0;
+  }
+  if (fmt_count > (uint32)32) { fmt_count = (uint32)32; }
+  var fmts: VkSurfaceFormatKHR[32];
+  vkGetPhysicalDeviceSurfaceFormatsKHR(ctx->phys, surf, &fmt_count, (VkSurfaceFormatKHR*)((int64)(&(fmts[0]))));
+  var chosen_fmt: uint32 = fmts[0].format;
+  var chosen_cs: uint32 = fmts[0].color_space;
+  var fi: uint32 = (uint32)0;
+  while (fi < fmt_count) {
+    if (fmts[fi].format == VK_FORMAT_B8G8R8A8_UNORM()) {
+      chosen_fmt = fmts[fi].format;
+      chosen_cs = fmts[fi].color_space;
+      fi = fmt_count;
+    } else {
+      fi = fi + (uint32)1;
+    }
+  }
+  ctx->sc_format = chosen_fmt;
+  ctx->sc_color_space = chosen_cs;
+  ctx->sc_width = ext_w;
+  ctx->sc_height = ext_h;
+
+  var img_count: uint32 = caps.min_image_count + (uint32)1;
+  if (caps.max_image_count != (uint32)0 && img_count > caps.max_image_count) {
+    img_count = caps.max_image_count;
+  }
+  if (img_count > (uint32)8) { img_count = (uint32)8; }
+
+  var swci: VkSwapchainCreateInfoKHR;
+  swci.s_type = VK_ST_SWAPCHAIN_CREATE_INFO_KHR();
+  swci.p_next = (int64)0;
+  swci.flags = (uint32)0;
+  swci.surface = surf;
+  swci.min_image_count = img_count;
+  swci.image_format = chosen_fmt;
+  swci.image_color_space = chosen_cs;
+  swci.image_extent_w = ext_w;
+  swci.image_extent_h = ext_h;
+  swci.image_array_layers = (uint32)1;
+  swci.image_usage = (uint32)16;
+  swci.image_sharing_mode = (uint32)0;
+  swci.queue_family_index_count = (uint32)0;
+  swci.p_queue_family_indices = (int64)0;
+  swci.pre_transform = caps.current_transform;
+  swci.composite_alpha = (uint32)1;
+  swci.present_mode = (uint32)2;
+  swci.clipped = (uint32)1;
+  swci.old_swapchain = (int64)0;
+
+  var sw: int64 = 0;
+  if (vkCreateSwapchainKHR(ctx->device, &swci, (int64)0, &sw) != VK_SUCCESS() || sw == 0) {
+    vk_say("vk: swapchain create failed");
+    return 0;
+  }
+  ctx->swapchain = sw;
+
+  var n: uint32 = (uint32)0;
+  vkGetSwapchainImagesKHR(ctx->device, sw, &n, (int64*)0);
+  if (n == (uint32)0) {
+    vk_say("vk: swapchain has no images");
+    return 0;
+  }
+  if (n > (uint32)8) { n = (uint32)8; }
+  vkGetSwapchainImagesKHR(ctx->device, sw, &n, (int64*)((int64)(&(ctx->sc_images[0]))));
+  ctx->sc_image_count = n;
+
+  var iv: uint32 = (uint32)0;
+  while (iv < n) {
+    var ivci: VkImageViewCreateInfo;
+    ivci.s_type = VK_ST_IMAGE_VIEW_CREATE_INFO();
+    ivci.p_next = (int64)0;
+    ivci.flags = (uint32)0;
+    ivci.image = ctx->sc_images[iv];
+    ivci.view_type = (uint32)1;
+    ivci.format = chosen_fmt;
+    ivci.comp_r = (uint32)0;
+    ivci.comp_g = (uint32)0;
+    ivci.comp_b = (uint32)0;
+    ivci.comp_a = (uint32)0;
+    ivci.aspect_mask = (uint32)1;
+    ivci.base_mip = (uint32)0;
+    ivci.level_count = (uint32)1;
+    ivci.base_array = (uint32)0;
+    ivci.layer_count = (uint32)1;
+    var view: int64 = 0;
+    if (vkCreateImageView(ctx->device, &ivci, (int64)0, &view) != VK_SUCCESS() || view == 0) {
+      vk_say("vk: image view create failed");
+      return 0;
+    }
+    ctx->sc_views[iv] = view;
+    iv = iv + (uint32)1;
+  }
+  return 1;
+}
+
+export function vk_context_create_surface_swapchain(ctx: VkContext*, hinstance: int64, hwnd: int64, want_w: uint32, want_h: uint32) -> int32 {
+  if (ctx == 0 || ctx->instance == 0 || ctx->device == 0) {
+    return 0;
+  }
+
+  var sci: VkWin32SurfaceCreateInfoKHR;
+  sci.s_type = VK_ST_WIN32_SURFACE_CREATE_INFO_KHR();
+  sci.p_next = (int64)0;
+  sci.flags = (uint32)0;
+  sci.hinstance = hinstance;
+  sci.hwnd = hwnd;
+  var surf: int64 = 0;
+  if (vkCreateWin32SurfaceKHR(ctx->instance, &sci, (int64)0, &surf) != VK_SUCCESS() || surf == 0) {
+    vk_say("vk: win32 surface create failed");
+    return 0;
+  }
+  ctx->surface = surf;
+
+  var supported: uint32 = (uint32)0;
+  vkGetPhysicalDeviceSurfaceSupportKHR(ctx->phys, ctx->graphics_family, surf, &supported);
+  if (supported == (uint32)0) {
+    vk_say("vk: graphics family cannot present to surface");
+    return 0;
+  }
+
+  if (vk_build_swapchain(ctx, want_w, want_h) == 0) {
+    return 0;
+  }
+  vk_say("vk: surface + swapchain + image views OK");
+  return 1;
+}
+
+export function vk_context_destroy_surface_swapchain(ctx: VkContext*) {
+  if (ctx == 0 || ctx->device == 0) {
+    return;
+  }
+  vkDeviceWaitIdle(ctx->device);
+  var i: uint32 = (uint32)0;
+  while (i < ctx->sc_image_count) {
+    if (ctx->sc_views[i] != 0) {
+      vkDestroyImageView(ctx->device, ctx->sc_views[i], (int64)0);
+      ctx->sc_views[i] = 0;
+    }
+    i = i + (uint32)1;
+  }
+  ctx->sc_image_count = (uint32)0;
+  if (ctx->swapchain != 0) {
+    vkDestroySwapchainKHR(ctx->device, ctx->swapchain, (int64)0);
+    ctx->swapchain = 0;
+  }
+  if (ctx->surface != 0 && ctx->instance != 0) {
+    vkDestroySurfaceKHR(ctx->instance, ctx->surface, (int64)0);
+    ctx->surface = 0;
+  }
+}
+
+// Destroy only the size-dependent objects (framebuffers + image views +
+// swapchain), keeping the surface, render pass, pipeline, command pool, and
+// sync. Used by resize before vk_build_swapchain rebuilds them.
+function vk_destroy_swapchain_only(ctx: VkContext*) {
+  if (ctx == 0 || ctx->device == 0) {
+    return;
+  }
+  vkDeviceWaitIdle(ctx->device);
+  var i: uint32 = (uint32)0;
+  while (i < ctx->sc_image_count) {
+    if (ctx->sc_framebuffers[i] != 0) {
+      vkDestroyFramebuffer(ctx->device, ctx->sc_framebuffers[i], (int64)0);
+      ctx->sc_framebuffers[i] = 0;
+    }
+    if (ctx->sc_views[i] != 0) {
+      vkDestroyImageView(ctx->device, ctx->sc_views[i], (int64)0);
+      ctx->sc_views[i] = 0;
+    }
+    i = i + (uint32)1;
+  }
+  vk_destroy_depth(ctx);
+  ctx->sc_image_count = (uint32)0;
+  if (ctx->swapchain != 0) {
+    vkDestroySwapchainKHR(ctx->device, ctx->swapchain, (int64)0);
+    ctx->swapchain = 0;
+  }
+}
+
+// Rebuild swapchain + image views + framebuffers at a new size. Pipeline,
+// render pass, command pool, and sync survive (the render pass is format-only,
+// the pipeline uses dynamic viewport/scissor, so neither depends on extent).
+// Returns 1 on success.
+export function vk_recreate_swapchain(ctx: VkContext*, w: uint32, h: uint32) -> int32 {
+  if (ctx == 0 || ctx->device == 0 || ctx->surface == 0 || ctx->render_pass == 0) {
+    return 0;
+  }
+  vk_destroy_swapchain_only(ctx);
+  if (vk_build_swapchain(ctx, w, h) == 0) {
+    return 0;
+  }
+  if (vk_create_depth(ctx, ctx->sc_width, ctx->sc_height) == 0) {
+    return 0;
+  }
+  // Rebuild one framebuffer per new image view.
+  var i: uint32 = (uint32)0;
+  while (i < ctx->sc_image_count) {
+    var attachments: int64[2];
+    attachments[0] = ctx->sc_views[i];
+    attachments[1] = ctx->depth_view;
+    var fbci: VkFramebufferCreateInfo;
+    fbci.s_type = VK_ST_FRAMEBUFFER_CREATE_INFO();
+    fbci.p_next = (int64)0;
+    fbci.flags = (uint32)0;
+    fbci.render_pass = ctx->render_pass;
+    fbci.attachment_count = (uint32)2;
+    fbci.p_attachments = (int64)((int64)(&(attachments[0])));
+    fbci.width = ctx->sc_width;
+    fbci.height = ctx->sc_height;
+    fbci.layers = (uint32)1;
+    var fb: int64 = 0;
+    if (vkCreateFramebuffer(ctx->device, &fbci, (int64)0, &fb) != VK_SUCCESS() || fb == 0) {
+      vk_say("vk: framebuffer rebuild failed");
+      return 0;
+    }
+    ctx->sc_framebuffers[i] = fb;
+    i = i + (uint32)1;
+  }
+  return 1;
+}
+
+// Bring-up phase 3: render pass, per-image framebuffers, command pool +
+// primary command buffers (one per swapchain image), and the per-frame sync
+// objects (image-available / render-finished semaphores + in-flight fence).
+// Requires phase 2 (swapchain + image views). Returns 1 on success.
+export function vk_context_create_render_infra(ctx: VkContext*) -> int32 {
+  if (ctx == 0 || ctx->device == 0 || ctx->swapchain == 0) {
+    return 0;
+  }
+
+  ctx->depth_format = (uint32)126;
+
+  // Color + depth attachments. Color is presented; depth is transient per
+  // frame and cleared to 1.0 at render pass begin.
+  var atts: VkAttachmentDescription[2];
+  atts[0].flags = (uint32)0;
+  atts[0].format = ctx->sc_format;
+  atts[0].samples = (uint32)1;
+  atts[0].load_op = (uint32)1;
+  atts[0].store_op = (uint32)0;
+  atts[0].stencil_load_op = (uint32)2;
+  atts[0].stencil_store_op = (uint32)1;
+  atts[0].initial_layout = (uint32)0;
+  atts[0].final_layout = (uint32)1000001002;
+  atts[1].flags = (uint32)0;
+  atts[1].format = ctx->depth_format;
+  atts[1].samples = (uint32)1;
+  atts[1].load_op = (uint32)1;
+  atts[1].store_op = (uint32)1;
+  atts[1].stencil_load_op = (uint32)2;
+  atts[1].stencil_store_op = (uint32)1;
+  atts[1].initial_layout = (uint32)0;
+  atts[1].final_layout = (uint32)3;
+
+  var att_ref: VkAttachmentReference;
+  att_ref.attachment = (uint32)0;
+  att_ref.layout = (uint32)2;
+  var depth_ref: VkAttachmentReference;
+  depth_ref.attachment = (uint32)1;
+  depth_ref.layout = (uint32)3;
+
+  var sub: VkSubpassDescription;
+  sub.flags = (uint32)0;
+  sub.pipeline_bind_point = (uint32)0;
+  sub.input_attachment_count = (uint32)0;
+  sub.p_input_attachments = (int64)0;
+  sub.color_attachment_count = (uint32)1;
+  sub.p_color_attachments = (int64)(&att_ref);
+  sub.p_resolve_attachments = (int64)0;
+  sub.p_depth_stencil_attachment = (int64)(&depth_ref);
+  sub.preserve_attachment_count = (uint32)0;
+  sub.p_preserve_attachments = (int64)0;
+
+  // External -> subpass dependency so the clear waits for image acquisition.
+  var u32_max: uint32 = (uint32)0 - (uint32)1;
+  var dep: VkSubpassDependency;
+  dep.src_subpass = u32_max;
+  dep.dst_subpass = (uint32)0;
+  dep.src_stage_mask = (uint32)1024;
+  dep.dst_stage_mask = (uint32)1280;
+  dep.src_access_mask = (uint32)0;
+  dep.dst_access_mask = (uint32)1280;
+  dep.dependency_flags = (uint32)0;
+
+  var rpci: VkRenderPassCreateInfo;
+  rpci.s_type = VK_ST_RENDER_PASS_CREATE_INFO();
+  rpci.p_next = (int64)0;
+  rpci.flags = (uint32)0;
+  rpci.attachment_count = (uint32)2;
+  rpci.p_attachments = (int64)((int64)(&(atts[0])));
+  rpci.subpass_count = (uint32)1;
+  rpci.p_subpasses = (int64)(&sub);
+  rpci.dependency_count = (uint32)1;
+  rpci.p_dependencies = (int64)(&dep);
+
+  var rp: int64 = 0;
+  if (vkCreateRenderPass(ctx->device, &rpci, (int64)0, &rp) != VK_SUCCESS() || rp == 0) {
+    vk_say("vk: render pass create failed");
+    return 0;
+  }
+  ctx->render_pass = rp;
+
+  if (vk_create_depth(ctx, ctx->sc_width, ctx->sc_height) == 0) {
+    return 0;
+  }
+
+  // One framebuffer per swapchain image view.
+  var i: uint32 = (uint32)0;
+  while (i < ctx->sc_image_count) {
+    var attachments: int64[2];
+    attachments[0] = ctx->sc_views[i];
+    attachments[1] = ctx->depth_view;
+    var fbci: VkFramebufferCreateInfo;
+    fbci.s_type = VK_ST_FRAMEBUFFER_CREATE_INFO();
+    fbci.p_next = (int64)0;
+    fbci.flags = (uint32)0;
+    fbci.render_pass = rp;
+    fbci.attachment_count = (uint32)2;
+    fbci.p_attachments = (int64)((int64)(&(attachments[0])));
+    fbci.width = ctx->sc_width;
+    fbci.height = ctx->sc_height;
+    fbci.layers = (uint32)1;
+    var fb: int64 = 0;
+    if (vkCreateFramebuffer(ctx->device, &fbci, (int64)0, &fb) != VK_SUCCESS() || fb == 0) {
+      vk_say("vk: framebuffer create failed");
+      return 0;
+    }
+    ctx->sc_framebuffers[i] = fb;
+    i = i + (uint32)1;
+  }
+
+  // Command pool (reset-buffer bit so we can re-record each frame).
+  var cpci: VkCommandPoolCreateInfo;
+  cpci.s_type = VK_ST_COMMAND_POOL_CREATE_INFO();
+  cpci.p_next = (int64)0;
+  cpci.flags = (uint32)2;
+  cpci.queue_family_index = ctx->graphics_family;
+  var pool: int64 = 0;
+  if (vkCreateCommandPool(ctx->device, &cpci, (int64)0, &pool) != VK_SUCCESS() || pool == 0) {
+    vk_say("vk: command pool create failed");
+    return 0;
+  }
+  ctx->command_pool = pool;
+
+  var cbai: VkCommandBufferAllocateInfo;
+  cbai.s_type = VK_ST_COMMAND_BUFFER_ALLOCATE_INFO();
+  cbai.p_next = (int64)0;
+  cbai.command_pool = pool;
+  cbai.level = (uint32)0;
+  cbai.command_buffer_count = ctx->sc_image_count;
+  if (vkAllocateCommandBuffers(ctx->device, &cbai, (int64*)((int64)(&(ctx->cmd_buffers[0])))) != VK_SUCCESS()) {
+    vk_say("vk: command buffer alloc failed");
+    return 0;
+  }
+
+  var sem_ci: VkSemaphoreCreateInfo;
+  sem_ci.s_type = VK_ST_SEMAPHORE_CREATE_INFO();
+  sem_ci.p_next = (int64)0;
+  sem_ci.flags = (uint32)0;
+  var s1: int64 = 0;
+  var s2: int64 = 0;
+  var sr1: int32 = vkCreateSemaphore(ctx->device, &sem_ci, (int64)0, &s1);
+  var sr2: int32 = vkCreateSemaphore(ctx->device, &sem_ci, (int64)0, &s2);
+  if (sr1 != VK_SUCCESS() || sr2 != VK_SUCCESS()) {
+    vk_say("vk: semaphore create failed");
+    return 0;
+  }
+  ctx->sem_image_available = s1;
+  ctx->sem_render_finished = s2;
+
+  // Fence starts signaled so the first frame's wait does not deadlock.
+  var fci: VkFenceCreateInfo;
+  fci.s_type = VK_ST_FENCE_CREATE_INFO();
+  fci.p_next = (int64)0;
+  fci.flags = (uint32)1;
+  var fence: int64 = 0;
+  if (vkCreateFence(ctx->device, &fci, (int64)0, &fence) != VK_SUCCESS() || fence == 0) {
+    vk_say("vk: fence create failed");
+    return 0;
+  }
+  ctx->in_flight_fence = fence;
+
+  vk_say("vk: render pass + framebuffers + commands + sync OK");
+  return 1;
+}
+
+export function vk_context_destroy_render_infra(ctx: VkContext*) {
+  if (ctx == 0 || ctx->device == 0) {
+    return;
+  }
+  vkDeviceWaitIdle(ctx->device);
+  if (ctx->in_flight_fence != 0) {
+    vkDestroyFence(ctx->device, ctx->in_flight_fence, (int64)0);
+    ctx->in_flight_fence = 0;
+  }
+  if (ctx->sem_render_finished != 0) {
+    vkDestroySemaphore(ctx->device, ctx->sem_render_finished, (int64)0);
+    ctx->sem_render_finished = 0;
+  }
+  if (ctx->sem_image_available != 0) {
+    vkDestroySemaphore(ctx->device, ctx->sem_image_available, (int64)0);
+    ctx->sem_image_available = 0;
+  }
+  var i: uint32 = (uint32)0;
+  while (i < ctx->sc_image_count) {
+    if (ctx->sc_framebuffers[i] != 0) {
+      vkDestroyFramebuffer(ctx->device, ctx->sc_framebuffers[i], (int64)0);
+      ctx->sc_framebuffers[i] = 0;
+    }
+    i = i + (uint32)1;
+  }
+  vk_destroy_depth(ctx);
+  if (ctx->command_pool != 0) {
+    vkDestroyCommandPool(ctx->device, ctx->command_pool, (int64)0);
+    ctx->command_pool = 0;
+  }
+  if (ctx->render_pass != 0) {
+    vkDestroyRenderPass(ctx->device, ctx->render_pass, (int64)0);
+    ctx->render_pass = 0;
+  }
+}
+
+// Raw byte copy. The backend strides arrays-of-structs by 8 bytes regardless
+// of element size (confirmed: VkPipelineShaderStageCreateInfo[2] puts elem 1
+// only 8 bytes in, not 48), so any "array of Vk struct" must be assembled by
+// copying each element into a manually-strided byte buffer instead.
+function vk_memcpy(dst: cstring, src: cstring, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    dst[i] = src[i];
+    i = i + 1;
+  }
+}
+
+// Pick a memory type index whose bit is set in type_bits and whose property
+// flags include all of want_props. VkMemoryType is {propertyFlags, heapIndex}
+// = 8 bytes; the i-th lives at mem_types_blob + i*8, propertyFlags at +0.
+function vk_find_memory_type(ctx: VkContext*, type_bits: uint32, want_props: uint32) -> int32 {
+  var mp: VkPhysicalDeviceMemoryProperties;
+  vkGetPhysicalDeviceMemoryProperties(ctx->phys, &mp);
+  var blob: int64 = (int64)(&(mp.mem_types_blob[0]));
+  var n: uint32 = mp.memory_type_count;
+  if (n > (uint32)32) { n = (uint32)32; }
+  var i: uint32 = (uint32)0;
+  while (i < n) {
+    var bit: uint32 = (uint32)1;
+    var k: uint32 = i;
+    while (k > (uint32)0) { bit = bit * (uint32)2; k = k - (uint32)1; }
+    if ((type_bits & bit) != (uint32)0) {
+      var pf_ptr: uint32* = (uint32*)(blob + (int64)i * (int64)8);
+      var pf: uint32 = *pf_ptr;
+      if ((pf & want_props) == want_props) {
+        return (int32)i;
+      }
+    }
+    i = i + (uint32)1;
+  }
+  return -1;
+}
+
+// Host-visible + host-coherent vertex buffer of capacity bytes, persistently
+// mapped (ctx->vbuf_mapped). VK_BUFFER_USAGE_VERTEX_BUFFER_BIT = 0x80;
+// HOST_VISIBLE|HOST_COHERENT property = 0x2|0x4 = 6.
+function vk_create_vertex_buffer(ctx: VkContext*, capacity: int64) -> int32 {
+  var bci: VkBufferCreateInfo;
+  bci.s_type = (uint32)12;
+  bci.p_next = (int64)0;
+  bci.flags = (uint32)0;
+  bci.size = capacity;
+  bci.usage = (uint32)128;
+  bci.sharing_mode = (uint32)0;
+  bci.queue_family_index_count = (uint32)0;
+  bci.p_queue_family_indices = (int64)0;
+  var buf: int64 = 0;
+  if (vkCreateBuffer(ctx->device, &bci, (int64)0, &buf) != VK_SUCCESS() || buf == 0) {
+    vk_say("vk: vertex buffer create failed");
+    return 0;
+  }
+  ctx->vbuf_buffer = buf;
+
+  var req: VkMemoryRequirements;
+  vkGetBufferMemoryRequirements(ctx->device, buf, &req);
+  var mt: int32 = vk_find_memory_type(ctx, req.memory_type_bits, (uint32)6);
+  if (mt < 0) {
+    vk_say("vk: no host-visible memory type");
+    return 0;
+  }
+  var mai: VkMemoryAllocateInfo;
+  mai.s_type = (uint32)5;
+  mai.p_next = (int64)0;
+  mai.allocation_size = req.size;
+  mai.memory_type_index = (uint32)mt;
+  var mem: int64 = 0;
+  if (vkAllocateMemory(ctx->device, &mai, (int64)0, &mem) != VK_SUCCESS() || mem == 0) {
+    vk_say("vk: vertex memory alloc failed");
+    return 0;
+  }
+  ctx->vbuf_memory = mem;
+  if (vkBindBufferMemory(ctx->device, buf, mem, (int64)0) != VK_SUCCESS()) {
+    vk_say("vk: vertex bind failed");
+    return 0;
+  }
+  var mapped: int64 = 0;
+  var whole: int64 = (int64)0 - (int64)1;
+  if (vkMapMemory(ctx->device, mem, (int64)0, whole, (uint32)0, &mapped) != VK_SUCCESS() || mapped == 0) {
+    vk_say("vk: vertex map failed");
+    return 0;
+  }
+  ctx->vbuf_mapped = mapped;
+  ctx->vbuf_capacity_bytes = capacity;
+  return 1;
+}
+
+// Depth image (D32_SFLOAT = 126), device-local, + view. Rebuilt on resize.
+// VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT = 0x20; aspect DEPTH = 2.
+function vk_create_depth(ctx: VkContext*, w: uint32, h: uint32) -> int32 {
+  ctx->depth_format = (uint32)126;
+  var ici: VkImageCreateInfo;
+  ici.s_type = (uint32)14;
+  ici.p_next = (int64)0;
+  ici.flags = (uint32)0;
+  ici.image_type = (uint32)1;
+  ici.format = ctx->depth_format;
+  ici.extent_w = w;
+  ici.extent_h = h;
+  ici.extent_d = (uint32)1;
+  ici.mip_levels = (uint32)1;
+  ici.array_layers = (uint32)1;
+  ici.samples = (uint32)1;
+  ici.tiling = (uint32)0;
+  ici.usage = (uint32)32;
+  ici.sharing_mode = (uint32)0;
+  ici.queue_family_index_count = (uint32)0;
+  ici.p_queue_family_indices = (int64)0;
+  ici.initial_layout = (uint32)0;
+  var img: int64 = 0;
+  if (vkCreateImage(ctx->device, &ici, (int64)0, &img) != VK_SUCCESS() || img == 0) {
+    vk_say("vk: depth image create failed");
+    return 0;
+  }
+  ctx->depth_image = img;
+  var req: VkMemoryRequirements;
+  vkGetImageMemoryRequirements(ctx->device, img, &req);
+  var mt: int32 = vk_find_memory_type(ctx, req.memory_type_bits, (uint32)1);
+  if (mt < 0) {
+    vk_say("vk: no device-local memory for depth");
+    return 0;
+  }
+  var mai: VkMemoryAllocateInfo;
+  mai.s_type = (uint32)5;
+  mai.p_next = (int64)0;
+  mai.allocation_size = req.size;
+  mai.memory_type_index = (uint32)mt;
+  var mem: int64 = 0;
+  if (vkAllocateMemory(ctx->device, &mai, (int64)0, &mem) != VK_SUCCESS() || mem == 0) {
+    vk_say("vk: depth memory alloc failed");
+    return 0;
+  }
+  ctx->depth_memory = mem;
+  vkBindImageMemory(ctx->device, img, mem, (int64)0);
+  var ivci: VkImageViewCreateInfo;
+  ivci.s_type = VK_ST_IMAGE_VIEW_CREATE_INFO();
+  ivci.p_next = (int64)0;
+  ivci.flags = (uint32)0;
+  ivci.image = img;
+  ivci.view_type = (uint32)1;
+  ivci.format = ctx->depth_format;
+  ivci.comp_r = (uint32)0;
+  ivci.comp_g = (uint32)0;
+  ivci.comp_b = (uint32)0;
+  ivci.comp_a = (uint32)0;
+  ivci.aspect_mask = (uint32)2;
+  ivci.base_mip = (uint32)0;
+  ivci.level_count = (uint32)1;
+  ivci.base_array = (uint32)0;
+  ivci.layer_count = (uint32)1;
+  var dv: int64 = 0;
+  if (vkCreateImageView(ctx->device, &ivci, (int64)0, &dv) != VK_SUCCESS() || dv == 0) {
+    vk_say("vk: depth view create failed");
+    return 0;
+  }
+  ctx->depth_view = dv;
+  return 1;
+}
+
+function vk_destroy_depth(ctx: VkContext*) {
+  if (ctx == 0 || ctx->device == 0) {
+    return;
+  }
+  if (ctx->depth_view != 0) {
+    vkDestroyImageView(ctx->device, ctx->depth_view, (int64)0);
+    ctx->depth_view = 0;
+  }
+  if (ctx->depth_image != 0) {
+    vkDestroyImage(ctx->device, ctx->depth_image, (int64)0);
+    ctx->depth_image = 0;
+  }
+  if (ctx->depth_memory != 0) {
+    vkFreeMemory(ctx->device, ctx->depth_memory, (int64)0);
+    ctx->depth_memory = 0;
+  }
+}
+
+// Build a VkShaderModule from one of the embedded SPIR-V blobs.
+function vk_make_shader_module(ctx: VkContext*, words: uint32*, word_count: int32) -> int64 {
+  var smci: VkShaderModuleCreateInfo;
+  smci.s_type = VK_ST_SHADER_MODULE_CREATE_INFO();
+  smci.p_next = (int64)0;
+  smci.flags = (uint32)0;
+  smci.code_size = (int64)word_count * (int64)4;
+  smci.p_code = (int64)words;
+  var m: int64 = 0;
+  if (vkCreateShaderModule(ctx->device, &smci, (int64)0, &m) != VK_SUCCESS()) {
+    return 0;
+  }
+  return m;
+}
+
+// Bring-up phase 4: pipeline layout + graphics pipeline (hardcoded-triangle
+// shaders, dynamic viewport/scissor). Requires the render pass (phase 3).
+export function vk_context_create_pipeline(ctx: VkContext*) -> int32 {
+  if (ctx == 0 || ctx->device == 0 || ctx->render_pass == 0) {
+    return 0;
+  }
+
+  // Fill SPIR-V into local buffers, then create the modules.
+  var vbuf: uint32[400];
+  var fbuf: uint32[160];
+  vk_spv_scene_vert_fill((uint32*)((int64)(&(vbuf[0]))));
+  vk_spv_scene_frag_fill((uint32*)((int64)(&(fbuf[0]))));
+  var vmod: int64 = vk_make_shader_module(ctx, (uint32*)((int64)(&(vbuf[0]))), vk_spv_scene_vert_word_count());
+  var fmod: int64 = vk_make_shader_module(ctx, (uint32*)((int64)(&(fbuf[0]))), vk_spv_scene_frag_word_count());
+  if (vmod == 0 || fmod == 0) {
+    vk_say("vk: shader module create failed");
+    return 0;
+  }
+  ctx->vert_module = vmod;
+  ctx->frag_module = fmod;
+
+  // Struct-array stride is now correct (compiler fix: arrays index by
+  // sizeof(element)), so a plain VkPipelineShaderStageCreateInfo[2] works.
+  var stages: VkPipelineShaderStageCreateInfo[2];
+  stages[0].s_type = VK_ST_PIPELINE_SHADER_STAGE_CREATE_INFO();
+  stages[0].p_next = (int64)0;
+  stages[0].flags = (uint32)0;
+  stages[0].stage = (uint32)1;
+  stages[0].module_handle = vmod;
+  stages[0].p_name = (int64)cstr("main");
+  stages[0].p_specialization_info = (int64)0;
+  stages[1].s_type = VK_ST_PIPELINE_SHADER_STAGE_CREATE_INFO();
+  stages[1].p_next = (int64)0;
+  stages[1].flags = (uint32)0;
+  stages[1].stage = (uint32)16;
+  stages[1].module_handle = fmod;
+  stages[1].p_name = (int64)cstr("main");
+  stages[1].p_specialization_info = (int64)0;
+  var stages_base: int64 = (int64)(&(stages[0]));
+
+  // Vertex layout: vec3 position @0, vec3 color @12, stride 24.
+  // VK_FORMAT_R32G32B32_SFLOAT = 106.
+  var vbind: VkVertexInputBindingDescription;
+  vbind.binding = (uint32)0;
+  vbind.stride = (uint32)24;
+  vbind.input_rate = (uint32)0;
+  var vattr: VkVertexInputAttributeDescription[2];
+  vattr[0].location = (uint32)0;
+  vattr[0].binding = (uint32)0;
+  vattr[0].format = (uint32)106;
+  vattr[0].offset = (uint32)0;
+  vattr[1].location = (uint32)1;
+  vattr[1].binding = (uint32)0;
+  vattr[1].format = (uint32)106;
+  vattr[1].offset = (uint32)12;
+
+  var vis: VkPipelineVertexInputStateCreateInfo;
+  vis.s_type = VK_ST_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO();
+  vis.p_next = (int64)0;
+  vis.flags = (uint32)0;
+  vis.vertex_binding_description_count = (uint32)1;
+  vis.p_vertex_binding_descriptions = (int64)(&vbind);
+  vis.vertex_attribute_description_count = (uint32)2;
+  vis.p_vertex_attribute_descriptions = (int64)((int64)(&(vattr[0])));
+
+  // LINE_LIST for editor chrome; a second TRIANGLE_LIST pipeline below draws
+  // imported meshes with the same shader/layout.
+  var ias: VkPipelineInputAssemblyStateCreateInfo;
+  ias.s_type = VK_ST_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO();
+  ias.p_next = (int64)0;
+  ias.flags = (uint32)0;
+  ias.topology = (uint32)1;
+  ias.primitive_restart_enable = (uint32)0;
+
+  var vps: VkPipelineViewportStateCreateInfo;
+  vps.s_type = VK_ST_PIPELINE_VIEWPORT_STATE_CREATE_INFO();
+  vps.p_next = (int64)0;
+  vps.flags = (uint32)0;
+  vps.viewport_count = (uint32)1;
+  vps.p_viewports = (int64)0;
+  vps.scissor_count = (uint32)1;
+  vps.p_scissors = (int64)0;
+
+  var rs: VkPipelineRasterizationStateCreateInfo;
+  rs.s_type = VK_ST_PIPELINE_RASTERIZATION_STATE_CREATE_INFO();
+  rs.p_next = (int64)0;
+  rs.flags = (uint32)0;
+  rs.depth_clamp_enable = (uint32)0;
+  rs.rasterizer_discard_enable = (uint32)0;
+  rs.polygon_mode = (uint32)0;
+  rs.cull_mode = (uint32)0;
+  rs.front_face = (uint32)1;
+  rs.depth_bias_enable = (uint32)0;
+  rs.depth_bias_constant_factor = (float32)0.0;
+  rs.depth_bias_clamp = (float32)0.0;
+  rs.depth_bias_slope_factor = (float32)0.0;
+  rs.line_width = (float32)1.0;
+
+  var ms: VkPipelineMultisampleStateCreateInfo;
+  ms.s_type = VK_ST_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO();
+  ms.p_next = (int64)0;
+  ms.flags = (uint32)0;
+  ms.rasterization_samples = (uint32)1;
+  ms.sample_shading_enable = (uint32)0;
+  ms.min_sample_shading = (float32)0.0;
+  ms.p_sample_mask = (int64)0;
+  ms.alpha_to_coverage_enable = (uint32)0;
+  ms.alpha_to_one_enable = (uint32)0;
+
+  var cba: VkPipelineColorBlendAttachmentState;
+  cba.blend_enable = (uint32)0;
+  cba.src_color_blend_factor = (uint32)1;
+  cba.dst_color_blend_factor = (uint32)0;
+  cba.color_blend_op = (uint32)0;
+  cba.src_alpha_blend_factor = (uint32)1;
+  cba.dst_alpha_blend_factor = (uint32)0;
+  cba.alpha_blend_op = (uint32)0;
+  cba.color_write_mask = (uint32)15;
+
+  var cbs: VkPipelineColorBlendStateCreateInfo;
+  cbs.s_type = VK_ST_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO();
+  cbs.p_next = (int64)0;
+  cbs.flags = (uint32)0;
+  cbs.logic_op_enable = (uint32)0;
+  cbs.logic_op = (uint32)0;
+  cbs.attachment_count = (uint32)1;
+  cbs.p_attachments = (int64)(&cba);
+  cbs.blend_constant0 = (float32)0.0;
+  cbs.blend_constant1 = (float32)0.0;
+  cbs.blend_constant2 = (float32)0.0;
+  cbs.blend_constant3 = (float32)0.0;
+
+  var dss: VkPipelineDepthStencilStateCreateInfo;
+  dss.s_type = (uint32)25;
+  dss.p_next = (int64)0;
+  dss.flags = (uint32)0;
+  dss.depth_test_enable = (uint32)1;
+  dss.depth_write_enable = (uint32)0;
+  dss.depth_compare_op = (uint32)3;
+  dss.depth_bounds_test_enable = (uint32)0;
+  dss.stencil_test_enable = (uint32)0;
+  dss.front_fail_op = (uint32)0;
+  dss.front_pass_op = (uint32)0;
+  dss.front_depth_fail_op = (uint32)0;
+  dss.front_compare_op = (uint32)0;
+  dss.front_compare_mask = (uint32)0;
+  dss.front_write_mask = (uint32)0;
+  dss.front_reference = (uint32)0;
+  dss.back_fail_op = (uint32)0;
+  dss.back_pass_op = (uint32)0;
+  dss.back_depth_fail_op = (uint32)0;
+  dss.back_compare_op = (uint32)0;
+  dss.back_compare_mask = (uint32)0;
+  dss.back_write_mask = (uint32)0;
+  dss.back_reference = (uint32)0;
+  dss.min_depth_bounds = (float32)0.0;
+  dss.max_depth_bounds = (float32)1.0;
+
+  var dyn_states: uint32[2];
+  dyn_states[0] = (uint32)0;
+  dyn_states[1] = (uint32)1;
+  var dyns: VkPipelineDynamicStateCreateInfo;
+  dyns.s_type = (uint32)27;
+  dyns.p_next = (int64)0;
+  dyns.flags = (uint32)0;
+  dyns.dynamic_state_count = (uint32)2;
+  dyns.p_dynamic_states = (int64)((int64)(&(dyn_states[0])));
+
+  // Push constant: one mat4 MVP (64 bytes), vertex stage (VK_SHADER_STAGE_
+  // VERTEX_BIT = 1).
+  var pcr: VkPushConstantRange;
+  pcr.stage_flags = (uint32)1;
+  pcr.offset = (uint32)0;
+  pcr.size = (uint32)64;
+
+  var plci: VkPipelineLayoutCreateInfo;
+  plci.s_type = VK_ST_PIPELINE_LAYOUT_CREATE_INFO();
+  plci.p_next = (int64)0;
+  plci.flags = (uint32)0;
+  plci.set_layout_count = (uint32)0;
+  plci.p_set_layouts = (int64)0;
+  plci.push_constant_range_count = (uint32)1;
+  plci.p_push_constant_ranges = (int64)(&pcr);
+  var layout: int64 = 0;
+  if (vkCreatePipelineLayout(ctx->device, &plci, (int64)0, &layout) != VK_SUCCESS() || layout == 0) {
+    vk_say("vk: pipeline layout create failed");
+    return 0;
+  }
+  ctx->pipeline_layout = layout;
+
+  var gpci: VkGraphicsPipelineCreateInfo;
+  gpci.s_type = VK_ST_GRAPHICS_PIPELINE_CREATE_INFO();
+  gpci.p_next = (int64)0;
+  gpci.flags = (uint32)0;
+  gpci.stage_count = (uint32)2;
+  gpci.p_stages = stages_base;
+  gpci.p_vertex_input_state = (int64)(&vis);
+  gpci.p_input_assembly_state = (int64)(&ias);
+  gpci.p_tessellation_state = (int64)0;
+  gpci.p_viewport_state = (int64)(&vps);
+  gpci.p_rasterization_state = (int64)(&rs);
+  gpci.p_multisample_state = (int64)(&ms);
+  gpci.p_depth_stencil_state = (int64)(&dss);
+  gpci.p_color_blend_state = (int64)(&cbs);
+  gpci.p_dynamic_state = (int64)(&dyns);
+  gpci.layout = layout;
+  gpci.render_pass = ctx->render_pass;
+  gpci.subpass = (uint32)0;
+  gpci.base_pipeline_handle = (int64)0;
+  gpci.base_pipeline_index = -1;
+
+  var pipe: int64 = 0;
+  var pres: int32 = vkCreateGraphicsPipelines(ctx->device, (int64)0, (uint32)1, &gpci, (int64)0, &pipe);
+  if (pres != VK_SUCCESS() || pipe == 0) {
+    print(cstr("vk: graphics pipeline create failed VkResult="));
+    print_int((int64)pres);
+    newline();
+    fflush(get_stdout());
+    return 0;
+  }
+  ctx->pipeline = pipe;
+
+  // Solid mesh pipeline: same vertex format and shader, triangle topology,
+  // depth test/write enabled. Lighting is baked into per-face vertex colors by
+  // engine_vk_scene for now.
+  ias.topology = (uint32)3;
+  dss.depth_write_enable = (uint32)1;
+  var solid_pipe: int64 = 0;
+  var spres: int32 = vkCreateGraphicsPipelines(ctx->device, (int64)0, (uint32)1, &gpci, (int64)0, &solid_pipe);
+  if (spres != VK_SUCCESS() || solid_pipe == 0) {
+    print(cstr("vk: solid pipeline create failed VkResult="));
+    print_int((int64)spres);
+    newline();
+    fflush(get_stdout());
+    return 0;
+  }
+  ctx->solid_pipeline = solid_pipe;
+
+  // Persistent host-visible vertex buffer. 24 bytes/vertex (vec3 pos + vec3
+  // color); 4MB leaves room for imported OBJ triangles plus editor chrome.
+  if (ctx->vbuf_buffer == 0) {
+    if (vk_create_vertex_buffer(ctx, (int64)4194304) == 0) {
+      return 0;
+    }
+  }
+
+  ctx->ready = (uint32)1;
+  vk_say("vk: graphics pipeline + vertex buffer OK");
+  return 1;
+}
+
+// Copy interleaved float vertex data (vec3 pos, vec3 color per vertex) into
+// the mapped vertex buffer. count = number of vertices. Host-coherent memory,
+// so no explicit flush. Clamps to buffer capacity.
+export function vk_upload_vertices_split(ctx: VkContext*, src_floats: float32*, solid_vertex_count: int32, line_vertex_count: int32) {
+  var vertex_count: int32 = solid_vertex_count + line_vertex_count;
+  if (ctx == 0 || ctx->vbuf_mapped == 0 || vertex_count <= 0) {
+    if (ctx != 0) {
+      ctx->vertex_count = (uint32)0;
+      ctx->solid_vertex_count = (uint32)0;
+      ctx->line_vertex_count = (uint32)0;
+    }
+    return;
+  }
+  var bytes: int64 = (int64)vertex_count * (int64)24;
+  if (bytes > ctx->vbuf_capacity_bytes) {
+    bytes = ctx->vbuf_capacity_bytes;
+    vertex_count = (int32)(bytes / (int64)24);
+    if (solid_vertex_count > vertex_count) {
+      solid_vertex_count = vertex_count;
+      line_vertex_count = 0;
+    } else {
+      line_vertex_count = vertex_count - solid_vertex_count;
+    }
+  }
+  vk_memcpy((cstring)ctx->vbuf_mapped, (cstring)((int64)src_floats), bytes);
+  ctx->vertex_count = (uint32)vertex_count;
+  ctx->solid_vertex_count = (uint32)solid_vertex_count;
+  ctx->line_vertex_count = (uint32)line_vertex_count;
+}
+
+export function vk_upload_vertices(ctx: VkContext*, src_floats: float32*, vertex_count: int32) {
+  vk_upload_vertices_split(ctx, src_floats, 0, vertex_count);
+}
+
+export function vk_context_destroy_pipeline(ctx: VkContext*) {
+  if (ctx == 0 || ctx->device == 0) {
+    return;
+  }
+  vkDeviceWaitIdle(ctx->device);
+  if (ctx->solid_pipeline != 0) {
+    vkDestroyPipeline(ctx->device, ctx->solid_pipeline, (int64)0);
+    ctx->solid_pipeline = 0;
+  }
+  if (ctx->pipeline != 0) {
+    vkDestroyPipeline(ctx->device, ctx->pipeline, (int64)0);
+    ctx->pipeline = 0;
+  }
+  if (ctx->pipeline_layout != 0) {
+    vkDestroyPipelineLayout(ctx->device, ctx->pipeline_layout, (int64)0);
+    ctx->pipeline_layout = 0;
+  }
+  if (ctx->frag_module != 0) {
+    vkDestroyShaderModule(ctx->device, ctx->frag_module, (int64)0);
+    ctx->frag_module = 0;
+  }
+  if (ctx->vert_module != 0) {
+    vkDestroyShaderModule(ctx->device, ctx->vert_module, (int64)0);
+    ctx->vert_module = 0;
+  }
+  if (ctx->vbuf_memory != 0) {
+    vkUnmapMemory(ctx->device, ctx->vbuf_memory);
+    vkFreeMemory(ctx->device, ctx->vbuf_memory, (int64)0);
+    ctx->vbuf_memory = 0;
+    ctx->vbuf_mapped = 0;
+  }
+  if (ctx->vbuf_buffer != 0) {
+    vkDestroyBuffer(ctx->device, ctx->vbuf_buffer, (int64)0);
+    ctx->vbuf_buffer = 0;
+  }
+}
+
+// Render one frame: wait fence, acquire image, record (clear + draw triangle),
+// submit, present. Returns 1 on a normal frame, 0 if the swapchain is out of
+// date / a fatal error (caller can stop). Blocks via fence (simple, correct).
+// mvp16 points at 16 float32 (column-major mat4) used as the vertex push
+// constant. Vertices must already be uploaded via vk_upload_vertices.
+export function vk_draw_frame(ctx: VkContext*, mvp16: float32*) -> int32 {
+  if (ctx == 0 || ctx->ready == (uint32)0) {
+    return 0;
+  }
+  var fence_local: int64 = ctx->in_flight_fence;
+  var big: int64 = (int64)0 - (int64)1;
+  vkWaitForFences(ctx->device, (uint32)1, &fence_local, (uint32)1, big);
+
+  var img_index: uint32 = (uint32)0;
+  var acq: int32 = vkAcquireNextImageKHR(ctx->device, ctx->swapchain, big, ctx->sem_image_available, (int64)0, &img_index);
+  if (acq != VK_SUCCESS()) {
+    // VK_SUBOPTIMAL_KHR (1) is still presentable; anything else -> stop.
+    if (acq != 1) {
+      return 0;
+    }
+  }
+  vkResetFences(ctx->device, (uint32)1, &fence_local);
+
+  var cmd: int64 = ctx->cmd_buffers[img_index];
+  vkResetCommandBuffer(cmd, (uint32)0);
+
+  var cbbi: VkCommandBufferBeginInfo;
+  cbbi.s_type = VK_ST_COMMAND_BUFFER_BEGIN_INFO();
+  cbbi.p_next = (int64)0;
+  cbbi.flags = (uint32)0;
+  cbbi.p_inheritance_info = (int64)0;
+  if (vkBeginCommandBuffer(cmd, &cbbi) != VK_SUCCESS()) {
+    return 0;
+  }
+
+  var clears: VkClearValue[2];
+  clears[0].r = (float32)0.05;
+  clears[0].g = (float32)0.06;
+  clears[0].b = (float32)0.10;
+  clears[0].a = (float32)1.0;
+  clears[1].r = (float32)1.0;
+  clears[1].g = (float32)0.0;
+  clears[1].b = (float32)0.0;
+  clears[1].a = (float32)0.0;
+
+  var rpbi: VkRenderPassBeginInfo;
+  rpbi.s_type = VK_ST_RENDER_PASS_BEGIN_INFO();
+  rpbi.p_next = (int64)0;
+  rpbi.render_pass = ctx->render_pass;
+  rpbi.framebuffer = ctx->sc_framebuffers[img_index];
+  rpbi.render_area_offset_x = 0;
+  rpbi.render_area_offset_y = 0;
+  rpbi.render_area_extent_w = ctx->sc_width;
+  rpbi.render_area_extent_h = ctx->sc_height;
+  rpbi.clear_value_count = (uint32)2;
+  rpbi.p_clear_values = (int64)((int64)(&(clears[0])));
+  vkCmdBeginRenderPass(cmd, &rpbi, (uint32)0);
+
+  var vp: VkViewport;
+  vp.x = (float32)0.0;
+  vp.y = (float32)0.0;
+  vp.width = (float32)(int32)ctx->sc_width;
+  vp.height = (float32)(int32)ctx->sc_height;
+  vp.min_depth = (float32)0.0;
+  vp.max_depth = (float32)1.0;
+  vkCmdSetViewport(cmd, (uint32)0, (uint32)1, &vp);
+
+  var sc: VkRect2D;
+  sc.offset_x = 0;
+  sc.offset_y = 0;
+  sc.extent_w = ctx->sc_width;
+  sc.extent_h = ctx->sc_height;
+  vkCmdSetScissor(cmd, (uint32)0, (uint32)1, &sc);
+
+  // MVP push constant (mat4, 64 bytes, vertex stage = 1).
+  if (mvp16 != 0) {
+    vkCmdPushConstants(cmd, ctx->pipeline_layout, (uint32)1, (uint32)0, (uint32)64, (int64)mvp16);
+  }
+
+  // Bind the vertex buffer and draw imported mesh solids first, then editor
+  // line chrome from the same buffer at firstVertex = solid count.
+  if (ctx->vbuf_buffer != 0 && ctx->vertex_count > (uint32)0) {
+    var vbuf_local: int64 = ctx->vbuf_buffer;
+    var voff: int64 = 0;
+    vkCmdBindVertexBuffers(cmd, (uint32)0, (uint32)1, &vbuf_local, &voff);
+    if (ctx->solid_vertex_count > (uint32)0 && ctx->solid_pipeline != 0) {
+      vkCmdBindPipeline(cmd, (uint32)0, ctx->solid_pipeline);
+      vkCmdDraw(cmd, ctx->solid_vertex_count, (uint32)1, (uint32)0, (uint32)0);
+    }
+    if (ctx->line_vertex_count > (uint32)0 && ctx->pipeline != 0) {
+      vkCmdBindPipeline(cmd, (uint32)0, ctx->pipeline);
+      vkCmdDraw(cmd, ctx->line_vertex_count, (uint32)1, ctx->solid_vertex_count, (uint32)0);
+    }
+  }
+  vkCmdEndRenderPass(cmd);
+  if (vkEndCommandBuffer(cmd) != VK_SUCCESS()) {
+    return 0;
+  }
+
+  var wait_sem: int64 = ctx->sem_image_available;
+  var sig_sem: int64 = ctx->sem_render_finished;
+  var cmd_local: int64 = cmd;
+  var wait_stage: uint32 = (uint32)1024;
+  var si: VkSubmitInfo;
+  si.s_type = VK_ST_SUBMIT_INFO();
+  si.p_next = (int64)0;
+  si.wait_semaphore_count = (uint32)1;
+  si.p_wait_semaphores = (int64)(&wait_sem);
+  si.p_wait_dst_stage_mask = (int64)(&wait_stage);
+  si.command_buffer_count = (uint32)1;
+  si.p_command_buffers = (int64)(&cmd_local);
+  si.signal_semaphore_count = (uint32)1;
+  si.p_signal_semaphores = (int64)(&sig_sem);
+  if (vkQueueSubmit(ctx->graphics_queue, (uint32)1, &si, ctx->in_flight_fence) != VK_SUCCESS()) {
+    return 0;
+  }
+
+  var sw_local: int64 = ctx->swapchain;
+  var idx_local: uint32 = img_index;
+  var pi: VkPresentInfoKHR;
+  pi.s_type = VK_ST_PRESENT_INFO_KHR();
+  pi.p_next = (int64)0;
+  pi.wait_semaphore_count = (uint32)1;
+  pi.p_wait_semaphores = (int64)(&sig_sem);
+  pi.swapchain_count = (uint32)1;
+  pi.p_swapchains = (int64)(&sw_local);
+  pi.p_image_indices = (int64)(&idx_local);
+  pi.p_results = (int64)0;
+  var pres: int32 = vkQueuePresentKHR(ctx->present_queue, &pi);
+  if (pres != VK_SUCCESS() && pres != 1) {
+    return 0;
+  }
+  return 1;
+}
+
+export function vk_context_destroy_core(ctx: VkContext*) {
+  if (ctx == 0) {
+    return;
+  }
+  // Teardown order: pipeline -> render infra (uses views) -> swapchain/surface
+  // -> device.
+  vk_context_destroy_pipeline(ctx);
+  vk_context_destroy_render_infra(ctx);
+  vk_context_destroy_surface_swapchain(ctx);
+  if (ctx->device != 0) {
+    vkDeviceWaitIdle(ctx->device);
+    vkDestroyDevice(ctx->device, (int64)0);
+    ctx->device = 0;
+  }
+  if (ctx->instance != 0) {
+    vkDestroyInstance(ctx->instance, (int64)0);
+    ctx->instance = 0;
+  }
+  free((cstring)ctx);
+}

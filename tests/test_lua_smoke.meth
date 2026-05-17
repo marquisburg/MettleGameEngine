@@ -1,0 +1,49 @@
+// Regression smoke test for the Lua 5.5 binding in engine_lua.meth.
+//
+// Build:
+//   bin\methlang.exe --build --emit-obj --linker internal --link-arg -llua55 \
+//                    tests\test_lua_smoke.meth -o tests\test_lua_smoke.exe
+// Run (with lua55.dll on PATH):
+//   tests\test_lua_smoke.exe
+//
+// Expected output:
+//   smoke main start
+//   lua_registry_create ok
+//   [lua] hello from lua Lua 5.5
+//   [lua] self_id at load = 0
+//   attach ok
+//   done
+import "../engine/engine_lua";
+import "std/io";
+import "std/win32";
+
+function trace(s: string) {
+  win32_write_stdout(s.chars, (uint32)s.length);
+}
+
+function main() -> int32 {
+  trace("smoke main start\n");
+  var reg: LuaScriptRegistry* = lua_registry_create(8);
+  if (reg == 0) {
+    trace("lua_registry_create failed\n");
+    return 1;
+  }
+  trace("lua_registry_create ok\n");
+  var ok: int32 = lua_registry_attach(reg, 1, cstr("tests/script_smoke.lua"));
+  if (ok == 0) {
+    trace("attach failed: ");
+    var err: cstring = lua_registry_last_error(reg);
+    if (err != 0) {
+      fputs(err, get_stdout());
+    }
+    trace("\n");
+    lua_registry_destroy(reg);
+    return 2;
+  }
+  // One tick with no scene to exercise the dispatch path. With a null scene
+  // the script's on_tick still runs but engine.get_pos / set_pos no-op safely.
+  lua_registry_tick_scene(reg, (Scene*)0, (InputMap*)0, 0.016, 0.0);
+  trace("attach ok\ndone\n");
+  lua_registry_destroy(reg);
+  return 0;
+}

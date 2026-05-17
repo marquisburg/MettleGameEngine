@@ -1,0 +1,380 @@
+// Runtime output log: a fixed-size ring of text lines shown in the editor's
+// bottom "Output" panel. Lua's engine.log(), script load/tick errors, and
+// engine status messages all funnel here so the user sees runtime output
+// without a console.
+//
+// Single global instance. This mirrors the lua_ctx_* module-static pattern in
+// engine_lua: one Methlang process == one editor == one log. Keeping it a
+// singleton means lua_api_log (which only gets a lua_State*) can append
+// without threading a pointer through every C callback.
+import "std/io";
+import "std/mem";
+
+function OUT_LOG_LINES() -> int32 { return 256; }
+function OUT_LOG_COLS()  -> int32 { return 200; }
+
+// Severity levels, shown as a colored prefix in the panel.
+export function OUT_INFO()  -> int32 { return 0; }
+export function OUT_LUA()   -> int32 { return 1; }
+export function OUT_WARN()  -> int32 { return 2; }
+export function OUT_ERROR() -> int32 { return 3; }
+
+// Source of a line: which subsystem produced it. Used for source-based
+// filtering (Engine vs. the spawned playtest processes).
+export function OUT_SRC_ENGINE() -> int32 { return 0; }
+export function OUT_SRC_SERVER() -> int32 { return 1; }
+export function OUT_SRC_CLIENT() -> int32 { return 2; }
+
+// Filter modes selectable from the panel's tab strip. ALL shows everything;
+// the level filters show that severity (and worse, for WARN); SERVER/CLIENT
+// filter by source regardless of level.
+export function OUT_FILTER_ALL()    -> int32 { return 0; }
+export function OUT_FILTER_LOGS()   -> int32 { return 1; }
+export function OUT_FILTER_WARN()   -> int32 { return 2; }
+export function OUT_FILTER_ERROR()  -> int32 { return 3; }
+export function OUT_FILTER_SERVER() -> int32 { return 4; }
+export function OUT_FILTER_CLIENT() -> int32 { return 5; }
+export function OUT_FILTER_COUNT()  -> int32 { return 6; }
+
+export struct OutputLog {
+  // Flat char grid: line i occupies [i*cols, i*cols+cols). NUL-terminated.
+  text: cstring;
+  level: int32*;
+  source: int32*;   // OUT_SRC_* per slot
+  cap: int32;       // number of line slots (OUT_LOG_LINES)
+  cols: int32;      // chars per line incl. NUL
+  count: int32;     // total lines ever written (monotonic)
+  head: int32;      // ring index of the oldest live line
+  scroll: int32;    // lines scrolled up from the bottom (0 = follow tail)
+  filter: int32;    // OUT_FILTER_* — which lines the panel shows
+}
+
+// The one instance. 0 until output_log_init() runs.
+var g_out_log: OutputLog* = 0;
+
+function out_log_struct_bytes() -> int64 { return (int64)96; }
+
+export function output_log_init() -> OutputLog* {
+  if (g_out_log != 0) {
+    return g_out_log;
+  }
+  var raw: cstring = calloc((int64)1, out_log_struct_bytes());
+  if (raw == 0) {
+    return (OutputLog*)0;
+  }
+  var lg: OutputLog* = (OutputLog*)raw;
+  lg->cap = OUT_LOG_LINES();
+  lg->cols = OUT_LOG_COLS();
+  lg->count = 0;
+  lg->head = 0;
+  lg->scroll = 0;
+  lg->filter = OUT_FILTER_ALL();
+  lg->text = calloc((int64)(lg->cap), (int64)(lg->cols));
+  if (lg->text == 0) {
+    free(raw);
+    return (OutputLog*)0;
+  }
+  lg->level = (int32*)calloc((int64)(lg->cap), (int64)4);
+  if (lg->level == 0) {
+    free(lg->text);
+    free(raw);
+    return (OutputLog*)0;
+  }
+  lg->source = (int32*)calloc((int64)(lg->cap), (int64)4);
+  if (lg->source == 0) {
+    free(lg->text);
+    free((cstring)lg->level);
+    free(raw);
+    return (OutputLog*)0;
+  }
+  g_out_log = lg;
+  return lg;
+}
+
+export function output_log_get() -> OutputLog* {
+  return g_out_log;
+}
+
+export function output_log_destroy() {
+  if (g_out_log == 0) {
+    return;
+  }
+  if (g_out_log->text != 0) {
+    free(g_out_log->text);
+  }
+  if (g_out_log->level != 0) {
+    free((cstring)g_out_log->level);
+  }
+  if (g_out_log->source != 0) {
+    free((cstring)g_out_log->source);
+  }
+  free((cstring)g_out_log);
+  g_out_log = 0;
+}
+
+function out_line_ptr(lg: OutputLog*, ring_idx: int32) -> cstring {
+  if (lg == 0 || lg->text == 0) {
+    return (cstring)0;
+  }
+  var off: int64 = (int64)ring_idx * (int64)(lg->cols);
+  return (cstring)((int64)(lg->text) + off);
+}
+
+// Append one line with the given severity and source. The string is truncated
+// to fit and embedded newlines are split into separate log lines.
+export function output_log_push_src(level: int32, source: int32, msg: cstring) {
+  var lg: OutputLog* = g_out_log;
+  if (lg == 0 || msg == 0) {
+    return;
+  }
+  var slot: int32 = (lg->head + lg->count) % lg->cap;
+  if (lg->count >= lg->cap) {
+    // Ring full: overwrite oldest, advance head.
+    slot = lg->head;
+    lg->head = (lg->head + 1) % lg->cap;
+  } else {
+    lg->count = lg->count + 1;
+  }
+  var dst: cstring = out_line_ptr(lg, slot);
+  lg->level[slot] = level;
+  lg->source[slot] = source;
+  var maxc: int32 = lg->cols - 1;
+  var j: int32 = 0;
+  var k: int32 = 0;
+  while (j < maxc) {
+    var ch: uint8 = (uint8)(msg[k]);
+    if (ch == (uint8)0) {
+      break;
+    }
+    if (ch == (uint8)10) {
+      // Newline: terminate this line, start the next one.
+      dst[j] = 0;
+      output_log_push_src(level, source, (cstring)((int64)msg + (int64)(k + 1)));
+      return;
+    }
+    if (ch == (uint8)13) {
+      // Drop CR; Windows line endings shouldn't show as a glyph.
+      k = k + 1;
+      continue;
+    }
+    dst[j] = ch;
+    j = j + 1;
+    k = k + 1;
+  }
+  dst[j] = 0;
+}
+
+// Engine-source append (most call sites).
+export function output_log_push(level: int32, msg: cstring) {
+  output_log_push_src(level, OUT_SRC_ENGINE(), msg);
+}
+
+// Convenience wrappers used across the engine.
+export function output_log_info(msg: cstring)  { output_log_push(OUT_INFO(), msg); }
+export function output_log_lua(msg: cstring)   { output_log_push(OUT_LUA(), msg); }
+export function output_log_warn(msg: cstring)  { output_log_push(OUT_WARN(), msg); }
+export function output_log_error(msg: cstring) { output_log_push(OUT_ERROR(), msg); }
+
+export function output_log_clear() {
+  if (g_out_log == 0) {
+    return;
+  }
+  g_out_log->count = 0;
+  g_out_log->head = 0;
+  g_out_log->scroll = 0;
+  g_out_log->filter = OUT_FILTER_ALL();
+}
+
+// Add a line attributed to the playtest server/client. Heuristically promotes
+// lines that look like errors/warnings so severity filters still work on
+// captured child output.
+export function output_log_push_child(source: int32, msg: cstring) {
+  if (msg == 0) {
+    return;
+  }
+  var lvl: int32 = OUT_INFO();
+  var i: int32 = 0;
+  while (i < 64) {
+    var c: uint8 = (uint8)(msg[i]);
+    if (c == (uint8)0) {
+      break;
+    }
+    // Cheap substring sniff for "err" / "warn" prefixes commonly emitted by
+    // the play processes (e.g. "[server] error: ...").
+    if (c == (uint8)101 && (uint8)(msg[i + 1]) == (uint8)114 && (uint8)(msg[i + 2]) == (uint8)114) {
+      lvl = OUT_ERROR();
+      break;
+    }
+    if (c == (uint8)119 && (uint8)(msg[i + 1]) == (uint8)97 && (uint8)(msg[i + 2]) == (uint8)114) {
+      lvl = OUT_WARN();
+      break;
+    }
+    i = i + 1;
+  }
+  output_log_push_src(lvl, source, msg);
+}
+
+// ---- View helpers (used by the editor panel renderer) ----------------------
+
+export function output_log_count() -> int32 {
+  if (g_out_log == 0) {
+    return 0;
+  }
+  return g_out_log->count;
+}
+
+// Pointer to the i-th live line in chronological order (0 = oldest live).
+export function output_log_line(i: int32) -> cstring {
+  var lg: OutputLog* = g_out_log;
+  if (lg == 0 || i < 0 || i >= lg->count) {
+    return (cstring)0;
+  }
+  var ring_idx: int32 = (lg->head + i) % lg->cap;
+  return out_line_ptr(lg, ring_idx);
+}
+
+export function output_log_line_level(i: int32) -> int32 {
+  var lg: OutputLog* = g_out_log;
+  if (lg == 0 || i < 0 || i >= lg->count) {
+    return OUT_INFO();
+  }
+  var ring_idx: int32 = (lg->head + i) % lg->cap;
+  return lg->level[ring_idx];
+}
+
+export function output_log_line_source(i: int32) -> int32 {
+  var lg: OutputLog* = g_out_log;
+  if (lg == 0 || i < 0 || i >= lg->count) {
+    return OUT_SRC_ENGINE();
+  }
+  var ring_idx: int32 = (lg->head + i) % lg->cap;
+  return lg->source[ring_idx];
+}
+
+// ---- Filtering -------------------------------------------------------------
+
+export function output_log_filter() -> int32 {
+  if (g_out_log == 0) {
+    return OUT_FILTER_ALL();
+  }
+  return g_out_log->filter;
+}
+
+export function output_log_set_filter(f: int32) {
+  if (g_out_log == 0) {
+    return;
+  }
+  if (f < 0 || f >= OUT_FILTER_COUNT()) {
+    f = OUT_FILTER_ALL();
+  }
+  g_out_log->filter = f;
+  // Re-following the tail after a filter change avoids landing on a scroll
+  // offset that no longer has matching lines under it.
+  g_out_log->scroll = 0;
+}
+
+// True if line i passes the active filter.
+export function output_log_line_visible(i: int32) -> int32 {
+  var lg: OutputLog* = g_out_log;
+  if (lg == 0 || i < 0 || i >= lg->count) {
+    return 0;
+  }
+  var f: int32 = lg->filter;
+  if (f == OUT_FILTER_ALL()) {
+    return 1;
+  }
+  var ring_idx: int32 = (lg->head + i) % lg->cap;
+  var lv: int32 = lg->level[ring_idx];
+  var sc: int32 = lg->source[ring_idx];
+  if (f == OUT_FILTER_LOGS()) {
+    if (lv == OUT_INFO() || lv == OUT_LUA()) {
+      return 1;
+    }
+    return 0;
+  }
+  if (f == OUT_FILTER_WARN()) {
+    if (lv == OUT_WARN() || lv == OUT_ERROR()) {
+      return 1;
+    }
+    return 0;
+  }
+  if (f == OUT_FILTER_ERROR()) {
+    if (lv == OUT_ERROR()) {
+      return 1;
+    }
+    return 0;
+  }
+  if (f == OUT_FILTER_SERVER()) {
+    if (sc == OUT_SRC_SERVER()) {
+      return 1;
+    }
+    return 0;
+  }
+  if (f == OUT_FILTER_CLIENT()) {
+    if (sc == OUT_SRC_CLIENT()) {
+      return 1;
+    }
+    return 0;
+  }
+  return 1;
+}
+
+// Count of lines passing the active filter (for the visible-rows math and the
+// header line count).
+export function output_log_visible_count() -> int32 {
+  var lg: OutputLog* = g_out_log;
+  if (lg == 0) {
+    return 0;
+  }
+  if (lg->filter == OUT_FILTER_ALL()) {
+    return lg->count;
+  }
+  var n: int32 = 0;
+  var i: int32 = 0;
+  while (i < lg->count) {
+    if (output_log_line_visible(i) != 0) {
+      n = n + 1;
+    }
+    i = i + 1;
+  }
+  return n;
+}
+
+export function output_log_filter_label(f: int32) -> cstring {
+  if (f == OUT_FILTER_LOGS())   { var a: string = "Logs";    return a.chars; }
+  if (f == OUT_FILTER_WARN())   { var b: string = "Warnings"; return b.chars; }
+  if (f == OUT_FILTER_ERROR())  { var c: string = "Errors";  return c.chars; }
+  if (f == OUT_FILTER_SERVER()) { var d: string = "Server";  return d.chars; }
+  if (f == OUT_FILTER_CLIENT()) { var e: string = "Client";  return e.chars; }
+  var g: string = "All";
+  return g.chars;
+}
+
+export function output_log_scroll() -> int32 {
+  if (g_out_log == 0) {
+    return 0;
+  }
+  return g_out_log->scroll;
+}
+
+// Scroll by delta lines (positive = back into history). Clamped so it can
+// never run off either end; clamping against the visible window happens in
+// the renderer which knows how many rows fit.
+export function output_log_scroll_add(delta: int32, visible_rows: int32) {
+  var lg: OutputLog* = g_out_log;
+  if (lg == 0) {
+    return;
+  }
+  var s: int32 = lg->scroll + delta;
+  var maxs: int32 = lg->count - visible_rows;
+  if (maxs < 0) {
+    maxs = 0;
+  }
+  if (s < 0) {
+    s = 0;
+  }
+  if (s > maxs) {
+    s = maxs;
+  }
+  lg->scroll = s;
+}

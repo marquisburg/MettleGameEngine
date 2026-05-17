@@ -1,0 +1,161 @@
+// Editor/runtime boundary: fixed-step game simulation, play-mode scene snapshot,
+// and restoration when play stops.
+//
+// The runtime drives TWO tick paths each fixed step:
+//   1. Lua scripts (engine_lua.LuaScriptRegistry) — primary, modern path. Any
+//      Entity with a non-empty lua_script is dispatched to Lua's on_tick.
+//   2. The built-in `script_id` chain (engine_scripts.script_tick_scene) — kept
+//      for legacy scenes still using SCRIPT_SPIN / SCRIPT_BOB / SCRIPT_PLAYER.
+//      Will be removed once all existing scenes are migrated.
+import "engine_input";
+import "engine_lua";
+import "engine_scene";
+import "engine_scripts";
+import "std/mem";
+
+export struct RuntimeState {
+  snapshot: Scene*;
+  lua_reg: LuaScriptRegistry*;
+  accumulator: float64;
+  fixed_dt: float64;
+  runtime_time: float64;
+  frame_dt: float64;
+  playing: int32;
+  max_steps: int32;
+  _pad: int32;
+  _pad2: int32;
+}
+
+function runtime_bytes() -> int64 {
+  return (int64)128;
+}
+
+export function runtime_create(scene_cap: int32) -> RuntimeState* {
+  var raw: cstring = calloc((int64)1, runtime_bytes());
+  if (raw == 0) {
+    return 0;
+  }
+  var rt: RuntimeState* = (RuntimeState*)raw;
+  rt->snapshot = scene_create(scene_cap);
+  if (rt->snapshot == 0) {
+    free(raw);
+    return 0;
+  }
+  rt->lua_reg = (LuaScriptRegistry*)0;
+  rt->fixed_dt = 1.0 / 60.0;
+  rt->accumulator = 0.0;
+  rt->runtime_time = 0.0;
+  rt->frame_dt = 0.0;
+  rt->playing = 0;
+  rt->max_steps = 5;
+  return rt;
+}
+
+// Late-binds the Lua registry. The runtime never owns it; the caller (the
+// editor / game shell) creates and destroys the registry independently.
+export function runtime_set_lua_registry(rt: RuntimeState*, reg: LuaScriptRegistry*) {
+  if (rt == 0) {
+    return;
+  }
+  rt->lua_reg = reg;
+}
+
+export function runtime_lua_registry(rt: RuntimeState*) -> LuaScriptRegistry* {
+  if (rt == 0) {
+    return (LuaScriptRegistry*)0;
+  }
+  return rt->lua_reg;
+}
+
+export function runtime_destroy(rt: RuntimeState*) {
+  if (rt == 0) {
+    return;
+  }
+  if (rt->snapshot != 0) {
+    scene_destroy(rt->snapshot);
+    rt->snapshot = 0;
+  }
+  free((cstring)rt);
+}
+
+export function runtime_is_playing(rt: RuntimeState*) -> int32 {
+  if (rt == 0) {
+    return 0;
+  }
+  return rt->playing;
+}
+
+export function runtime_begin_play(rt: RuntimeState*, sc: Scene*) -> int32 {
+  if (rt == 0 || sc == 0 || rt->snapshot == 0) {
+    return 0;
+  }
+  if (rt->playing != 0) {
+    return 1;
+  }
+  if (scene_copy_into(rt->snapshot, sc) == 0) {
+    return 0;
+  }
+  rt->playing = 1;
+  rt->accumulator = 0.0;
+  rt->runtime_time = 0.0;
+  rt->frame_dt = 0.0;
+  return 1;
+}
+
+export function runtime_stop_play(rt: RuntimeState*, sc: Scene*) -> int32 {
+  if (rt == 0 || sc == 0 || rt->snapshot == 0) {
+    return 0;
+  }
+  if (rt->playing == 0) {
+    return 1;
+  }
+  scene_copy_into(sc, rt->snapshot);
+  rt->playing = 0;
+  rt->accumulator = 0.0;
+  rt->runtime_time = 0.0;
+  rt->frame_dt = 0.0;
+  return 1;
+}
+
+export function runtime_toggle_play(rt: RuntimeState*, sc: Scene*) -> int32 {
+  if (rt == 0) {
+    return 0;
+  }
+  if (rt->playing != 0) {
+    return runtime_stop_play(rt, sc);
+  }
+  return runtime_begin_play(rt, sc);
+}
+
+export function runtime_frame_tick(rt: RuntimeState*, sc: Scene*, input: InputMap*, dt: float64) -> int32 {
+  if (rt == 0 || sc == 0 || rt->playing == 0) {
+    return 0;
+  }
+  if (dt < 0.0) {
+    dt = 0.0;
+  }
+  if (dt > 0.25) {
+    dt = 0.25;
+  }
+  rt->frame_dt = dt;
+  rt->accumulator = rt->accumulator + dt;
+  var changed: int32 = 0;
+  var steps: int32 = 0;
+  while (rt->accumulator >= rt->fixed_dt && steps < rt->max_steps) {
+    rt->runtime_time = rt->runtime_time + rt->fixed_dt;
+    if (rt->lua_reg != 0) {
+      if (lua_registry_tick_scene(rt->lua_reg, sc, input, rt->fixed_dt, rt->runtime_time) != 0) {
+        changed = 1;
+      }
+    }
+    if (script_tick_scene(sc, input, rt->fixed_dt, rt->runtime_time) != 0) {
+      changed = 1;
+    }
+    rt->accumulator = rt->accumulator - rt->fixed_dt;
+    steps = steps + 1;
+  }
+  if (steps >= rt->max_steps) {
+    rt->accumulator = 0.0;
+  }
+  return changed;
+}

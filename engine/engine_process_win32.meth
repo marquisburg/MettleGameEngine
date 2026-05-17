@@ -1,0 +1,356 @@
+// Win32 process spawning and supervision for playtest server/client.
+//
+// Editor uses this to launch engine_play_server.exe and engine_play_client.exe
+// with a generated manifest path. Provides handle tracking, poll, terminate,
+// and cleanup.
+import "engine_output_log";
+import "std/mem";
+
+export extern function CreatePipe(read_handle: int64*, write_handle: int64*, security_attrs: cstring, size: uint32) -> int32 = "CreatePipe";
+export extern function SetHandleInformation(handle: int64, mask: uint32, flags: uint32) -> int32 = "SetHandleInformation";
+export extern function PeekNamedPipe(handle: int64, buf: cstring, buf_size: uint32, read: uint32*, total_avail: uint32*, left: uint32*) -> int32 = "PeekNamedPipe";
+export extern function ReadFile(handle: int64, buf: cstring, to_read: uint32, did_read: uint32*, overlapped: cstring) -> int32 = "ReadFile";
+
+function HANDLE_FLAG_INHERIT() -> uint32 { return (uint32)1; }
+function STARTF_USESTDHANDLES() -> uint32 { return (uint32)256; }
+
+export struct Win32Process {
+  process_handle: int64;
+  thread_handle: int64;
+  process_id: uint32;
+  thread_id: uint32;
+  running: int32;
+  // Read end of the child's stdout/stderr pipe (write end is given to the
+  // child and closed in the parent after spawn). 0 if capture is disabled.
+  stdout_read: int64;
+  // Partial-line carry: bytes read that didn't end on a newline yet.
+  line_buf: uint8[512];
+  line_len: int32;
+}
+
+export struct PlaytestSupervisor {
+  server: Win32Process;
+  client: Win32Process;
+  session_id: int32;
+  port: int32;
+  manifest_path: uint8[800];
+  active: int32;
+}
+
+export struct Win32ProcessInformation {
+  process_handle: int64;
+  thread_handle: int64;
+  process_id: uint32;
+  thread_id: uint32;
+}
+
+export extern function CreateProcessA(app_name: cstring, cmd_line: cstring, proc_attrs: cstring, thread_attrs: cstring, inherit: int32, creation_flags: uint32, env: cstring, cwd: cstring, startup_info: cstring, process_info: cstring) -> int32 = "CreateProcessA";
+export extern function TerminateProcess(process: int64, exit_code: uint32) -> int32 = "TerminateProcess";
+export extern function WaitForSingleObject(handle: int64, ms: uint32) -> uint32 = "WaitForSingleObject";
+export extern function CloseHandle(handle: int64) -> int32 = "CloseHandle";
+export extern function GetExitCodeProcess(process: int64, code: uint32*) -> int32 = "GetExitCodeProcess";
+
+export function playtest_supervisor_create() -> PlaytestSupervisor* {
+  // Oversized on purpose: PlaytestSupervisor embeds two Win32Process structs
+  // which now carry per-process line buffers for stdout capture. 4096 leaves
+  // generous headroom rather than tracking the exact packed size by hand.
+  var raw: cstring = calloc((int64)1, (int64)4096);
+  if (raw == 0) {
+    return (PlaytestSupervisor*)0;
+  }
+  return (PlaytestSupervisor*)raw;
+}
+
+export function playtest_supervisor_destroy(sv: PlaytestSupervisor*) {
+  if (sv == 0) {
+    return;
+  }
+  playtest_stop(sv);
+  free((cstring)sv);
+}
+
+export function playtest_is_active(sv: PlaytestSupervisor*) -> int32 {
+  if (sv == 0) {
+    return 0;
+  }
+  return sv->active;
+}
+
+// Write a 64-bit value into buf at byte offset off.
+function proc_put_i64(buf: cstring, off: int32, v: int64) {
+  var p: int64* = (int64*)((int64)buf + (int64)off);
+  p[0] = v;
+}
+
+function proc_put_u32(buf: cstring, off: int32, v: uint32) {
+  var p: uint32* = (uint32*)((int64)buf + (int64)off);
+  p[0] = v;
+}
+
+// Spawn one child with its stdout+stderr redirected to a fresh pipe. On
+// success fills proc (handles + the parent's read end). Returns 1 on success.
+function proc_spawn_captured(proc: Win32Process*, cmd: cstring) -> int32 {
+  if (proc == 0 || cmd == 0) {
+    return 0;
+  }
+  // SECURITY_ATTRIBUTES { nLength=24, lpSecurityDescriptor=NULL, bInheritHandle=TRUE }
+  var sa: cstring = calloc((int64)1, (int64)24);
+  if (sa == 0) {
+    return 0;
+  }
+  proc_put_u32(sa, 0, (uint32)24);
+  proc_put_u32(sa, 16, (uint32)1);
+  var rd: int64 = 0;
+  var wr: int64 = 0;
+  if (CreatePipe(&rd, &wr, sa, (uint32)65536) == 0) {
+    free(sa);
+    return 0;
+  }
+  free(sa);
+  // The read end stays in the parent and must NOT be inherited by the child.
+  SetHandleInformation(rd, HANDLE_FLAG_INHERIT(), (uint32)0);
+
+  var si: cstring = calloc((int64)1, (int64)104);
+  var pi: cstring = calloc((int64)1, (int64)24);
+  if (si == 0 || pi == 0) {
+    if (si != 0) { free(si); }
+    if (pi != 0) { free(pi); }
+    CloseHandle(rd);
+    CloseHandle(wr);
+    return 0;
+  }
+  proc_put_u32(si, 0, (uint32)104);                       // cb
+  proc_put_u32(si, 60, STARTF_USESTDHANDLES());           // dwFlags
+  proc_put_i64(si, 80, wr);                               // hStdOutput
+  proc_put_i64(si, 88, wr);                               // hStdError
+  // inherit=1 so the child receives the pipe write handle.
+  if (CreateProcessA((cstring)0, cmd, (cstring)0, (cstring)0, 1, (uint32)0, (cstring)0, (cstring)0, si, pi) == 0) {
+    free(si);
+    free(pi);
+    CloseHandle(rd);
+    CloseHandle(wr);
+    return 0;
+  }
+  var pinfo: Win32ProcessInformation* = (Win32ProcessInformation*)pi;
+  proc->process_handle = pinfo->process_handle;
+  proc->thread_handle = pinfo->thread_handle;
+  proc->process_id = pinfo->process_id;
+  proc->thread_id = pinfo->thread_id;
+  proc->running = 1;
+  proc->stdout_read = rd;
+  proc->line_len = 0;
+  free(si);
+  free(pi);
+  // Parent closes its copy of the write end; only the child holds it now, so
+  // the read end sees EOF when the child exits.
+  CloseHandle(wr);
+  return 1;
+}
+
+// Drain whatever is currently buffered in the pipe, splitting on newlines and
+// pushing complete lines to the output log under `source`. Non-blocking:
+// PeekNamedPipe first so we never stall the editor's frame loop.
+function proc_drain(proc: Win32Process*, source: int32) {
+  if (proc == 0 || proc->stdout_read == 0) {
+    return;
+  }
+  var avail: uint32 = 0;
+  var nread: uint32 = 0;
+  var left: uint32 = 0;
+  var chunk: uint8[1024];
+  var cp: cstring = (cstring)((int64)(&(chunk[0])));
+  var guard: int32 = 0;
+  while (guard < 64) {
+    guard = guard + 1;
+    avail = (uint32)0;
+    if (PeekNamedPipe(proc->stdout_read, (cstring)0, (uint32)0, (uint32*)0, &avail, &left) == 0) {
+      return;
+    }
+    if (avail == (uint32)0) {
+      return;
+    }
+    nread = (uint32)0;
+    if (ReadFile(proc->stdout_read, cp, (uint32)1023, &nread, (cstring)0) == 0) {
+      return;
+    }
+    if (nread == (uint32)0) {
+      return;
+    }
+    var k: int32 = 0;
+    while (k < (int32)nread) {
+      var ch: uint8 = (uint8)(chunk[k]);
+      if (ch == (uint8)10) {
+        proc->line_buf[proc->line_len] = 0;
+        output_log_push_child(source, (cstring)((int64)(&(proc->line_buf[0]))));
+        proc->line_len = 0;
+      } else {
+        if (ch != (uint8)13 && proc->line_len < 510) {
+          proc->line_buf[proc->line_len] = ch;
+          proc->line_len = proc->line_len + 1;
+        }
+      }
+      k = k + 1;
+    }
+  }
+}
+
+// Flush any trailing partial line (no terminating newline) when a child exits.
+function proc_flush_tail(proc: Win32Process*, source: int32) {
+  if (proc == 0) {
+    return;
+  }
+  if (proc->line_len > 0) {
+    proc->line_buf[proc->line_len] = 0;
+    output_log_push_child(source, (cstring)((int64)(&(proc->line_buf[0]))));
+    proc->line_len = 0;
+  }
+  if (proc->stdout_read != 0) {
+    CloseHandle(proc->stdout_read);
+    proc->stdout_read = 0;
+  }
+}
+
+export function playtest_start(sv: PlaytestSupervisor*, manifest: cstring, server_exe: cstring, client_exe: cstring) -> int32 {
+  if (sv == 0 || manifest == 0) {
+    return 0;
+  }
+  // copy manifest path
+  var i: int32 = 0;
+  while (i + 1 < 800) {
+    sv->manifest_path[i] = (uint8)(manifest[i]);
+    if (sv->manifest_path[i] == (uint8)0) {
+      break;
+    }
+    i = i + 1;
+  }
+  sv->manifest_path[799] = 0;
+
+  var cmd: uint8[1024];
+  proc_build_command((cstring)((int64)(&(cmd[0]))), 1024, server_exe, cstr("engine_play_server.exe"), manifest);
+  if (proc_spawn_captured(&(sv->server), (cstring)((int64)(&(cmd[0])))) == 0) {
+    return 0;
+  }
+  output_log_push_src(OUT_INFO(), OUT_SRC_SERVER(), cstr("server started"));
+
+  proc_build_command((cstring)((int64)(&(cmd[0]))), 1024, client_exe, cstr("engine_play_client.exe"), manifest);
+  if (proc_spawn_captured(&(sv->client), (cstring)((int64)(&(cmd[0])))) == 0) {
+    TerminateProcess(sv->server.process_handle, (uint32)1);
+    CloseHandle(sv->server.process_handle);
+    CloseHandle(sv->server.thread_handle);
+    proc_flush_tail(&(sv->server), OUT_SRC_SERVER());
+    sv->server.running = 0;
+    return 0;
+  }
+  output_log_push_src(OUT_INFO(), OUT_SRC_CLIENT(), cstr("client started"));
+
+  sv->active = 1;
+  return 1;
+}
+
+function proc_build_command(out: cstring, cap: int32, exe: cstring, fallback: cstring, manifest: cstring) {
+  if (out == 0 || cap <= 0) {
+    return;
+  }
+  out[0] = 0;
+  var src: cstring = exe;
+  if (src == 0 || (uint8)(src[0]) == (uint8)0) {
+    src = fallback;
+  }
+  var pos: int32 = 0;
+  pos = proc_append_byte(out, cap, pos, (uint8)34);
+  pos = proc_append(out, cap, pos, src);
+  pos = proc_append_byte(out, cap, pos, (uint8)34);
+  pos = proc_append(out, cap, pos, cstr(" --playtest "));
+  pos = proc_append_byte(out, cap, pos, (uint8)34);
+  pos = proc_append(out, cap, pos, manifest);
+  pos = proc_append_byte(out, cap, pos, (uint8)34);
+  if (pos >= cap) {
+    pos = cap - 1;
+  }
+  out[pos] = 0;
+}
+
+function proc_append(out: cstring, cap: int32, pos: int32, src: cstring) -> int32 {
+  if (out == 0 || src == 0) {
+    return pos;
+  }
+  var i: int32 = 0;
+  while (pos + 1 < cap && (uint8)(src[i]) != (uint8)0) {
+    out[pos] = (uint8)(src[i]);
+    pos = pos + 1;
+    i = i + 1;
+  }
+  return pos;
+}
+
+function proc_append_byte(out: cstring, cap: int32, pos: int32, b: uint8) -> int32 {
+  if (out == 0) {
+    return pos;
+  }
+  if (pos + 1 < cap) {
+    out[pos] = b;
+    pos = pos + 1;
+  }
+  return pos;
+}
+
+export function playtest_poll(sv: PlaytestSupervisor*) {
+  if (sv == 0 || sv->active == 0) {
+    return;
+  }
+  var code: uint32 = 0;
+  // Drain stdout before checking exit so output emitted right before the
+  // process ended isn't lost.
+  proc_drain(&(sv->server), OUT_SRC_SERVER());
+  proc_drain(&(sv->client), OUT_SRC_CLIENT());
+  if (sv->server.running != 0) {
+    if (WaitForSingleObject(sv->server.process_handle, (uint32)0) == (uint32)0) {
+      sv->server.running = 0;
+      GetExitCodeProcess(sv->server.process_handle, &code);
+      proc_drain(&(sv->server), OUT_SRC_SERVER());
+      proc_flush_tail(&(sv->server), OUT_SRC_SERVER());
+      CloseHandle(sv->server.process_handle);
+      CloseHandle(sv->server.thread_handle);
+      output_log_push_src(OUT_INFO(), OUT_SRC_SERVER(), cstr("server exited"));
+    }
+  }
+  if (sv->client.running != 0) {
+    if (WaitForSingleObject(sv->client.process_handle, (uint32)0) == (uint32)0) {
+      sv->client.running = 0;
+      GetExitCodeProcess(sv->client.process_handle, &code);
+      proc_drain(&(sv->client), OUT_SRC_CLIENT());
+      proc_flush_tail(&(sv->client), OUT_SRC_CLIENT());
+      CloseHandle(sv->client.process_handle);
+      CloseHandle(sv->client.thread_handle);
+      output_log_push_src(OUT_INFO(), OUT_SRC_CLIENT(), cstr("client exited"));
+    }
+  }
+  if (sv->server.running == 0 && sv->client.running == 0) {
+    sv->active = 0;
+  }
+}
+
+export function playtest_stop(sv: PlaytestSupervisor*) {
+  if (sv == 0 || sv->active == 0) {
+    return;
+  }
+  if (sv->server.running != 0) {
+    proc_drain(&(sv->server), OUT_SRC_SERVER());
+    TerminateProcess(sv->server.process_handle, (uint32)1);
+    proc_flush_tail(&(sv->server), OUT_SRC_SERVER());
+    CloseHandle(sv->server.process_handle);
+    CloseHandle(sv->server.thread_handle);
+    sv->server.running = 0;
+    output_log_push_src(OUT_INFO(), OUT_SRC_SERVER(), cstr("server stopped"));
+  }
+  if (sv->client.running != 0) {
+    proc_drain(&(sv->client), OUT_SRC_CLIENT());
+    TerminateProcess(sv->client.process_handle, (uint32)1);
+    proc_flush_tail(&(sv->client), OUT_SRC_CLIENT());
+    CloseHandle(sv->client.process_handle);
+    CloseHandle(sv->client.thread_handle);
+    sv->client.running = 0;
+    output_log_push_src(OUT_INFO(), OUT_SRC_CLIENT(), cstr("client stopped"));
+  }
+  sv->active = 0;
+}
