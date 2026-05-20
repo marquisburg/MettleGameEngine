@@ -1,8 +1,8 @@
 // Game / Services explorer + overlay code editor for the editor.
 //
-// Replaces the raw filesystem "Project Files" panel with a Roblox-style game
-// tree: three service containers (ServerScriptService / ReplicatedStorage /
-// StarterPlayerScripts) whose children are ServiceScriptRecords, plus a
+// Replaces the raw filesystem "Project Files" panel with a game-tree panel:
+// three service containers (ServerScripts / SharedScripts / ClientScripts)
+// whose children are ServiceScriptRecords, plus a
 // Workspace node that lists scene entities (read-only here; the inspector
 // owns entity editing). Selecting a script and pressing Enter (or double-
 // clicking) opens a modal overlay code editor that edits the .lua on disk.
@@ -337,17 +337,17 @@ export function gt_push_row(gt: GameTreeState*, kind: int32, service_id: int32, 
 
 export function gt_service_collapsed(gt: GameTreeState*, service_id: int32) -> int32 {
   if (service_id == SVC_WORKSPACE()) { return gt->collapse_ws; }
-  if (service_id == SVC_SERVER_SCRIPT_SERVICE()) { return gt->collapse_sss; }
-  if (service_id == SVC_REPLICATED_STORAGE()) { return gt->collapse_rs; }
-  if (service_id == SVC_STARTER_PLAYER_SCRIPTS()) { return gt->collapse_sps; }
+  if (service_id == SVC_SERVER_SCRIPTS()) { return gt->collapse_sss; }
+  if (service_id == SVC_SHARED_SCRIPTS()) { return gt->collapse_rs; }
+  if (service_id == SVC_CLIENT_SCRIPTS()) { return gt->collapse_sps; }
   return 0;
 }
 
 export function gt_service_toggle(gt: GameTreeState*, service_id: int32) {
   if (service_id == SVC_WORKSPACE()) { gt->collapse_ws = 1 - gt->collapse_ws; return; }
-  if (service_id == SVC_SERVER_SCRIPT_SERVICE()) { gt->collapse_sss = 1 - gt->collapse_sss; return; }
-  if (service_id == SVC_REPLICATED_STORAGE()) { gt->collapse_rs = 1 - gt->collapse_rs; return; }
-  if (service_id == SVC_STARTER_PLAYER_SCRIPTS()) { gt->collapse_sps = 1 - gt->collapse_sps; return; }
+  if (service_id == SVC_SERVER_SCRIPTS()) { gt->collapse_sss = 1 - gt->collapse_sss; return; }
+  if (service_id == SVC_SHARED_SCRIPTS()) { gt->collapse_rs = 1 - gt->collapse_rs; return; }
+  if (service_id == SVC_CLIENT_SCRIPTS()) { gt->collapse_sps = 1 - gt->collapse_sps; return; }
 }
 
 export function gt_emit_service(gt: GameTreeState*, sc: Scene*, service_id: int32, label: cstring) {
@@ -391,9 +391,9 @@ export function game_tree_rebuild_rows(gt: GameTreeState*, sc: Scene*) {
   }
   gt->row_count = 0;
   gt_emit_service(gt, sc, SVC_WORKSPACE(), cstr("Workspace"));
-  gt_emit_service(gt, sc, SVC_SERVER_SCRIPT_SERVICE(), cstr("ServerScriptService"));
-  gt_emit_service(gt, sc, SVC_REPLICATED_STORAGE(), cstr("ReplicatedStorage"));
-  gt_emit_service(gt, sc, SVC_STARTER_PLAYER_SCRIPTS(), cstr("StarterPlayerScripts"));
+  gt_emit_service(gt, sc, SVC_SERVER_SCRIPTS(), cstr("ServerScripts"));
+  gt_emit_service(gt, sc, SVC_SHARED_SCRIPTS(), cstr("SharedScripts"));
+  gt_emit_service(gt, sc, SVC_CLIENT_SCRIPTS(), cstr("ClientScripts"));
   if (gt->selection >= gt->row_count) {
     gt->selection = gt->row_count - 1;
   }
@@ -1790,30 +1790,30 @@ export function game_tree_editor_drag_end(gt: GameTreeState*) {
 }
 
 export function gt_default_template(svc: int32) -> cstring {
-  if (svc == SVC_REPLICATED_STORAGE()) {
+  if (svc == SVC_SHARED_SCRIPTS()) {
     return cstr("local M = {}\n\nfunction M.hello()\n  return \"hi\"\nend\n\nreturn M\n");
   }
   return cstr("local t = 0\n\nfunction on_tick(dt)\n  t = t + dt\nend\n");
 }
 
 export function gt_ext_for_service(svc: int32) -> cstring {
-  if (svc == SVC_SERVER_SCRIPT_SERVICE()) { return cstr(".server.lua"); }
-  if (svc == SVC_STARTER_PLAYER_SCRIPTS()) { return cstr(".client.lua"); }
-  if (svc == SVC_REPLICATED_STORAGE()) { return cstr(".module.lua"); }
+  if (svc == SVC_SERVER_SCRIPTS()) { return cstr(".server.lua"); }
+  if (svc == SVC_CLIENT_SCRIPTS()) { return cstr(".client.lua"); }
+  if (svc == SVC_SHARED_SCRIPTS()) { return cstr(".module.lua"); }
   return cstr(".lua");
 }
 
 export function gt_folder_for_service(svc: int32) -> cstring {
-  if (svc == SVC_SERVER_SCRIPT_SERVICE()) { return cstr("ServerScriptService"); }
-  if (svc == SVC_STARTER_PLAYER_SCRIPTS()) { return cstr("StarterPlayerScripts"); }
-  if (svc == SVC_REPLICATED_STORAGE()) { return cstr("ReplicatedStorage"); }
+  if (svc == SVC_SERVER_SCRIPTS()) { return cstr("ServerScripts"); }
+  if (svc == SVC_CLIENT_SCRIPTS()) { return cstr("ClientScripts"); }
+  if (svc == SVC_SHARED_SCRIPTS()) { return cstr("SharedScripts"); }
   return cstr("");
 }
 
 export function gt_role_for_service(svc: int32) -> int32 {
-  if (svc == SVC_SERVER_SCRIPT_SERVICE()) { return SCRIPT_ROLE_SERVER(); }
-  if (svc == SVC_STARTER_PLAYER_SCRIPTS()) { return SCRIPT_ROLE_LOCAL(); }
-  if (svc == SVC_REPLICATED_STORAGE()) { return SCRIPT_ROLE_MODULE(); }
+  if (svc == SVC_SERVER_SCRIPTS()) { return SCRIPT_ROLE_SERVER(); }
+  if (svc == SVC_CLIENT_SCRIPTS()) { return SCRIPT_ROLE_LOCAL(); }
+  if (svc == SVC_SHARED_SCRIPTS()) { return SCRIPT_ROLE_MODULE(); }
   return SCRIPT_ROLE_SERVER();
 }
 
@@ -1999,7 +1999,7 @@ function GT_MENU_W() -> int32 { return 188; }
 // Workspace entities map to SVC_WORKSPACE.
 export function gt_menu_target_is_scripts(gt: GameTreeState*) -> int32 {
   var s: int32 = gt->menu_target_service;
-  if (s == SVC_SERVER_SCRIPT_SERVICE() || s == SVC_STARTER_PLAYER_SCRIPTS() || s == SVC_REPLICATED_STORAGE()) {
+  if (s == SVC_SERVER_SCRIPTS() || s == SVC_CLIENT_SCRIPTS() || s == SVC_SHARED_SCRIPTS()) {
     return 1;
   }
   return 0;
@@ -2010,7 +2010,7 @@ export function gt_menu_target_is_scripts(gt: GameTreeState*) -> int32 {
 export function gt_menu_item(gt: GameTreeState*, i: int32, out: cstring) -> int32 {
   out[0] = 0;
   if (gt_menu_target_is_scripts(gt) != 0) {
-    // Script services: insert a script (+ ModuleScript for ReplicatedStorage),
+    // Script services: insert a script (+ ModuleScript for SharedScripts),
     // and Open/Delete when the right-click landed on a script row.
     var on_script: int32 = 0;
     if (gt->menu_target_kind == GT_ROW_SCRIPT()) {
@@ -2020,7 +2020,7 @@ export function gt_menu_item(gt: GameTreeState*, i: int32, out: cstring) -> int3
       gt_copy_cstr(out, 64, cstr("Insert Script"));
       return GT_MENU_INSERT_SCRIPT();
     }
-    if (gt->menu_target_service == SVC_REPLICATED_STORAGE()) {
+    if (gt->menu_target_service == SVC_SHARED_SCRIPTS()) {
       if (i == 1) {
         gt_copy_cstr(out, 64, cstr("Insert ModuleScript"));
         return GT_MENU_INSERT_MODULE();
@@ -2120,9 +2120,9 @@ function gt_menu_do_action(gt: GameTreeState*, sc: Scene*, action: int32) -> int
     return gt_add_script(gt, gt->menu_target_service);
   }
   if (action == GT_MENU_INSERT_MODULE()) {
-    // ModuleScript: same flow as a script under ReplicatedStorage; the .module
+    // ModuleScript: same flow as a script under SharedScripts; the .module
     // extension + MODULE role come from gt_add_script's per-service mapping.
-    return gt_add_script(gt, SVC_REPLICATED_STORAGE());
+    return gt_add_script(gt, SVC_SHARED_SCRIPTS());
   }
   if (action == GT_MENU_OPEN()) {
     return gt_open_selected(gt);

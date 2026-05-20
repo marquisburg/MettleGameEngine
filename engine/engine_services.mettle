@@ -1,7 +1,7 @@
-// Service model for Roblox-style playtest architecture.
+// Service model for the playtest architecture.
 //
-// Provides fixed-capacity service containers (Workspace, ServerScriptService,
-// ReplicatedStorage, StarterPlayer, StarterPlayerScripts) and script records
+// Provides fixed-capacity service containers (Workspace, ServerScripts,
+// SharedScripts, StarterPlayer, ClientScripts) and script records
 // with role (ServerScript, LocalScript, ModuleScript). This sits alongside
 // the existing Scene/Entity model.
 //
@@ -15,10 +15,10 @@
 import "std/mem";
 
 export function SVC_WORKSPACE() -> int32 { return 1; }
-export function SVC_SERVER_SCRIPT_SERVICE() -> int32 { return 2; }
-export function SVC_REPLICATED_STORAGE() -> int32 { return 3; }
+export function SVC_SERVER_SCRIPTS() -> int32 { return 2; }
+export function SVC_SHARED_SCRIPTS() -> int32 { return 3; }
 export function SVC_STARTER_PLAYER() -> int32 { return 4; }
-export function SVC_STARTER_PLAYER_SCRIPTS() -> int32 { return 5; }
+export function SVC_CLIENT_SCRIPTS() -> int32 { return 5; }
 
 export function SCRIPT_ROLE_SERVER() -> int32 { return 1; }
 export function SCRIPT_ROLE_LOCAL() -> int32 { return 2; }

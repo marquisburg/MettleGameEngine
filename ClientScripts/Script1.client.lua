@@ -75,7 +75,7 @@ function on_tick(dt)
   if hU then mvy = mvy + 1.0 end
   if hD then mvy = mvy - 1.0 end
 
-  -- StarterPlayerScripts run with no owner entity (self_id == 0 until the
+  -- ClientScripts run with no owner entity (self_id == 0 until the
   -- player-entity binding gap lands), so engine.translate / engine.get_pos
   -- silently no-op. Drive the camera position directly instead.
   if mvx ~= 0.0 or mvy ~= 0.0 or mvz ~= 0.0 then

@@ -1017,7 +1017,7 @@ export function lua_registry_tick_scene(reg: LuaScriptRegistry*, scene: Scene*, 
 }
 
 // Service-script tick path. Unlike lua_registry_tick_scene this walks the
-// ServiceModel, not the Scene: ServerScriptService / StarterPlayerScripts
+// ServiceModel, not the Scene: ServerScripts / ClientScripts
 // scripts are not attached to a Workspace entity. For each record whose role
 // matches `role` we find the slot keyed by (rec->id, rec->path) — exactly the
 // key lua_vm_load_service_scripts used in lua_registry_attach — and run its

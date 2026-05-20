@@ -406,7 +406,7 @@ export function main() -> int32 {
     net_cleanup();
     return 11;
   }
-  // Load services snapshot (StarterPlayerScripts -> LOCAL, ReplicatedStorage
+  // Load services snapshot (ClientScripts -> LOCAL, SharedScripts
   // -> MODULE). Same file the editor wrote and the server loaded; on local
   // playtest both processes read the same .mettleplay/services.msvc.
   var csvc_path: cstring = play_manifest_services_snapshot(mani);
@@ -427,8 +427,8 @@ export function main() -> int32 {
     return 7;
   }
 
-  lua_vm_load_service_scripts(lua_vm, SVC_STARTER_PLAYER_SCRIPTS(), SCRIPT_ROLE_LOCAL());
-  lua_vm_load_service_scripts(lua_vm, SVC_REPLICATED_STORAGE(), SCRIPT_ROLE_MODULE());
+  lua_vm_load_service_scripts(lua_vm, SVC_CLIENT_SCRIPTS(), SCRIPT_ROLE_LOCAL());
+  lua_vm_load_service_scripts(lua_vm, SVC_SHARED_SCRIPTS(), SCRIPT_ROLE_MODULE());
 
   // Create window using existing game_gdi_win32
   var g: GameWin32* = game_win32_create(cstr("Playtest Client"), 1280, 720);

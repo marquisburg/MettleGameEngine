@@ -7,8 +7,8 @@
 // - Load authoritative Scene from snapshot
 // - Load ServiceModel from services_snapshot
 // - Create server-side LuaScriptVm (role-aware)
-// - Register ServerScriptService scripts + migrated entity scripts as SERVER role
-// - Register ReplicatedStorage ModuleScripts for server cache
+// - Register ServerScripts scripts + migrated entity scripts as SERVER role
+// - Register SharedScripts ModuleScripts for server cache
 // - Bind localhost TCP, accept one client
 // - Send full snapshot (WELCOME + SCENE_BEGIN + ENTITY lines + SCRIPT lines + SCENE_END)
 // - Fixed tick loop at tick_hz:
@@ -258,7 +258,7 @@ export function main() -> int32 {
 
   // Migration: turn entity lua_script into transient server script records.
   // This is additive on top of services.msvc so per-entity scripts assigned
-  // via the editor's Ctrl+L still run alongside ServerScriptService scripts.
+  // via the editor's Ctrl+L still run alongside ServerScripts scripts.
   var n: int32 = scene_count(sc);
   var i: int32 = 0;
   while (i < n) {
@@ -288,8 +288,8 @@ export function main() -> int32 {
   lua_vm->input = server_input;
 
   // Register server-side scripts from ServiceModel
-  lua_vm_load_service_scripts(lua_vm, SVC_SERVER_SCRIPT_SERVICE(), SCRIPT_ROLE_SERVER());
-  lua_vm_load_service_scripts(lua_vm, SVC_REPLICATED_STORAGE(), SCRIPT_ROLE_MODULE());
+  lua_vm_load_service_scripts(lua_vm, SVC_SERVER_SCRIPTS(), SCRIPT_ROLE_SERVER());
+  lua_vm_load_service_scripts(lua_vm, SVC_SHARED_SCRIPTS(), SCRIPT_ROLE_MODULE());
 
   server_trace(cstr("server Lua VM initialized"));
 

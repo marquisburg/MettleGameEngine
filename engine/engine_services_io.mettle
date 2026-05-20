@@ -15,7 +15,7 @@
 //
 // The editor writes services.msvc next to scene.mscene in
 // editor_start_playtest. The playtest server and client both load it so the
-// on-disk ServerScriptService / StarterPlayerScripts / ReplicatedStorage
+// on-disk ServerScripts / ClientScripts / SharedScripts
 // scripts are actually registered (previously they were dead code).
 import "engine_fs_win32";
 import "engine_services";
@@ -253,18 +253,18 @@ export function svio_scan_folder(sm: ServiceModel*, project_root: cstring, folde
 // root, then write services.msvc so the playtest server/client load the same
 // records. `sm` is cleared first. Returns total scripts written.
 //
-//   <project>/ServerScriptService/*.server.lua  -> SERVER
-//   <project>/StarterPlayerScripts/*.client.lua -> LOCAL
-//   <project>/ReplicatedStorage/*.module.lua    -> MODULE
+//   <project>/ServerScripts/*.server.lua  -> SERVER
+//   <project>/ClientScripts/*.client.lua  -> LOCAL
+//   <project>/SharedScripts/*.module.lua  -> MODULE
 export function service_io_build_from_project(sm: ServiceModel*, project_root: cstring, out_path: cstring) -> int32 {
   if (sm == 0 || project_root == 0) {
     return 0;
   }
   service_model_clear(sm);
   var total: int32 = 0;
-  total = total + svio_scan_folder(sm, project_root, "ServerScriptService", ".server.lua", SVC_SERVER_SCRIPT_SERVICE(), SCRIPT_ROLE_SERVER());
-  total = total + svio_scan_folder(sm, project_root, "StarterPlayerScripts", ".client.lua", SVC_STARTER_PLAYER_SCRIPTS(), SCRIPT_ROLE_LOCAL());
-  total = total + svio_scan_folder(sm, project_root, "ReplicatedStorage", ".module.lua", SVC_REPLICATED_STORAGE(), SCRIPT_ROLE_MODULE());
+  total = total + svio_scan_folder(sm, project_root, "ServerScripts", ".server.lua", SVC_SERVER_SCRIPTS(), SCRIPT_ROLE_SERVER());
+  total = total + svio_scan_folder(sm, project_root, "ClientScripts", ".client.lua", SVC_CLIENT_SCRIPTS(), SCRIPT_ROLE_LOCAL());
+  total = total + svio_scan_folder(sm, project_root, "SharedScripts", ".module.lua", SVC_SHARED_SCRIPTS(), SCRIPT_ROLE_MODULE());
   if (out_path != 0 && (uint8)(out_path[0]) != (uint8)0) {
     service_io_save(out_path, sm);
   }
