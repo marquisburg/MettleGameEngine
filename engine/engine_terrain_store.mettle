@@ -1,0 +1,596 @@
+// Heightmap storage for terrain entities (binary .mthmap + editor sculpting).
+// Per-entity grid of local Y offsets (metres), bilinear-sampled over [-hx,hx]×[-hz,hz].
+import "std/mem";
+
+extern function sqrtf64(x: float64) -> float64 = "sqrt";
+
+export function TERRAIN_OP_RAISE() -> int32 {
+  return 0;
+}
+
+export function TERRAIN_OP_LOWER() -> int32 {
+  return 1;
+}
+
+export function TERRAIN_OP_SMOOTH() -> int32 {
+  return 2;
+}
+
+export function TERRAIN_OP_FLATTEN() -> int32 {
+  return 3;
+}
+
+export struct TerrainPatch {
+  heights: float32*;
+  id: int32;
+  nx: int32;
+  nz: int32;
+  dirty: int32;
+}
+
+export struct TerrainStore {
+  patches: TerrainPatch*;
+  cap: int32;
+  count: int32;
+  _pad: int32;
+}
+
+function tsp_bytes() -> int64 {
+  return (int64)32;
+}
+
+function tspatch_bytes() -> int64 {
+  return (int64)32;
+}
+
+export function terrain_store_create(cap: int32) -> TerrainStore* {
+  if (cap <= 0) {
+    cap = 32;
+  }
+  if (cap > 512) {
+    cap = 512;
+  }
+  var raw: cstring = calloc((int64)1, tsp_bytes());
+  if (raw == 0) {
+    return 0;
+  }
+  var ts: TerrainStore* = (TerrainStore*)raw;
+  var blob: cstring = calloc(tspatch_bytes(), (int64)cap);
+  if (blob == 0) {
+    free(raw);
+    return 0;
+  }
+  ts->patches = (TerrainPatch*)blob;
+  ts->cap = cap;
+  ts->count = 0;
+  return ts;
+}
+
+function terrain_store_free_patch(p: TerrainPatch*) {
+  if (p == 0) {
+    return;
+  }
+  if (p->heights != 0) {
+    free((cstring)p->heights);
+    p->heights = 0;
+  }
+  p->id = 0;
+  p->nx = 0;
+  p->nz = 0;
+  p->dirty = 0;
+}
+
+export function terrain_store_destroy(ts: TerrainStore*) {
+  if (ts == 0) {
+    return;
+  }
+  var i: int32 = 0;
+  while (i < ts->count) {
+    terrain_store_free_patch((TerrainPatch*)((cstring)((int64)ts->patches + (int64)i * tspatch_bytes())));
+    i = i + 1;
+  }
+  if (ts->patches != 0) {
+    free((cstring)ts->patches);
+    ts->patches = 0;
+  }
+  free((cstring)ts);
+}
+
+export function terrain_store_clear(ts: TerrainStore*) {
+  if (ts == 0) {
+    return;
+  }
+  var i: int32 = 0;
+  while (i < ts->count) {
+    terrain_store_free_patch((TerrainPatch*)((cstring)((int64)ts->patches + (int64)i * tspatch_bytes())));
+    i = i + 1;
+  }
+  ts->count = 0;
+}
+
+function terrain_store_find_index(ts: TerrainStore*, id: int32) -> int32 {
+  if (ts == 0) {
+    return -1;
+  }
+  var i: int32 = 0;
+  while (i < ts->count) {
+    var p: TerrainPatch* = (TerrainPatch*)((cstring)((int64)ts->patches + (int64)i * tspatch_bytes()));
+    if (p != 0 && p->id == id) {
+      return i;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+function terrain_store_patch_at(ts: TerrainStore*, idx: int32) -> TerrainPatch* {
+  if (ts == 0 || idx < 0 || idx >= ts->count) {
+    return (TerrainPatch*)0;
+  }
+  return (TerrainPatch*)((cstring)((int64)ts->patches + (int64)idx * tspatch_bytes()));
+}
+
+// Slot for index in [0, cap) — use ts->count when appending a new patch (patch_at requires idx < count).
+function terrain_store_patch_slot(ts: TerrainStore*, idx: int32) -> TerrainPatch* {
+  if (ts == 0 || idx < 0 || idx >= ts->cap) {
+    return (TerrainPatch*)0;
+  }
+  return (TerrainPatch*)((cstring)((int64)ts->patches + (int64)idx * tspatch_bytes()));
+}
+
+export function terrain_store_has(ts: TerrainStore*, id: int32) -> int32 {
+  if (terrain_store_find_index(ts, id) >= 0) {
+    return 1;
+  }
+  return 0;
+}
+
+export function terrain_store_remove(ts: TerrainStore*, id: int32) {
+  if (ts == 0) {
+    return;
+  }
+  var idx: int32 = terrain_store_find_index(ts, id);
+  if (idx < 0) {
+    return;
+  }
+  var last: int32 = ts->count - 1;
+  terrain_store_free_patch(terrain_store_patch_at(ts, idx));
+  if (idx != last) {
+    var dst: TerrainPatch* = terrain_store_patch_at(ts, idx);
+    var src: TerrainPatch* = terrain_store_patch_at(ts, last);
+    if (dst != 0 && src != 0) {
+      memcpy((cstring)dst, (cstring)src, tspatch_bytes());
+    }
+  }
+  ts->count = ts->count - 1;
+}
+
+export function terrain_store_patch_nx(ts: TerrainStore*, id: int32) -> int32 {
+  var idx: int32 = terrain_store_find_index(ts, id);
+  if (idx < 0) {
+    return 0;
+  }
+  var p: TerrainPatch* = terrain_store_patch_at(ts, idx);
+  if (p == 0) {
+    return 0;
+  }
+  return p->nx;
+}
+
+export function terrain_store_patch_nz(ts: TerrainStore*, id: int32) -> int32 {
+  var idx: int32 = terrain_store_find_index(ts, id);
+  if (idx < 0) {
+    return 0;
+  }
+  var p: TerrainPatch* = terrain_store_patch_at(ts, idx);
+  if (p == 0) {
+    return 0;
+  }
+  return p->nz;
+}
+
+// Allocate or replace grid; heights initialized to zero.
+export function terrain_store_create_grid(ts: TerrainStore*, id: int32, nx: int32, nz: int32) -> int32 {
+  if (ts == 0 || id <= 0) {
+    return 0;
+  }
+  if (nx < 2) {
+    nx = 2;
+  }
+  if (nz < 2) {
+    nz = 2;
+  }
+  if (nx > 512 || nz > 512) {
+    return 0;
+  }
+  terrain_store_remove(ts, id);
+  if (ts->count >= ts->cap) {
+    return 0;
+  }
+  var p: TerrainPatch* = terrain_store_patch_slot(ts, ts->count);
+  if (p == 0) {
+    return 0;
+  }
+  var ncell: int64 = (int64)nx * (int64)nz;
+  var hb: cstring = malloc(ncell * (int64)4);
+  if (hb == 0) {
+    return 0;
+  }
+  memset(hb, 0, ncell * (int64)4);
+  p->heights = (float32*)hb;
+  p->id = id;
+  p->nx = nx;
+  p->nz = nz;
+  p->dirty = 1;
+  ts->count = ts->count + 1;
+  return 1;
+}
+
+function terrain_store_clamp01(t: float64) -> float64 {
+  if (t < 0.0) {
+    return 0.0;
+  }
+  if (t > 1.0) {
+    return 1.0;
+  }
+  return t;
+}
+
+function terrain_store_height_at(p: TerrainPatch*, ix: int32, iz: int32) -> float64 {
+  if (p == 0 || p->heights == 0) {
+    return 0.0;
+  }
+  if (ix < 0) {
+    ix = 0;
+  }
+  if (iz < 0) {
+    iz = 0;
+  }
+  if (ix >= p->nx) {
+    ix = p->nx - 1;
+  }
+  if (iz >= p->nz) {
+    iz = p->nz - 1;
+  }
+  var idx: int64 = (int64)iz * (int64)p->nx + (int64)ix;
+  return (float64)p->heights[idx];
+}
+
+function terrain_store_set_height(p: TerrainPatch*, ix: int32, iz: int32, v: float64) {
+  if (p == 0 || p->heights == 0) {
+    return;
+  }
+  if (ix < 0 || iz < 0 || ix >= p->nx || iz >= p->nz) {
+    return;
+  }
+  var idx: int64 = (int64)iz * (int64)p->nx + (int64)ix;
+  p->heights[idx] = (float32)v;
+}
+
+export function terrain_store_sample(ts: TerrainStore*, id: int32, lx: float64, lz: float64, hx: float64, hz: float64) -> float64 {
+  var idx: int32 = terrain_store_find_index(ts, id);
+  if (idx < 0) {
+    return 0.0;
+  }
+  var p: TerrainPatch* = terrain_store_patch_at(ts, idx);
+  if (p == 0 || p->heights == 0 || p->nx < 2 || p->nz < 2) {
+    return 0.0;
+  }
+  if (hx < 0.000001) {
+    hx = 0.000001;
+  }
+  if (hz < 0.000001) {
+    hz = 0.000001;
+  }
+  var ux: float64 = (lx + hx) / (2.0 * hx);
+  var uz: float64 = (lz + hz) / (2.0 * hz);
+  ux = terrain_store_clamp01(ux);
+  uz = terrain_store_clamp01(uz);
+  var fx: float64 = ux * (float64)(p->nx - 1);
+  var fz: float64 = uz * (float64)(p->nz - 1);
+  var ix0: int32 = (int32)fx;
+  var iz0: int32 = (int32)fz;
+  if (ix0 < 0) {
+    ix0 = 0;
+  }
+  if (iz0 < 0) {
+    iz0 = 0;
+  }
+  if (ix0 >= p->nx) {
+    ix0 = p->nx - 1;
+  }
+  if (iz0 >= p->nz) {
+    iz0 = p->nz - 1;
+  }
+  var ix1: int32 = ix0 + 1;
+  var iz1: int32 = iz0 + 1;
+  if (ix1 >= p->nx) {
+    ix1 = p->nx - 1;
+  }
+  if (iz1 >= p->nz) {
+    iz1 = p->nz - 1;
+  }
+  var tx: float64 = fx - (float64)ix0;
+  var tz: float64 = fz - (float64)iz0;
+  var h00: float64 = terrain_store_height_at(p, ix0, iz0);
+  var h10: float64 = terrain_store_height_at(p, ix1, iz0);
+  var h01: float64 = terrain_store_height_at(p, ix0, iz1);
+  var h11: float64 = terrain_store_height_at(p, ix1, iz1);
+  var h0: float64 = h00 * (1.0 - tx) + h10 * tx;
+  var h1: float64 = h01 * (1.0 - tx) + h11 * tx;
+  return h0 * (1.0 - tz) + h1 * tz;
+}
+
+export function terrain_store_mark_dirty(ts: TerrainStore*, id: int32, dirty: int32) {
+  var idx: int32 = terrain_store_find_index(ts, id);
+  if (idx < 0) {
+    return;
+  }
+  var p: TerrainPatch* = terrain_store_patch_at(ts, idx);
+  if (p == 0) {
+    return;
+  }
+  p->dirty = dirty;
+}
+
+export function terrain_store_is_dirty(ts: TerrainStore*, id: int32) -> int32 {
+  var idx: int32 = terrain_store_find_index(ts, id);
+  if (idx < 0) {
+    return 0;
+  }
+  var p: TerrainPatch* = terrain_store_patch_at(ts, idx);
+  if (p == 0) {
+    return 0;
+  }
+  return p->dirty;
+}
+
+export function terrain_store_load_file(ts: TerrainStore*, id: int32, abs_path: cstring) -> int32 {
+  if (ts == 0 || id <= 0 || abs_path == 0) {
+    return 0;
+  }
+  if ((uint8)(abs_path[0]) == (uint8)0) {
+    return 0;
+  }
+  var fp: cstring = fopen(abs_path, cstr("rb"));
+  if (fp == 0) {
+    return 0;
+  }
+  var hdr: uint8[16];
+  var n: int64 = fread((cstring)((int64)(&(hdr[0]))), (int64)1, (int64)16, fp);
+  if (n < 16) {
+    fclose(fp);
+    return 0;
+  }
+  if (hdr[0] != (uint8)77 || hdr[1] != (uint8)84 || hdr[2] != (uint8)72 || hdr[3] != (uint8)72) {
+    fclose(fp);
+    return 0;
+  }
+  var ver: uint32 = (uint32)hdr[4] | ((uint32)hdr[5] << 8) | ((uint32)hdr[6] << 16) | ((uint32)hdr[7] << 24);
+  if (ver != (uint32)1) {
+    fclose(fp);
+    return 0;
+  }
+  var nx: int32 = (int32)((uint32)hdr[8] | ((uint32)hdr[9] << 8) | ((uint32)hdr[10] << 16) | ((uint32)hdr[11] << 24));
+  var nz: int32 = (int32)((uint32)hdr[12] | ((uint32)hdr[13] << 8) | ((uint32)hdr[14] << 16) | ((uint32)hdr[15] << 24));
+  if (nx < 2 || nz < 2 || nx > 512 || nz > 512) {
+    fclose(fp);
+    return 0;
+  }
+  var ncell: int64 = (int64)nx * (int64)nz;
+  var expect: int64 = ncell * (int64)4;
+  terrain_store_remove(ts, id);
+  if (ts->count >= ts->cap) {
+    fclose(fp);
+    return 0;
+  }
+  var hb: cstring = malloc(ncell * (int64)4);
+  if (hb == 0) {
+    fclose(fp);
+    return 0;
+  }
+  var nr: int64 = fread(hb, (int64)1, expect, fp);
+  fclose(fp);
+  if (nr != expect) {
+    free(hb);
+    return 0;
+  }
+  var p: TerrainPatch* = terrain_store_patch_slot(ts, ts->count);
+  if (p == 0) {
+    free(hb);
+    return 0;
+  }
+  p->heights = (float32*)hb;
+  p->id = id;
+  p->nx = nx;
+  p->nz = nz;
+  p->dirty = 0;
+  ts->count = ts->count + 1;
+  return 1;
+}
+
+function terrain_store_write_header_u32(dst: uint8*, off: int32, v: uint32) {
+  dst[off + 0] = (uint8)(v & (uint32)255);
+  dst[off + 1] = (uint8)((v >> 8) & (uint32)255);
+  dst[off + 2] = (uint8)((v >> 16) & (uint32)255);
+  dst[off + 3] = (uint8)((v >> 24) & (uint32)255);
+}
+
+export function terrain_store_save_file(ts: TerrainStore*, id: int32, abs_path: cstring) -> int32 {
+  if (ts == 0 || id <= 0 || abs_path == 0) {
+    return 0;
+  }
+  if ((uint8)(abs_path[0]) == (uint8)0) {
+    return 0;
+  }
+  var idx: int32 = terrain_store_find_index(ts, id);
+  if (idx < 0) {
+    return 0;
+  }
+  var p: TerrainPatch* = terrain_store_patch_at(ts, idx);
+  if (p == 0 || p->heights == 0) {
+    return 0;
+  }
+  var hdr: uint8[16];
+  hdr[0] = (uint8)77;
+  hdr[1] = (uint8)84;
+  hdr[2] = (uint8)72;
+  hdr[3] = (uint8)72;
+  terrain_store_write_header_u32((uint8*)((int64)(&(hdr[0]))), 4, (uint32)1);
+  terrain_store_write_header_u32((uint8*)((int64)(&(hdr[0]))), 8, (uint32)p->nx);
+  terrain_store_write_header_u32((uint8*)((int64)(&(hdr[0]))), 12, (uint32)p->nz);
+  var fp: cstring = fopen(abs_path, cstr("wb"));
+  if (fp == 0) {
+    return 0;
+  }
+  fwrite((cstring)((int64)(&(hdr[0]))), (int64)1, (int64)16, fp);
+  var ncell: int64 = (int64)p->nx * (int64)p->nz;
+  fwrite((cstring)p->heights, (int64)1, ncell * (int64)4, fp);
+  fclose(fp);
+  p->dirty = 0;
+  return 1;
+}
+
+export function terrain_store_copy_from(dst: TerrainStore*, src: TerrainStore*) {
+  if (dst == 0) {
+    return;
+  }
+  terrain_store_clear(dst);
+  if (src == 0) {
+    return;
+  }
+  var si: int32 = 0;
+  while (si < src->count) {
+    var sp: TerrainPatch* = terrain_store_patch_at(src, si);
+    if (sp != 0 && sp->heights != 0 && sp->nx >= 2 && sp->nz >= 2 && dst->count < dst->cap) {
+      var ncell: int64 = (int64)sp->nx * (int64)sp->nz;
+      var hb: cstring = malloc(ncell * (int64)4);
+      if (hb != 0) {
+        memcpy(hb, (cstring)sp->heights, ncell * (int64)4);
+        var dp: TerrainPatch* = terrain_store_patch_slot(dst, dst->count);
+        if (dp != 0) {
+          dp->heights = (float32*)hb;
+          dp->id = sp->id;
+          dp->nx = sp->nx;
+          dp->nz = sp->nz;
+          dp->dirty = sp->dirty;
+          dst->count = dst->count + 1;
+        } else {
+          free(hb);
+        }
+      }
+    }
+    si = si + 1;
+  }
+}
+
+function terrain_store_lx_at(p: TerrainPatch*, ix: int32, hx: float64) -> float64 {
+  if (p->nx <= 1) {
+    return 0.0;
+  }
+  return 0.0 - hx + (2.0 * hx) * (float64)ix / (float64)(p->nx - 1);
+}
+
+function terrain_store_lz_at(p: TerrainPatch*, iz: int32, hz: float64) -> float64 {
+  if (p->nz <= 1) {
+    return 0.0;
+  }
+  return 0.0 - hz + (2.0 * hz) * (float64)iz / (float64)(p->nz - 1);
+}
+
+export function terrain_store_brush_stamp(ts: TerrainStore*, id: int32, cx: float64, cz: float64, radius: float64, strength: float64, op: int32, hx: float64, hz: float64, invert: int32) -> int32 {
+  if (ts == 0 || id <= 0 || radius <= 0.0) {
+    return 0;
+  }
+  var idx: int32 = terrain_store_find_index(ts, id);
+  if (idx < 0) {
+    return 0;
+  }
+  var p: TerrainPatch* = terrain_store_patch_at(ts, idx);
+  if (p == 0 || p->heights == 0) {
+    return 0;
+  }
+  if (hx < 0.000001) {
+    hx = 0.000001;
+  }
+  if (hz < 0.000001) {
+    hz = 0.000001;
+  }
+  var target_flat: float64 = terrain_store_sample(ts, id, cx, cz, hx, hz);
+  var touched: int32 = 0;
+  var iz: int32 = 0;
+  while (iz < p->nz) {
+    var ix: int32 = 0;
+    while (ix < p->nx) {
+      var lx: float64 = terrain_store_lx_at(p, ix, hx);
+      var lz: float64 = terrain_store_lz_at(p, iz, hz);
+      var dx: float64 = lx - cx;
+      var dz: float64 = lz - cz;
+      var dist: float64 = sqrtf64(dx * dx + dz * dz);
+      if (dist < radius) {
+        touched = touched + 1;
+        var t: float64 = 1.0 - dist / radius;
+        var fall: float64 = t * t;
+        var delta: float64 = strength * fall;
+        var ih: int32 = op;
+        if (invert != 0 && ih == TERRAIN_OP_RAISE()) {
+          ih = TERRAIN_OP_LOWER();
+        } else {
+          if (invert != 0 && ih == TERRAIN_OP_LOWER()) {
+            ih = TERRAIN_OP_RAISE();
+          }
+        }
+        var cur: float64 = terrain_store_height_at(p, ix, iz);
+        if (ih == TERRAIN_OP_RAISE()) {
+          terrain_store_set_height(p, ix, iz, cur + delta);
+        } else {
+          if (ih == TERRAIN_OP_LOWER()) {
+            terrain_store_set_height(p, ix, iz, cur - delta);
+          } else {
+            if (ih == TERRAIN_OP_FLATTEN()) {
+              terrain_store_set_height(p, ix, iz, cur + (target_flat - cur) * fall * 0.25);
+            } else {
+              var acc: float64 = cur;
+              var cnt: int32 = 1;
+              if (ix + 1 < p->nx) {
+                acc = acc + terrain_store_height_at(p, ix + 1, iz);
+                cnt = cnt + 1;
+              }
+              if (ix - 1 >= 0) {
+                acc = acc + terrain_store_height_at(p, ix - 1, iz);
+                cnt = cnt + 1;
+              }
+              if (iz + 1 < p->nz) {
+                acc = acc + terrain_store_height_at(p, ix, iz + 1);
+                cnt = cnt + 1;
+              }
+              if (iz - 1 >= 0) {
+                acc = acc + terrain_store_height_at(p, ix, iz - 1);
+                cnt = cnt + 1;
+              }
+              var avg: float64 = acc / (float64)cnt;
+              terrain_store_set_height(p, ix, iz, cur + (avg - cur) * fall * 0.5);
+            }
+          }
+        }
+        p->dirty = 1;
+      }
+      ix = ix + 1;
+    }
+    iz = iz + 1;
+  }
+  return touched;
+}
+
+export function terrain_store_set_cell(ts: TerrainStore*, id: int32, ix: int32, iz: int32, v: float64) {
+  var idx: int32 = terrain_store_find_index(ts, id);
+  if (idx < 0) {
+    return;
+  }
+  var p: TerrainPatch* = terrain_store_patch_at(ts, idx);
+  if (p == 0 || p->heights == 0) {
+    return;
+  }
+  terrain_store_set_height(p, ix, iz, v);
+  p->dirty = 1;
+}

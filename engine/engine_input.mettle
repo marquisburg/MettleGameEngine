@@ -14,9 +14,33 @@ export function IA_COUNT() -> int32 { return 16; }
 
 export struct InputMap {
   action_vk: int32[16];
+  mouse_dx: int32;
+  mouse_dy: int32;
   held: uint8[16];
   pressed: uint8[16];
   released: uint8[16];
+}
+
+// Mouse-look delta (screen px) for the current client frame. The client
+// measures relative mouse motion and stashes it here; LocalScripts read it
+// via engine.mouse_delta(). Lives on InputMap (pointer-passed) rather than a
+// module global so it crosses the module boundary cleanly.
+export function input_map_set_mouse_delta(im: InputMap*, dx: int32, dy: int32) {
+  if (im == 0) {
+    return;
+  }
+  im->mouse_dx = dx;
+  im->mouse_dy = dy;
+}
+
+export function input_map_mouse_dx(im: InputMap*) -> int32 {
+  if (im == 0) { return 0; }
+  return im->mouse_dx;
+}
+
+export function input_map_mouse_dy(im: InputMap*) -> int32 {
+  if (im == 0) { return 0; }
+  return im->mouse_dy;
 }
 
 function input_map_bytes() -> int64 {
@@ -79,6 +103,24 @@ export function input_map_update(im: InputMap*, g: GameWin32*) {
     }
     i = i + 1;
   }
+}
+
+// Zero all action state. Used by the playtest client when its window loses
+// focus so a backgrounded window can't latch phantom "held" actions from
+// stale async key state (playtest_gaps 1.2).
+export function input_map_clear(im: InputMap*) {
+  if (im == 0) {
+    return;
+  }
+  var i: int32 = 0;
+  while (i < IA_COUNT()) {
+    im->held[i] = (uint8)0;
+    im->pressed[i] = (uint8)0;
+    im->released[i] = (uint8)0;
+    i = i + 1;
+  }
+  im->mouse_dx = 0;
+  im->mouse_dy = 0;
 }
 
 export function input_action_held(im: InputMap*, action: int32) -> int32 {

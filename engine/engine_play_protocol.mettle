@@ -28,7 +28,7 @@
 import "std/conv";
 import "std/mem";
 
-export function PLAY_PROTOCOL_VERSION() -> int32 { return 1; }
+export function PLAY_PROTOCOL_VERSION() -> int32 { return 2; }
 
 export function PLAY_SIDE_SERVER() -> int32 { return 1; }
 export function PLAY_SIDE_CLIENT() -> int32 { return 2; }
@@ -59,6 +59,10 @@ export struct PlayPacket {
   i9: int32;
   i10: int32;
   i11: int32;
+  i12: int32;
+  i13: int32;
+  i14: int32;
+  i15: int32;
   s0: uint8[520];
   s1: uint8[128];
 }
@@ -80,6 +84,10 @@ export function play_packet_reset(p: PlayPacket*) {
   p->i9 = 0;
   p->i10 = 0;
   p->i11 = 0;
+  p->i12 = 0;
+  p->i13 = 0;
+  p->i14 = 0;
+  p->i15 = 0;
   p->s0[0] = 0;
   p->s1[0] = 0;
 }
@@ -220,7 +228,7 @@ export function play_encode_scene_end(buf: cstring, cap: int32) -> int32 {
   return i;
 }
 
-export function play_encode_entity(buf: cstring, cap: int32, id: int32, kind: int32, parent: int32, pos_x_mm: int32, pos_y_mm: int32, pos_z_mm: int32, rot_x_e6: int32, rot_y_e6: int32, rot_z_e6: int32, rot_w_e6: int32, scale_e6: int32, mesh_path: cstring, name: cstring) -> int32 {
+export function play_encode_entity(buf: cstring, cap: int32, id: int32, kind: int32, parent: int32, pos_x_mm: int32, pos_y_mm: int32, pos_z_mm: int32, rot_x_e6: int32, rot_y_e6: int32, rot_z_e6: int32, rot_w_e6: int32, scale_e6: int32, size_x_e6: int32, size_y_e6: int32, size_z_e6: int32, flags: int32, material_id: int32, mesh_path: cstring, name: cstring) -> int32 {
   if (buf == 0 || cap <= 0) {
     return -1;
   }
@@ -243,6 +251,11 @@ export function play_encode_entity(buf: cstring, cap: int32, id: int32, kind: in
   pos = play_write_i32(buf, cap, pos, rot_z_e6);
   pos = play_write_i32(buf, cap, pos, rot_w_e6);
   pos = play_write_i32(buf, cap, pos, scale_e6);
+  pos = play_write_i32(buf, cap, pos, size_x_e6);
+  pos = play_write_i32(buf, cap, pos, size_y_e6);
+  pos = play_write_i32(buf, cap, pos, size_z_e6);
+  pos = play_write_i32(buf, cap, pos, flags);
+  pos = play_write_i32(buf, cap, pos, material_id);
   pos = play_write_len_str(buf, cap, pos, mesh_path, 519);
   pos = play_write_len_str(buf, cap, pos, name, 127);
   if (pos + 1 >= cap) {
@@ -418,6 +431,16 @@ export function play_decode_line(line: cstring, pkt: PlayPacket*) -> int32 {
     pkt->i9 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
     p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
     pkt->i10 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i11 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i12 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i13 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i14 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
+    p = play_proto_next_token(line, p, (cstring)((int64)(&(tok[0]))), 64);
+    pkt->i15 = (int32)play_proto_atol((cstring)((int64)(&(tok[0]))));
     p = play_proto_read_len_str(line, p, (cstring)((int64)(&(pkt->s0[0]))), 520);
     p = play_proto_read_len_str(line, p, (cstring)((int64)(&(pkt->s1[0]))), 128);
     return pkt->type;

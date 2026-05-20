@@ -1,0 +1,61 @@
+// Probe for compiler changes 1 (multi-line statements), 2 (diagnostics),
+// 3 (struct byte-budget guard). This file is intentionally written in the
+// styles that used to be E0002 parse errors.
+import "std/io";
+
+struct Probe {
+  a: float64;
+  b: float64;
+  c: int32;
+  d: int32;
+}
+
+// (1a) multi-line boolean condition inside an unclosed paren.
+function probe_cond(x: int32, y: int32, z: int32) -> int32 {
+  if (x > 0 && y > 0
+      && z > 0
+      && x + y + z < 100) {
+    return 1;
+  }
+  return 0;
+}
+
+// (1b) multi-line call argument list.
+function probe_call(p: Probe*) -> float64 {
+  if (p == 0) {
+    return 0.0;
+  }
+  return probe_sum(p->a,
+                   p->b,
+                   (float64)p->c);
+}
+
+function probe_sum(a: float64, b: float64, c: float64) -> float64 {
+  return a + b + c;
+}
+
+// (1c) `} else if {` on its own / split lines, and `else` after a newline.
+function probe_else(n: int32) -> int32 {
+  if (n == 0) {
+    return 10;
+  }
+  else if (n == 1) {
+    return 20;
+  }
+  else {
+    return 30;
+  }
+}
+
+function main() -> int32 {
+  var pr: Probe;
+  pr.a = 1.0;
+  pr.b = 2.0;
+  pr.c = 3;
+  pr.d = 0;
+  var s: float64 = probe_call(&pr);
+  var ok: int32 = probe_cond(1, 2, 3) + probe_else(1);
+  print_int((int64)s);
+  print_int((int64)ok);
+  return 0;
+}

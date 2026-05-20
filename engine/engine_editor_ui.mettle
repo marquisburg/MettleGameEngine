@@ -9,18 +9,52 @@ import "std/conv";
 import "engine_assets";
 import "engine_explorer";
 import "engine_fs_win32";
+import "engine_game_tree";
 import "engine_lua";
 import "engine_mesh";
 import "engine_output_log";
 import "engine_project";
 import "engine_scene";
 import "engine_scene_io";
+import "engine_terrain_store";
 import "engine_viewport";
 import "game_gdi_win32";
 import "std/io";
 import "std/mem";
 
+extern function Win32_CreateDirectoryA(path: cstring, security_attributes: cstring) -> int32 = "CreateDirectoryA";
+
+export struct EditorOpenFileNameA {
+  l_struct_size: uint32;
+  _pad0: uint32;
+  hwnd_owner: int64;
+  hinstance: int64;
+  lpstr_filter: cstring;
+  lpstr_custom_filter: cstring;
+  n_max_cust_filter: uint32;
+  n_filter_index: uint32;
+  lpstr_file: cstring;
+  n_max_file: uint32;
+  _pad1: uint32;
+  lpstr_file_title: cstring;
+  n_max_file_title: uint32;
+  _pad2: uint32;
+  lpstr_initial_dir: cstring;
+  lpstr_title: cstring;
+  flags: uint32;
+  n_file_offset: uint16;
+  n_file_extension: uint16;
+  lpstr_def_ext: cstring;
+  l_cust_data: int64;
+  lpfn_hook: int64;
+  lp_template_name: cstring;
+  pv_reserved: cstring;
+  dw_reserved: uint32;
+  flags_ex: uint32;
+}
+
 extern function editor_atof(s: cstring) -> float64 = "atof";
+extern function Win32_GetOpenFileNameA(ofn: EditorOpenFileNameA*) -> int32 = "GetOpenFileNameA";
 
 export function EDITOR_PANEL_W() -> int32 {
   return 312;
@@ -68,6 +102,7 @@ export struct EditorUiState {
   status_frames: int32;
   active_panel: int32;
   project_settings_open: int32;
+  right_was_down: int32;
 }
 
 function editor_ui_bytes() -> int64 {
@@ -229,6 +264,58 @@ function editor_copy_trunc_to_buf(dst: uint8*, dst_cap: int32, src: cstring) {
   dst[ji] = 0;
 }
 
+// Copy src into dst showing at most max_chars characters. If src is longer
+// the result is leading-ellipsis style ("...tail") so the filename end stays
+// visible. dst_cap must be >= max_chars + 1.
+function editor_copy_tail_trunc(dst: uint8*, dst_cap: int32, src: cstring, max_chars: int32) {
+  if (dst_cap <= 1 || max_chars <= 0) {
+    if (dst_cap >= 1) {
+      dst[0] = 0;
+    }
+    return;
+  }
+  if (src == 0) {
+    dst[0] = 0;
+    return;
+  }
+  var slen: int32 = (int32)strlen(src);
+  if (slen <= max_chars) {
+    var k: int32 = 0;
+    while (k < slen && k + 1 < dst_cap) {
+      dst[k] = (uint8)(src[k]);
+      k = k + 1;
+    }
+    dst[k] = 0;
+    return;
+  }
+  if (max_chars <= 3 || dst_cap < 5) {
+    var n: int32 = max_chars;
+    if (n + 1 > dst_cap) {
+      n = dst_cap - 1;
+    }
+    var i: int32 = 0;
+    while (i < n) {
+      dst[i] = (uint8)46;
+      i = i + 1;
+    }
+    dst[n] = 0;
+    return;
+  }
+  dst[0] = (uint8)46;
+  dst[1] = (uint8)46;
+  dst[2] = (uint8)46;
+  var tail_chars: int32 = max_chars - 3;
+  var src_start: int32 = slen - tail_chars;
+  var w: int32 = 3;
+  var r: int32 = 0;
+  while (r < tail_chars && w + 1 < dst_cap) {
+    dst[w] = (uint8)(src[src_start + r]);
+    w = w + 1;
+    r = r + 1;
+  }
+  dst[w] = 0;
+}
+
 function editor_copy_cstr(dst: cstring, dst_cap: int32, src: cstring) {
   if (dst == 0 || dst_cap <= 0) {
     return;
@@ -388,7 +475,16 @@ function editor_format_fixed(buf: cstring, cap: int32, v: float64, scale: int64,
   buf[pos] = 0;
 }
 
-function editor_value_to_buf(buf: cstring, cap: int32, e: Entity*, field: int32) {
+// Terrain-brush pseudo-properties. They live on EngineViewport, not Entity,
+// but the inspector edits them with the same machinery, so they get ids in a
+// reserved band well above scene_prop_count().
+export function EDITOR_TBRUSH_RADIUS() -> int32 { return 101; }
+export function EDITOR_TBRUSH_STRENGTH() -> int32 { return 102; }
+export function EDITOR_TBRUSH_OP() -> int32 { return 103; }
+
+// Format a property's current value into buf for display, driven entirely by
+// the engine_scene descriptor table. Bools render as "true"/"false".
+function editor_value_to_buf(buf: cstring, cap: int32, sc: Scene*, e: Entity*, id: int32) {
   if (buf == 0 || cap <= 0) {
     return;
   }
@@ -396,37 +492,65 @@ function editor_value_to_buf(buf: cstring, cap: int32, e: Entity*, field: int32)
   if (e == 0) {
     return;
   }
-  if (field == 1) {
+  var t: int32 = scene_prop_type(id);
+  if (t == PT_STRING()) {
     editor_copy_cstr(buf, cap, scene_entity_name(e));
-  } else {
-    if (field == 2) { editor_format_fixed(buf, cap, e->pos_x, (int64)1000, 3); }
-    if (field == 3) { editor_format_fixed(buf, cap, e->pos_y, (int64)1000, 3); }
-    if (field == 4) { editor_format_fixed(buf, cap, e->pos_z, (int64)1000, 3); }
-    if (field == 5) { editor_format_fixed(buf, cap, e->rot_x, (int64)1000000, 6); }
-    if (field == 6) { editor_format_fixed(buf, cap, e->rot_y, (int64)1000000, 6); }
-    if (field == 7) { editor_format_fixed(buf, cap, e->rot_z, (int64)1000000, 6); }
-    if (field == 8) { editor_format_fixed(buf, cap, e->rot_w, (int64)1000000, 6); }
-    if (field == 9) { editor_format_fixed(buf, cap, e->scale, (int64)1000, 3); }
-    if (field == 10) { int_to_dec(buf, (int64)e->kind); }
-    if (field == 11) { int_to_dec(buf, (int64)e->parent_id); }
-    if (field == 12) {
-      // Lua script path. Show "(none)" instead of an empty string so the user
-      // can clearly see the slot is unbound.
-      var lp: cstring = scene_entity_lua_script(e);
-      if (lp == 0 || (uint8)(lp[0]) == (uint8)0) {
-        editor_copy_cstr(buf, cap, cstr("(none)"));
-      } else {
-        editor_copy_cstr(buf, cap, lp);
-      }
-    }
+    return;
   }
+  if (t == PT_BOOL()) {
+    if (scene_prop_get_num(sc, e, id) != 0.0) {
+      editor_copy_cstr(buf, cap, cstr("true"));
+    } else {
+      editor_copy_cstr(buf, cap, cstr("false"));
+    }
+    return;
+  }
+  if (t == PT_FLOAT()) {
+    editor_format_fixed(buf, cap, scene_prop_get_num(sc, e, id), scene_prop_scale(id), scene_prop_decimals(id));
+    return;
+  }
+  // PT_INT / PT_COLOR8.
+  int_to_dec(buf, (int64)((int32)(scene_prop_get_num(sc, e, id) + 0.5)));
 }
 
-function editor_field_to_buf(ui: EditorUiState*, e: Entity*, field: int32) {
+function editor_tbrush_to_buf(out: cstring, cap: int32, vp: EngineViewport*, field: int32) -> int32 {
+  if (vp == 0 || field < EDITOR_TBRUSH_RADIUS() || field > EDITOR_TBRUSH_OP()) {
+    return 0;
+  }
+  out[0] = 0;
+  if (field == EDITOR_TBRUSH_RADIUS()) {
+    editor_format_fixed(out, cap, vp->terrain_brush_radius, (int64)1000, 3);
+  }
+  if (field == EDITOR_TBRUSH_STRENGTH()) {
+    editor_format_fixed(out, cap, vp->terrain_brush_strength, (int64)10000, 4);
+  }
+  if (field == EDITOR_TBRUSH_OP()) {
+    int_to_dec(out, (int64)vp->terrain_brush_op);
+  }
+  return 1;
+}
+
+function editor_field_to_buf(ui: EditorUiState*, sc: Scene*, e: Entity*, vp: EngineViewport*, field: int32) {
   if (ui == 0) {
     return;
   }
-  editor_value_to_buf((cstring)((int64)(&(ui->edit_buf[0]))), 128, e, field);
+  var buf: cstring = (cstring)((int64)(&(ui->edit_buf[0])));
+  if (editor_tbrush_to_buf(buf, 128, vp, field) != 0) {
+    return;
+  }
+  editor_value_to_buf(buf, 128, sc, e, field);
+}
+
+function editor_inspector_row_value(out: cstring, cap: int32, sc: Scene*, e: Entity*, vp: EngineViewport*, field: int32) {
+  if (out == 0 || cap <= 0) {
+    return;
+  }
+  if (field >= EDITOR_TBRUSH_RADIUS() && field <= EDITOR_TBRUSH_OP() && vp != 0 && e != 0 && e->kind == SK_TERRAIN()) {
+    if (editor_tbrush_to_buf(out, cap, vp, field) != 0) {
+      return;
+    }
+  }
+  editor_value_to_buf(out, cap, sc, e, field);
 }
 
 function editor_project_field_to_buf(ui: EditorUiState*, proj: ProjectInfo*, field: int32) {
@@ -456,7 +580,7 @@ function editor_begin_project_edit(ui: EditorUiState*, proj: ProjectInfo*, field
   editor_snapshot_keys(ui);
 }
 
-function editor_apply_project_field(ui: EditorUiState*, proj: ProjectInfo*) -> int32 {
+function editor_apply_project_field(ui: EditorUiState*, proj: ProjectInfo*, am: AssetManager*) -> int32 {
   if (ui == 0 || proj == 0) {
     return 0;
   }
@@ -475,18 +599,24 @@ function editor_apply_project_field(ui: EditorUiState*, proj: ProjectInfo*) -> i
   }
   if (field == -3) {
     project_set_assets_subdir(proj, buf);
-    editor_status(ui, "Project asset folder updated");
+    if (am != 0) {
+      var assets_abs: uint8[1024];
+      project_resolve_assets_abs(proj, (cstring)((int64)(&(assets_abs[0]))), 1024);
+      asset_manager_set_project_root(am, (cstring)((int64)(&(assets_abs[0]))));
+      asset_registry_rebuild(am);
+    }
+    editor_status(ui, "Project asset folder updated and indexed");
   }
   ui->editing_field = 0;
   return 1;
 }
 
-function editor_apply_field(ui: EditorUiState*, sc: Scene*, proj: ProjectInfo*) -> int32 {
+function editor_apply_field(ui: EditorUiState*, sc: Scene*, proj: ProjectInfo*, am: AssetManager*, vp: EngineViewport*) -> int32 {
   if (ui == 0 || ui->editing_field == 0) {
     return 0;
   }
   if (ui->editing_field < 0) {
-    return editor_apply_project_field(ui, proj);
+    return editor_apply_project_field(ui, proj, am);
   }
   if (sc == 0) {
     return 0;
@@ -498,27 +628,54 @@ function editor_apply_field(ui: EditorUiState*, sc: Scene*, proj: ProjectInfo*) 
   }
   var buf: cstring = (cstring)((int64)(&(ui->edit_buf[0])));
   var field: int32 = ui->editing_field;
-  if (field == 1) {
+
+  // Terrain-brush pseudo-properties (viewport state, not the entity).
+  if (field >= EDITOR_TBRUSH_RADIUS() && field <= EDITOR_TBRUSH_OP()) {
+    if (vp == 0 || e->kind != SK_TERRAIN()) {
+      ui->editing_field = 0;
+      return 1;
+    }
+    if (field == EDITOR_TBRUSH_OP()) {
+      var op: int32 = atoi(buf);
+      if (op < 0) { op = 0; }
+      if (op > 3) { op = 3; }
+      vp->terrain_brush_op = op;
+    } else {
+      var fvb: float64 = editor_atof(buf);
+      if (field == EDITOR_TBRUSH_RADIUS()) {
+        if (fvb < 0.2) { fvb = 0.2; }
+        if (fvb > 45.0) { fvb = 45.0; }
+        vp->terrain_brush_radius = fvb;
+      }
+      if (field == EDITOR_TBRUSH_STRENGTH()) {
+        if (fvb < 0.005) { fvb = 0.005; }
+        if (fvb > 0.6) { fvb = 0.6; }
+        vp->terrain_brush_strength = fvb;
+      }
+    }
+    ui->editing_field = 0;
+    return 1;
+  }
+
+  // Everything else is a real entity property dispatched through the
+  // engine_scene descriptor table — one path for name, floats, ints, bools,
+  // and color channels.
+  var t: int32 = scene_prop_type(field);
+  if (t == PT_STRING()) {
     scene_set_name(sc, e->id, buf);
   } else {
-    var fv: float64 = editor_atof(buf);
-    if (field == 2) { e->pos_x = fv; }
-    if (field == 3) { e->pos_y = fv; }
-    if (field == 4) { e->pos_z = fv; }
-    if (field == 5) { e->rot_x = fv; scene_entity_normalize_rotation(e); }
-    if (field == 6) { e->rot_y = fv; scene_entity_normalize_rotation(e); }
-    if (field == 7) { e->rot_z = fv; scene_entity_normalize_rotation(e); }
-    if (field == 8) { e->rot_w = fv; scene_entity_normalize_rotation(e); }
-    if (field == 9) {
-      if (fv < 0.05) { fv = 0.05; }
-      if (fv > 40.0) { fv = 40.0; }
-      e->scale = fv;
+    if (t == PT_BOOL()) {
+      var bv: float64 = 0.0;
+      var b0: uint8 = (uint8)(buf[0]);
+      if (b0 == (uint8)116 || b0 == (uint8)84 || b0 == (uint8)121 || b0 == (uint8)89) {
+        bv = 1.0;  // t/T (true) or y/Y (yes)
+      } else {
+        if (editor_atof(buf) != 0.0) { bv = 1.0; }
+      }
+      scene_prop_set_num(sc, e, field, bv);
+    } else {
+      scene_prop_set_num(sc, e, field, editor_atof(buf));
     }
-    if (field == 10) { e->kind = atoi(buf); }
-    if (field == 11) { scene_set_parent(sc, e->id, atoi(buf)); }
-    // field == 12 (Script) is no longer text-editable; binding happens via
-    // Ctrl+L (assign selected .lua asset) or Ctrl+Shift+L (clear). The inline
-    // text edit is suppressed in editor_begin_edit below.
   }
   ui->editing_field = 0;
   return 1;
@@ -591,6 +748,10 @@ function editor_kind_label(kind: int32) -> cstring {
     var c: string = "mesh";
     return c.chars;
   }
+  if (kind == SK_TERRAIN()) {
+    var t: string = "terrain";
+    return t.chars;
+  }
   var d: string = "?";
   return d.chars;
 }
@@ -612,20 +773,28 @@ function editor_clamp_scene_scroll(ui: EditorUiState*, sc: Scene*) {
   }
 }
 
-function editor_begin_edit(ui: EditorUiState*, sc: Scene*, field: int32) {
+function editor_begin_edit(ui: EditorUiState*, sc: Scene*, vp: EngineViewport*, field: int32) {
   if (ui == 0 || sc == 0) {
-    return;
-  }
-  // Field 12 (lua script) is bind-by-asset, not inline text. Skip.
-  if (field == 12) {
     return;
   }
   var e: Entity* = scene_selected_row(sc);
   if (e == 0) {
     return;
   }
+  if (field >= EDITOR_TBRUSH_RADIUS() && field <= EDITOR_TBRUSH_OP()) {
+    if (vp == 0 || e->kind != SK_TERRAIN()) {
+      return;
+    }
+  } else {
+    // Real entity property: skip ones that don't apply to this kind so a
+    // click on a hidden row can't strand the editor in an uneditable field.
+    if (scene_prop_applies(field, e->kind) == 0) {
+      return;
+    }
+  }
   ui->editing_field = field;
-  editor_field_to_buf(ui, e, field);
+  editor_field_to_buf(ui, sc, e, vp, field);
+  editor_snapshot_keys(ui);
 }
 
 // Bind the currently-selected .lua asset (if any) to the currently-selected
@@ -697,6 +866,47 @@ function editor_reload_entity_script(ui: EditorUiState*, sc: Scene*, lua_reg: Lu
   return 0;
 }
 
+function editor_pick_asset_source(g: GameWin32*, out: cstring, out_cap: int32) -> int32 {
+  if (g == 0 || out == 0 || out_cap <= 0) {
+    return 0;
+  }
+  out[0] = 0;
+  var ofn: EditorOpenFileNameA;
+  memset((cstring)((int64)(&ofn)), 0, (int64)152);
+  ofn.l_struct_size = (uint32)152;
+  ofn.hwnd_owner = g->hwnd;
+  ofn.lpstr_file = out;
+  ofn.n_max_file = (uint32)out_cap;
+  var title: string = "Import Asset";
+  ofn.lpstr_title = title.chars;
+  ofn.flags = (uint32)530440;
+  if (Win32_GetOpenFileNameA(&ofn) != 0) {
+    return 1;
+  }
+  out[0] = 0;
+  return 0;
+}
+
+function editor_import_asset_file(ui: EditorUiState*, g: GameWin32*, am: AssetManager*) -> int32 {
+  if (ui == 0 || g == 0 || am == 0) {
+    return 0;
+  }
+  var src: uint8[800];
+  if (editor_pick_asset_source(g, (cstring)((int64)(&(src[0]))), 800) == 0) {
+    return 0;
+  }
+  if (asset_kind_from_filename((cstring)((int64)(&(src[0])))) == AK_UNKNOWN()) {
+    editor_status(ui, "Unsupported asset type");
+    return 1;
+  }
+  if (asset_manager_import_file(am, (cstring)((int64)(&(src[0])))) != 0) {
+    editor_status(ui, "Asset imported into project");
+    return 1;
+  }
+  editor_status(ui, "Asset import failed");
+  return 1;
+}
+
 function editor_import_selected_asset(ui: EditorUiState*, am: AssetManager*, sc: Scene*, meshes: MeshStore*, vp: EngineViewport*) -> int32 {
   if (ui == 0 || am == 0 || sc == 0 || meshes == 0) {
     return 0;
@@ -732,11 +942,40 @@ function editor_import_selected_asset(ui: EditorUiState*, am: AssetManager*, sc:
   return 1;
 }
 
-export function editor_ui_input_tick(ui: EditorUiState*, g: GameWin32*, proj: ProjectInfo*, es: ExplorerState*, am: AssetManager*, sc: Scene*, meshes: MeshStore*, vp: EngineViewport*, lua_reg: LuaScriptRegistry*) -> int32 {
+export function editor_ui_input_tick(ui: EditorUiState*, g: GameWin32*, proj: ProjectInfo*, es: ExplorerState*, am: AssetManager*, sc: Scene*, meshes: MeshStore*, vp: EngineViewport*, lua_reg: LuaScriptRegistry*, gt: GameTreeState*) -> int32 {
   if (ui == 0 || g == 0) {
     return 0;
   }
   var dirty: int32 = 0;
+  // Modal code editor: when open it owns all keyboard input. Drain it first
+  // and short-circuit so no editor shortcut (Ctrl+S scene save, Delete entity,
+  // WASD fly, etc.) fires while the user is typing code.
+  if (game_tree_editor_open(gt) != 0) {
+    game_tree_editor_input(gt);
+    // Mouse: press places the caret + drops a selection anchor; holding and
+    // moving extends the selection (mode 1); release ends the drag.
+    var elx: int32 = game_win32_mouse_x(g);
+    var ely: int32 = game_win32_mouse_y(g);
+    var eld: int32 = game_input_key_held(1);
+    if (eld != 0 && ui->left_was_down == 0) {
+      if (game_tree_editor_click(gt, elx, ely, 0) != 0) {
+        dirty = 1;
+      }
+    } else {
+      if (eld != 0 && ui->left_was_down != 0) {
+        if (game_tree_editor_click(gt, elx, ely, 1) != 0) {
+          dirty = 1;
+        }
+      } else {
+        if (eld == 0) {
+          game_tree_editor_drag_end(gt);
+        }
+      }
+    }
+    ui->left_was_down = eld;
+    editor_snapshot_keys(ui);
+    return 1;
+  }
   if (ui->status_frames > 0) {
     ui->status_frames = ui->status_frames - 1;
     dirty = 1;
@@ -755,6 +994,31 @@ export function editor_ui_input_tick(ui: EditorUiState*, g: GameWin32*, proj: Pr
   if (rx < ax1 + (int32)160) {
     rx = ax1 + (int32)160;
   }
+
+  // Right-click context menu on the Game tree (left panel). The menu is modal
+  // over the tree: while open, a left click either picks an item or dismisses,
+  // and Esc closes it — nothing else in the editor processes input.
+  if (game_tree_menu_open(gt) != 0) {
+    game_tree_menu_key(gt);
+    if (game_tree_menu_click(gt, mx, my, click, sc) != 0) {
+      engine_viewport_sync_scene(vp, sc);
+      dirty = 1;
+    }
+    ui->left_was_down = left_down;
+    editor_snapshot_keys(ui);
+    return 1;
+  }
+  var rmb_down: int32 = game_input_key_held(2);
+  if (rmb_down != 0 && ui->right_was_down == 0 && mx >= 0 && mx < EDITOR_PANEL_W() && my >= EDITOR_BODY_TOP()) {
+    ui->active_panel = EDITOR_FOCUS_PROJECT_FILES();
+    var menu_row: int32 = (my - EDITOR_BODY_TOP()) / EDITOR_LINE_H();
+    if (menu_row >= 0) {
+      if (game_tree_open_menu(gt, menu_row, mx, my) != 0) {
+        dirty = 1;
+      }
+    }
+  }
+  ui->right_was_down = rmb_down;
 
   if (click != 0 && my < EDITOR_TOPBAR_H()) {
     ui->active_panel = 0;
@@ -814,10 +1078,8 @@ export function editor_ui_input_tick(ui: EditorUiState*, g: GameWin32*, proj: Pr
     if (mx >= 0 && mx < EDITOR_PANEL_W()) {
       ui->active_panel = EDITOR_FOCUS_PROJECT_FILES();
       var prow: int32 = (my - EDITOR_BODY_TOP()) / EDITOR_LINE_H();
-      if (my >= EDITOR_BODY_TOP() && prow >= 0 && prow < EXPLORER_VISIBLE_LINES()) {
-        var pidx: int32 = explorer_scroll(es) + prow;
-        if (pidx >= 0 && pidx < explorer_entry_count(es)) {
-          explorer_select_index(es, pidx);
+      if (my >= EDITOR_BODY_TOP() && prow >= 0) {
+        if (game_tree_click_row(gt, prow, ui->status_frames + ui->scene_scroll) != 0) {
           dirty = 1;
         }
       }
@@ -846,42 +1108,81 @@ export function editor_ui_input_tick(ui: EditorUiState*, g: GameWin32*, proj: Pr
 
   if (am != 0 && mx >= ax0 && mx < ax1) {
     if (click != 0) {
+      if (editor_hit(mx, my, ax1 - (int32)82, EDITOR_TOPBAR_H() + (int32)8, 66, 22) != 0) {
+        dirty = dirty | editor_import_asset_file(ui, g, am);
+      }
+      // Filter chips: each is 42px wide at y = EDITOR_TOPBAR_H()+50, height 20.
+      var chip_hit_y: int32 = EDITOR_TOPBAR_H() + (int32)50;
+      var chip_hit_x0: int32 = ax0 + (int32)8;
+      var chip_w_hit: int32 = 42;
+      var chip_h_hit: int32 = 20;
+      var chip_kinds: int32[7];
+      chip_kinds[0] = AK_ANY();
+      chip_kinds[1] = AK_MESH();
+      chip_kinds[2] = AK_TEXTURE();
+      chip_kinds[3] = AK_LUA();
+      chip_kinds[4] = AK_SCENE();
+      chip_kinds[5] = AK_MATERIAL();
+      chip_kinds[6] = AK_METTLE();
+      var ci: int32 = 0;
+      while (ci < 7) {
+        if (editor_hit(mx, my, chip_hit_x0 + ci * chip_w_hit, chip_hit_y, chip_w_hit - (int32)2, chip_h_hit) != 0) {
+          asset_manager_set_filter(am, chip_kinds[ci]);
+          dirty = 1;
+        }
+        ci = ci + 1;
+      }
+      // Action bar at the bottom of the asset panel: Import/Unimport, Use,
+      // Reveal. Hit-test before the list so the buttons swallow clicks even
+      // when they overlap the list region in tall windows.
+      var action_consumed: int32 = 0;
+      var sel_now: int32 = asset_selected_index(am);
+      if (sel_now >= 0 && sel_now < asset_manager_count(am)) {
+        var ab_y: int32 = g->height - (int32)44;
+        var ab_h: int32 = 22;
+        var ab_w: int32 = (EDITOR_ASSET_W() - (int32)24) / (int32)3;
+        var ab_x0: int32 = ax0 + (int32)8;
+        if (editor_hit(mx, my, ab_x0 + 0 * ab_w, ab_y, ab_w - (int32)4, ab_h) != 0) {
+          var cur_state: int32 = asset_row_import_state(am, sel_now);
+          if (cur_state == IS_IMPORTED()) {
+            asset_row_set_import_state(am, sel_now, IS_DISCOVERED());
+            editor_status(ui, "Asset unimported");
+          } else {
+            asset_row_set_import_state(am, sel_now, IS_IMPORTED());
+            editor_status(ui, "Asset imported");
+          }
+          action_consumed = 1;
+          dirty = 1;
+        }
+        if (action_consumed == 0 && editor_hit(mx, my, ab_x0 + 1 * ab_w, ab_y, ab_w - (int32)4, ab_h) != 0) {
+          var sk: int32 = asset_row_kind(am, sel_now);
+          if (sk == AK_MESH()) {
+            dirty = dirty | editor_import_selected_asset(ui, am, sc, meshes, vp);
+          } else {
+            if (sk == AK_LUA()) {
+              dirty = dirty | editor_assign_selected_script(ui, am, sc, lua_reg);
+            } else {
+              editor_status(ui, "No 'Use' action for this asset kind");
+            }
+          }
+          action_consumed = 1;
+        }
+        if (action_consumed == 0 && editor_hit(mx, my, ab_x0 + 2 * ab_w, ab_y, ab_w - (int32)4, ab_h) != 0) {
+          editor_status(ui, "Reveal: not yet implemented");
+          action_consumed = 1;
+        }
+      }
       // The filter row sits one EDITOR_LINE_H above the list (+20px), so the
       // clickable list starts EDITOR_BODY_TOP + 20.
-      var list_top: int32 = EDITOR_BODY_TOP() + (int32)20;
-      var arel: int32 = (my - list_top) / EDITOR_LINE_H();
-      if (my >= list_top && arel >= 0 && arel < 28) {
-        // Walk the rows past asset_scroll, skipping non-matching, until we
-        // reach the visual-row index. This keeps click semantics correct
-        // regardless of filter.
-        var fk2: int32 = asset_manager_filter(am);
-        var scanned: int32 = 0;
-        var visidx: int32 = 0;
-        var found: int32 = 0 - 1;
-        var total: int32 = asset_manager_count(am);
-        var probe: int32 = asset_scroll(am);
-        while (probe < total) {
-          var pk: int32 = asset_row_kind(am, probe);
-          var keep: int32 = 1;
-          if (fk2 != AK_ANY() && pk != fk2) {
-            keep = 0;
+      if (action_consumed == 0) {
+        var list_top: int32 = EDITOR_BODY_TOP() + (int32)20;
+        var arel: int32 = (my - list_top) / EDITOR_LINE_H();
+        if (my >= list_top && arel >= 0 && arel < 28) {
+          var found: int32 = asset_visible_row_index(am, asset_scroll(am) + arel);
+          if (found >= 0) {
+            asset_select(am, found);
+            dirty = 1;
           }
-          if (keep != 0) {
-            if (visidx == arel) {
-              found = probe;
-              break;
-            }
-            visidx = visidx + 1;
-          }
-          probe = probe + 1;
-          scanned = scanned + 1;
-          if (scanned > 4096) {
-            break;
-          }
-        }
-        if (found >= 0) {
-          asset_select(am, found);
-          dirty = 1;
         }
       }
     }
@@ -895,7 +1196,7 @@ export function editor_ui_input_tick(ui: EditorUiState*, g: GameWin32*, proj: Pr
   if (ui->editing_field != 0) {
     editor_process_text_key(ui);
     if (editor_key_edge(ui, 13) != 0) {
-    if (editor_apply_field(ui, sc, proj) != 0) {
+      if (editor_apply_field(ui, sc, proj, am, vp) != 0) {
         engine_viewport_sync_scene(vp, sc);
         dirty = 1;
       }
@@ -911,7 +1212,7 @@ export function editor_ui_input_tick(ui: EditorUiState*, g: GameWin32*, proj: Pr
 
   var ctrl: int32 = game_input_key_held(17);
   if (ctrl != 0 && editor_key_edge(ui, 83) != 0) {
-    if (scene_io_save(editor_scene_path(ui, es), sc) != 0) {
+    if (scene_io_save(editor_scene_path(ui, es), sc, project_root_ptr(proj)) != 0) {
       editor_status(ui, "Scene saved");
     } else {
       editor_status(ui, "Scene save failed");
@@ -919,7 +1220,7 @@ export function editor_ui_input_tick(ui: EditorUiState*, g: GameWin32*, proj: Pr
     dirty = 1;
   }
   if (ctrl != 0 && editor_key_edge(ui, 79) != 0) {
-    if (scene_io_load(editor_scene_path(ui, es), sc, meshes) != 0) {
+    if (scene_io_load(editor_scene_path(ui, es), sc, meshes, project_root_ptr(proj)) != 0) {
       engine_viewport_sync_scene(vp, sc);
       engine_viewport_frame_selection(vp, sc);
       editor_status(ui, "Scene loaded");
@@ -928,10 +1229,14 @@ export function editor_ui_input_tick(ui: EditorUiState*, g: GameWin32*, proj: Pr
     }
     dirty = 1;
   }
-  if (ctrl != 0 && editor_key_edge(ui, 73) != 0) {
-    dirty = dirty | editor_import_selected_asset(ui, am, sc, meshes, vp);
-  }
   var shift_held: int32 = game_input_key_held(16);
+  if (ctrl != 0 && editor_key_edge(ui, 73) != 0) {
+    if (shift_held != 0) {
+      dirty = dirty | editor_import_asset_file(ui, g, am);
+    } else {
+      dirty = dirty | editor_import_selected_asset(ui, am, sc, meshes, vp);
+    }
+  }
   // Ctrl+L: bind selected .lua to selected entity. Ctrl+Shift+L: clear.
   if (ctrl != 0 && editor_key_edge(ui, 76) != 0) {
     if (shift_held != 0) {
@@ -974,32 +1279,39 @@ export function editor_ui_input_tick(ui: EditorUiState*, g: GameWin32*, proj: Pr
     dirty = 1;
   }
   if (editor_key_edge(ui, 113) != 0) {
-    editor_begin_edit(ui, sc, 1);
+    editor_begin_edit(ui, sc, vp, 1);
     dirty = 1;
   }
 
   if (mx >= rx && click != 0) {
     var iy0: int32 = EDITOR_TOPBAR_H();
-    if (editor_hit(mx, my, rx + 12, iy0 + 28, 54, 22) != 0) {
-      if (scene_io_save(editor_scene_path(ui, es), sc) != 0) { editor_status(ui, "Scene saved"); } else { editor_status(ui, "Scene save failed"); }
+    if (editor_hit(mx, my, rx + 12, iy0 + 28, 50, 22) != 0) {
+      if (scene_io_save(editor_scene_path(ui, es), sc, project_root_ptr(proj)) != 0) { editor_status(ui, "Scene saved"); } else { editor_status(ui, "Scene save failed"); }
       dirty = 1;
     } else {
-      if (editor_hit(mx, my, rx + 72, iy0 + 28, 54, 22) != 0) {
-        if (scene_io_load(editor_scene_path(ui, es), sc, meshes) != 0) { engine_viewport_sync_scene(vp, sc); engine_viewport_frame_selection(vp, sc); editor_status(ui, "Scene loaded"); } else { editor_status(ui, "Scene load failed"); }
+      if (editor_hit(mx, my, rx + 66, iy0 + 28, 50, 22) != 0) {
+        if (scene_io_load(editor_scene_path(ui, es), sc, meshes, project_root_ptr(proj)) != 0) { engine_viewport_sync_scene(vp, sc); engine_viewport_frame_selection(vp, sc); editor_status(ui, "Scene loaded"); } else { editor_status(ui, "Scene load failed"); }
         dirty = 1;
       } else {
-        if (editor_hit(mx, my, rx + 132, iy0 + 28, 70, 22) != 0) {
+        if (editor_hit(mx, my, rx + 120, iy0 + 28, 64, 22) != 0) {
           dirty = dirty | editor_import_selected_asset(ui, am, sc, meshes, vp);
         } else {
-          if (editor_hit(mx, my, rx + 208, iy0 + 28, 50, 22) != 0) {
+          if (editor_hit(mx, my, rx + 190, iy0 + 28, 46, 22) != 0) {
             var nid: int32 = scene_add(sc, SK_CUBE(), 0.0, 1.0, 0.0, 1.0);
             if (nid != 0) { scene_set_selected(sc, nid); engine_viewport_sync_scene(vp, sc); }
             dirty = 1;
           } else {
-            if (editor_hit(mx, my, rx + 264, iy0 + 28, 54, 22) != 0) {
+            if (editor_hit(mx, my, rx + 240, iy0 + 28, 78, 22) != 0) {
               if (scene_selected_id(sc) != 0) { scene_remove(sc, scene_selected_id(sc)); engine_viewport_sync_scene(vp, sc); dirty = 1; }
             } else {
               var row0: int32 = iy0 + 78;
+              if (editor_hit(mx, my, rx + 208, iy0 + 54, 70, 22) != 0) {
+                // Y amplitude defaults to 1.8m — old 0.22m default was so
+                // small the procedural undulation looked like a flat slab.
+                var tid: int32 = scene_add_terrain(sc, 0.0, 0.0, 0.0, 22.0, 22.0, 1.8);
+                if (tid != 0) { scene_set_name(sc, tid, cstr("Terrain")); scene_set_selected(sc, tid); engine_viewport_sync_scene(vp, sc); }
+                dirty = 1;
+              } else {
               var rel: int32 = (my - row0) / EDITOR_LINE_H();
               if (my >= row0 && rel >= 0 && rel < 14) {
                 var idx: int32 = ui->scene_scroll + rel;
@@ -1012,12 +1324,63 @@ export function editor_ui_input_tick(ui: EditorUiState*, g: GameWin32*, proj: Pr
                   }
                 }
               } else {
-                var py: int32 = iy0 + 326;
-                var pf: int32 = (my - py) / 20;
-                if (my >= py && pf >= 0 && pf < 12) {
-                  editor_begin_edit(ui, sc, pf + 1);
-                  dirty = 1;
+                var selent: Entity* = scene_selected_row(sc);
+                var insp_rows: int32 = 0;
+                if (selent != 0) {
+                  insp_rows = editor_inspector_total_rows(selent, vp, sc);
                 }
+                var tbase: int32 = iy0 + 326 + insp_rows * 20;
+                var did_terrain_ui: int32 = 0;
+                if (selent != 0 && selent->kind == SK_TERRAIN() && editor_hit(mx, my, rx + 12, tbase, 198, 22) != 0) {
+                  var asset_dir: uint8[1024];
+                  var terr_dir: uint8[1024];
+                  fs_path_join_child((cstring)((int64)(&(asset_dir[0]))), 1024, project_root_ptr(proj), cstr("Assets"));
+                  Win32_CreateDirectoryA((cstring)((int64)(&(asset_dir[0]))), (cstring)0);
+                  fs_path_join_child((cstring)((int64)(&(terr_dir[0]))), 1024, project_root_ptr(proj), cstr("Assets\\Terrain"));
+                  Win32_CreateDirectoryA((cstring)((int64)(&(terr_dir[0]))), (cstring)0);
+                  var relm: uint8[520];
+                  editor_terrain_rel_path((cstring)((int64)(&(relm[0]))), 520, selent->id);
+                  if (scene_terrain_bind_heightmap_from_procedural(sc, selent->id, 65, 65, (cstring)((int64)(&(relm[0])))) != 0) {
+                    editor_status(ui, "Heightmap created; T sculpt");
+                  } else {
+                    editor_status(ui, "Heightmap create failed");
+                  }
+                  dirty = 1;
+                  did_terrain_ui = 1;
+                } else {
+                  if (selent != 0 && selent->kind == SK_TERRAIN() && sc->terrain != 0 && terrain_store_has(sc->terrain, selent->id) != 0 && editor_hit(mx, my, rx + 12, tbase + 24, 198, 22) != 0) {
+                    var no: int32 = vp->terrain_brush_op + 1;
+                    if (no > TERRAIN_OP_FLATTEN()) {
+                      no = TERRAIN_OP_RAISE();
+                    }
+                    vp->terrain_brush_op = no;
+                    dirty = 1;
+                    did_terrain_ui = 1;
+                  }
+                }
+                if (did_terrain_ui == 0) {
+                  var sel_row: Entity* = scene_selected_row(sc);
+                  var py: int32 = iy0 + 326;
+                  var pf: int32 = (my - py) / 20;
+                  if (sel_row != 0 && my >= py && pf >= 0 && pf < insp_rows) {
+                    var clicked_id: int32 = 0;
+                    var ck: int32 = editor_inspector_row(sel_row, vp, sc, pf, &clicked_id);
+                    if (ck == IRK_PROP()) {
+                      if (clicked_id < EDITOR_TBRUSH_RADIUS() && scene_prop_type(clicked_id) == PT_BOOL()) {
+                        // Bools toggle on click instead of opening a text edit.
+                        var cv: float64 = 0.0;
+                        if (scene_prop_get_num(sc, sel_row, clicked_id) == 0.0) {
+                          cv = 1.0;
+                        }
+                        scene_prop_set_num(sc, sel_row, clicked_id, cv);
+                      } else {
+                        editor_begin_edit(ui, sc, vp, clicked_id);
+                      }
+                      dirty = 1;
+                    }
+                  }
+                }
+              }
               }
             }
           }
@@ -1072,24 +1435,168 @@ function editor_draw_button(mdc: int64, x: int32, y: int32, label: string) {
   editor_text_out(mdc, x + 8, y + 4, label.chars);
 }
 
-function editor_prop_label(field: int32) -> cstring {
-  if (field == 1) { var a: string = "Name"; return a.chars; }
-  if (field == 2) { var b: string = "Pos X"; return b.chars; }
-  if (field == 3) { var c: string = "Pos Y"; return c.chars; }
-  if (field == 4) { var d: string = "Pos Z"; return d.chars; }
-  if (field == 5) { var e: string = "Quat X"; return e.chars; }
-  if (field == 6) { var f: string = "Quat Y"; return f.chars; }
-  if (field == 7) { var g: string = "Quat Z"; return g.chars; }
-  if (field == 8) { var h: string = "Quat W"; return h.chars; }
-  if (field == 9) { var i: string = "Scale"; return i.chars; }
-  if (field == 10) { var j: string = "Kind"; return j.chars; }
-  if (field == 11) { var k: string = "Parent"; return k.chars; }
-  var l: string = "Script";
-  return l.chars;
+function editor_draw_asset_chip(px: uint32*, mdc: int64, ww: int32, hh: int32, x: int32, y: int32, w: int32, h: int32, label: string, active: int32) {
+  var bg: uint32 = swizzle_bgra8(48, 50, 60, 255);
+  if (active != 0) {
+    bg = swizzle_bgra8(80, 110, 170, 255);
+  }
+  fb_fill_rect(px, ww, hh, x, y, x + w - (int32)2, y + h, bg);
+  if (active != 0) {
+    Win32_SetTextColor(mdc, COLORREF_WHITE());
+  } else {
+    Win32_SetTextColor(mdc, COLORREF_DIM_TEXT());
+  }
+  editor_text_out(mdc, x + (int32)4, y + (int32)4, label.chars);
+  Win32_SetTextColor(mdc, COLORREF_WHITE());
 }
 
-function editor_draw_inspector(g: GameWin32*, ui: EditorUiState*, sc: Scene*, mdc: int64) {
-  if (g == 0 || ui == 0 || mdc == 0) {
+function editor_prop_label(field: int32) -> cstring {
+  if (field == EDITOR_TBRUSH_RADIUS())   { var br: string = "Brush radius";   return br.chars; }
+  if (field == EDITOR_TBRUSH_STRENGTH()) { var bs: string = "Brush strength"; return bs.chars; }
+  if (field == EDITOR_TBRUSH_OP())       { var bo: string = "Brush op";       return bo.chars; }
+  return scene_prop_label(field);
+}
+
+function editor_terrain_rel_path(out: cstring, cap: int32, id: int32) {
+  if (out == 0 || cap <= 0) {
+    return;
+  }
+  var pfx: string = "Assets\\Terrain\\terrain_";
+  editor_copy_cstr(out, cap, pfx.chars);
+  var L: int32 = 0;
+  while (L + 1 < cap && (uint8)(out[L]) != (uint8)0) {
+    L = L + 1;
+  }
+  var nb: uint8[24];
+  int_to_dec((cstring)((int64)(&(nb[0]))), (int64)id);
+  var k: int32 = 0;
+  while (L + 1 < cap && nb[k] != (uint8)0) {
+    out[L] = nb[k];
+    L = L + 1;
+    k = k + 1;
+  }
+  var sfx: string = ".mthmap";
+  k = 0;
+  while (L + 1 < cap && (uint8)(sfx.chars[k]) != (uint8)0) {
+    out[L] = sfx.chars[k];
+    L = L + 1;
+    k = k + 1;
+  }
+  out[L] = 0;
+}
+
+function editor_terrain_brush_label(op: int32) -> cstring {
+  if (op == TERRAIN_OP_LOWER()) {
+    var a: string = "lower";
+    return a.chars;
+  }
+  if (op == TERRAIN_OP_SMOOTH()) {
+    var b: string = "smooth";
+    return b.chars;
+  }
+  if (op == TERRAIN_OP_FLATTEN()) {
+    var c: string = "flatten";
+    return c.chars;
+  }
+  var d: string = "raise";
+  return d.chars;
+}
+
+// ---- Inspector row model --------------------------------------------------
+// One builder feeds both the renderer and the click hit-test so they can
+// never disagree about which screen row is which property. The property list
+// is the engine_scene descriptor table, grouped, with kind-inapplicable
+// properties skipped, plus a synthetic "Terrain Brush" group for terrain.
+//
+// editor_inspector_row(se, row, out_kind) -> id
+//   out_kind: 1 = group header (id = group label code), 2 = property
+//             (id = prop/tbrush id), 0 = past the end (row >= total).
+
+export function IRK_END() -> int32 { return 0; }
+export function IRK_HEADER() -> int32 { return 1; }
+export function IRK_PROP() -> int32 { return 2; }
+
+// Group label code 99 is the synthetic terrain-brush group.
+function editor_inspector_group_label(code: int32) -> cstring {
+  if (code == 99) {
+    var t: string = "Terrain Brush";
+    return t.chars;
+  }
+  return scene_prop_group_label(code);
+}
+
+function editor_inspector_row(se: Entity*, vp: EngineViewport*, sc: Scene*, row: int32, out_id: int32*) -> int32 {
+  if (se == 0) {
+    return IRK_END();
+  }
+  var cur: int32 = 0;
+  var g: int32 = PG_GENERAL();
+  while (g <= PG_BEHAVIOR()) {
+    // Does this group have any applicable property? If not, skip its header.
+    var any: int32 = 0;
+    var pid: int32 = 1;
+    var pn: int32 = scene_prop_count();
+    while (pid <= pn) {
+      if (scene_prop_group(pid) == g && scene_prop_applies(pid, se->kind) != 0) {
+        any = 1;
+        pid = pn;
+      }
+      pid = pid + 1;
+    }
+    if (any != 0) {
+      if (cur == row) {
+        *out_id = g;
+        return IRK_HEADER();
+      }
+      cur = cur + 1;
+      var p2: int32 = 1;
+      while (p2 <= pn) {
+        if (scene_prop_group(p2) == g && scene_prop_applies(p2, se->kind) != 0) {
+          if (cur == row) {
+            *out_id = p2;
+            return IRK_PROP();
+          }
+          cur = cur + 1;
+        }
+        p2 = p2 + 1;
+      }
+    }
+    g = g + 1;
+  }
+  // Terrain brush pseudo-group (only when a heightmap is bound).
+  if (se->kind == SK_TERRAIN() && sc != 0 && sc->terrain != 0 && terrain_store_has(sc->terrain, se->id) != 0) {
+    if (cur == row) {
+      *out_id = 99;
+      return IRK_HEADER();
+    }
+    cur = cur + 1;
+    var tb: int32 = EDITOR_TBRUSH_RADIUS();
+    while (tb <= EDITOR_TBRUSH_OP()) {
+      if (cur == row) {
+        *out_id = tb;
+        return IRK_PROP();
+      }
+      cur = cur + 1;
+      tb = tb + 1;
+    }
+  }
+  return IRK_END();
+}
+
+function editor_inspector_total_rows(se: Entity*, vp: EngineViewport*, sc: Scene*) -> int32 {
+  var n: int32 = 0;
+  var dummy: int32 = 0;
+  while (editor_inspector_row(se, vp, sc, n, &dummy) != IRK_END()) {
+    n = n + 1;
+    if (n > 256) {
+      return n;
+    }
+  }
+  return n;
+}
+
+function editor_draw_inspector(g: GameWin32*, ui: EditorUiState*, sc: Scene*, vp: EngineViewport*, mdc: int64) {
+  if (g == 0 || ui == 0 || mdc == 0 || vp == 0) {
     return;
   }
   var ww: int32 = g->width;
@@ -1110,16 +1617,18 @@ function editor_draw_inspector(g: GameWin32*, ui: EditorUiState*, sc: Scene*, md
   fb_fill_rect(px, ww, hh, rx, yoff, ww, hh, panel);
   var title: string = "Scene";
   editor_text_out(mdc, rx + 14, yoff + 10, title.chars);
-  fb_fill_rect(px, ww, hh, rx + 12, yoff + 28, rx + 66, yoff + 50, button_bg);
-  fb_fill_rect(px, ww, hh, rx + 72, yoff + 28, rx + 126, yoff + 50, button_bg);
-  fb_fill_rect(px, ww, hh, rx + 132, yoff + 28, rx + 202, yoff + 50, button_bg);
-  fb_fill_rect(px, ww, hh, rx + 208, yoff + 28, rx + 258, yoff + 50, button_bg);
-  fb_fill_rect(px, ww, hh, rx + 264, yoff + 28, rx + 318, yoff + 50, button_bg);
+  fb_fill_rect(px, ww, hh, rx + 12, yoff + 28, rx + 62, yoff + 50, button_bg);
+  fb_fill_rect(px, ww, hh, rx + 66, yoff + 28, rx + 116, yoff + 50, button_bg);
+  fb_fill_rect(px, ww, hh, rx + 120, yoff + 28, rx + 184, yoff + 50, button_bg);
+  fb_fill_rect(px, ww, hh, rx + 190, yoff + 28, rx + 236, yoff + 50, button_bg);
+  fb_fill_rect(px, ww, hh, rx + 240, yoff + 28, rx + 318, yoff + 50, button_bg);
+  fb_fill_rect(px, ww, hh, rx + 208, yoff + 54, rx + 278, yoff + 76, button_bg);
   editor_draw_button(mdc, rx + 12, yoff + 28, "Save");
-  editor_draw_button(mdc, rx + 72, yoff + 28, "Load");
-  editor_draw_button(mdc, rx + 132, yoff + 28, "Import");
-  editor_draw_button(mdc, rx + 208, yoff + 28, "Cube");
-  editor_draw_button(mdc, rx + 264, yoff + 28, "Delete");
+  editor_draw_button(mdc, rx + 66, yoff + 28, "Load");
+  editor_draw_button(mdc, rx + 120, yoff + 28, "Place");
+  editor_draw_button(mdc, rx + 190, yoff + 28, "Cube");
+  editor_draw_button(mdc, rx + 240, yoff + 28, "Delete");
+  editor_draw_button(mdc, rx + 208, yoff + 54, "Terrain");
   var hdr: string = "Objects";
   editor_text_out(mdc, rx + 14, yoff + 58, hdr.chars);
   var n: int32 = scene_count(sc);
@@ -1166,27 +1675,74 @@ function editor_draw_inspector(g: GameWin32*, ui: EditorUiState*, sc: Scene*, md
     var none: string = "No selection";
     editor_text_out(mdc, rx + 14, yoff + 326, none.chars);
   } else {
-    var f: int32 = 1;
-    while (f <= 12) {
-      var fy: int32 = yoff + 326 + (f - 1) * 20;
-      fb_fill_rect(px, ww, hh, rx + 86, fy - 2, ww - 14, fy + 17, field_bg);
-      if (ui->editing_field == f) {
-        fb_fill_rect(px, ww, hh, rx + 86, fy - 2, ww - 14, fy + 17, edit_hi);
-      }
-      editor_text_out(mdc, rx + 14, fy, editor_prop_label(f));
-      var vb: cstring = (cstring)((int64)(&(line[0])));
-      if (ui->editing_field == f) {
-        editor_copy_cstr(vb, 220, (cstring)((int64)(&(ui->edit_buf[0]))));
+    // Label column gets 124px (rx+14 .. rx+134) so "Transparency" and
+    // "Material" fit without colliding with the value background. The value
+    // field begins at rx+138 to keep a 4px gutter between label and value.
+    // Rows come from the shared row model so a click maps back to the exact
+    // property drawn here.
+    var grp_col: uint32 = swizzle_bgra8(60, 64, 80, 255);
+    var total: int32 = editor_inspector_total_rows(se, vp, sc);
+    var rcur: int32 = 0;
+    while (rcur < total) {
+      var rid: int32 = 0;
+      var rkind: int32 = editor_inspector_row(se, vp, sc, rcur, &rid);
+      var fy: int32 = yoff + 326 + rcur * 20;
+      if (rkind == IRK_HEADER()) {
+        fb_fill_rect(px, ww, hh, rx + 8, fy - 2, ww - 10, fy + 17, grp_col);
+        editor_text_out(mdc, rx + 14, fy, editor_inspector_group_label(rid));
       } else {
-        editor_value_to_buf(vb, 220, se, f);
+        if (rkind == IRK_PROP()) {
+          fb_fill_rect(px, ww, hh, rx + 138, fy - 2, ww - 14, fy + 17, field_bg);
+          if (ui->editing_field == rid) {
+            fb_fill_rect(px, ww, hh, rx + 138, fy - 2, ww - 14, fy + 17, edit_hi);
+          }
+          editor_text_out(mdc, rx + 24, fy, editor_prop_label(rid));
+          var vb: cstring = (cstring)((int64)(&(line[0])));
+          if (ui->editing_field == rid) {
+            editor_copy_cstr(vb, 220, (cstring)((int64)(&(ui->edit_buf[0]))));
+          } else {
+            editor_inspector_row_value(vb, 220, sc, se, vp, rid);
+          }
+          editor_text_out(mdc, rx + 146, fy, vb);
+        }
       }
-      editor_text_out(mdc, rx + 96, fy, vb);
-      f = f + 1;
+      rcur = rcur + 1;
     }
-    var kind_help: string = "kind: 0 cube, 1 box, 2 mesh   Script: pick a .lua in Assets, Ctrl+L to bind";
-    editor_text_out(mdc, rx + 14, yoff + 574, kind_help.chars);
-    var script_help: string = "Ctrl+Shift+L clear  Ctrl+R reload  F4 cycle asset filter";
-    editor_text_out(mdc, rx + 14, yoff + 592, script_help.chars);
+    var tbase: int32 = yoff + 326 + total * 20;
+    if (se->kind == SK_TERRAIN()) {
+      fb_fill_rect(px, ww, hh, rx + 12, tbase, rx + 210, tbase + 20, button_bg);
+      editor_draw_button(mdc, rx + 14, tbase + 2, "Create heightmap");
+      if (sc != 0 && sc->terrain != 0 && terrain_store_has(sc->terrain, se->id) != 0) {
+        fb_fill_rect(px, ww, hh, rx + 12, tbase + 24, rx + 210, tbase + 44, button_bg);
+        editor_draw_button(mdc, rx + 14, tbase + 26, "Cycle brush");
+        // ASCII only — GDI SYSTEM_FIXED_FONT renders en-dash as garbage
+        // (was the "0âûû3" mojibake in the inspector).
+        var h1: string = "T sculpt; [ ] resize, , . strength";
+        editor_text_out(mdc, rx + 14, tbase + 50, h1.chars);
+        var h2: string = "Op 0-3: raise/lower/smooth/flatten";
+        editor_text_out(mdc, rx + 14, tbase + 68, h2.chars);
+      }
+    }
+    // Help text is anchored *below* the (now much taller, grouped) property
+    // list. tbase already accounts for every visible row + group header; the
+    // terrain buttons push it further when present. Using a fixed Y here was
+    // what made the hints paint over the Appearance rows.
+    var khy: int32 = tbase + 28;
+    if (se->kind == SK_TERRAIN()) {
+      if (sc != 0 && sc->terrain != 0 && terrain_store_has(sc->terrain, se->id) != 0) {
+        khy = tbase + 94;
+      } else {
+        khy = tbase + 30;
+      }
+    }
+    // Only show hints if there's vertical room before the status strip; on a
+    // short window the long property list already fills the panel.
+    if (khy + 36 < hh - 56) {
+      var kind_help: string = "kind: 0 cube  1 box  2 mesh  3 terrain";
+      editor_text_out(mdc, rx + 14, khy, kind_help.chars);
+      var script_help: string = "Script: select .lua asset, Ctrl+L bind";
+      editor_text_out(mdc, rx + 14, khy + 18, script_help.chars);
+    }
   }
   // Status strip across the bottom of the inspector. When status_frames is 0
   // we still show a faint hint, which keeps the line from blinking empty.
@@ -1195,7 +1751,7 @@ function editor_draw_inspector(g: GameWin32*, ui: EditorUiState*, sc: Scene*, md
     editor_text_out(mdc, rx + 14, hh - 28, (cstring)((int64)(&(ui->status[0]))));
     Win32_SetTextColor(mdc, COLORREF_DIM_TEXT());
   }
-  var path_label: string = "Ctrl+S/O, F2 rename, Del delete, Ctrl+L assign script";
+  var path_label: string = "Ctrl+S save  Ctrl+O load  Ctrl+L bind";
   editor_text_out(mdc, rx + 14, hh - 48, path_label.chars);
 }
 
@@ -1485,7 +2041,7 @@ function editor_draw_project_settings(g: GameWin32*, ui: EditorUiState*, proj: P
   editor_text_out(mdc, x0 + 16, y0 + 140, cstr("Launch with --project <folder> to open an explicit project root."));
 }
 
-export function engine_editor_present(g: GameWin32*, ui: EditorUiState*, proj: ProjectInfo*, es: ExplorerState*, am: AssetManager*, vp: EngineViewport*, sc: Scene*, frame: int32, vk_active: int32, play_mode: int32) -> int32 {
+export function engine_editor_present(g: GameWin32*, ui: EditorUiState*, proj: ProjectInfo*, es: ExplorerState*, am: AssetManager*, vp: EngineViewport*, sc: Scene*, gt: GameTreeState*, frame: int32, vk_active: int32, play_mode: int32) -> int32 {
   if (g == 0) {
     return 0;
   }
@@ -1509,17 +2065,6 @@ export function engine_editor_present(g: GameWin32*, ui: EditorUiState*, proj: P
   fb_fill_rect(px, ww, hh, asset_x, 0, asset_r, hh, swizzle_bgra8(36, 38, 48, 255));
   fb_fill_rect(px, ww, hh, asset_r, 0, asset_r + (int32)4, hh, split);
   editor_viewport_region(g, vp, sc, view_x, frame, vk_active);
-  var ec: int32 = explorer_entry_count(es);
-  var sel: int32 = explorer_selection(es);
-  var scr: int32 = explorer_scroll(es);
-  if (ec > 0 && sel >= 0 && sel < ec) {
-    var row_rel: int32 = sel - scr;
-    if (row_rel >= 0 && row_rel < EXPLORER_VISIBLE_LINES()) {
-      var ry0: int32 = EDITOR_BODY_TOP() - (int32)4 + row_rel * EDITOR_LINE_H();
-      var ry1: int32 = ry0 + EDITOR_LINE_H() + (int32)2;
-      fb_fill_rect(px, ww, hh, (int32)8, ry0, EDITOR_PANEL_W() - (int32)12, ry1, hi);
-    }
-  }
   // Draw labels into the DIB (mem DC), not on the window DC. WM_PAINT only
   // BitBlt's mem_dc; text on the HWND was missing on repaints → flicker.
   var mdc: int64 = g->mem_dc;
@@ -1529,10 +2074,10 @@ export function engine_editor_present(g: GameWin32*, ui: EditorUiState*, proj: P
   Win32_SelectObject(mdc, Win32_GetStockObject(SYSTEM_FIXED_FONT_STOCK()));
   Win32_SetBkMode(mdc, GDI_BKMODE_TRANSPARENT());
   Win32_SetTextColor(mdc, COLORREF_WHITE());
-  var title: string = "Project Files";
-  editor_text_out(mdc, (int32)14, EDITOR_TOPBAR_H() + (int32)14, title.chars);
   var ar: string = "Assets";
   editor_text_out(mdc, asset_x + (int32)16, EDITOR_TOPBAR_H() + (int32)14, ar.chars);
+  fb_fill_rect(px, ww, hh, asset_r - (int32)82, EDITOR_TOPBAR_H() + (int32)8, asset_r - (int32)16, EDITOR_TOPBAR_H() + (int32)30, swizzle_bgra8(55, 55, 66, 255));
+  editor_draw_button(mdc, asset_r - (int32)82, EDITOR_TOPBAR_H() + (int32)8, "Import");
   var vt: string = "Viewport";
   editor_text_out(mdc, view_x + (int32)12, EDITOR_TOPBAR_H() + (int32)14, vt.chars);
   Win32_SetTextColor(mdc, COLORREF_DIM_TEXT());
@@ -1556,91 +2101,166 @@ export function engine_editor_present(g: GameWin32*, ui: EditorUiState*, proj: P
   editor_text_out(mdc, view_x + (int32)100, EDITOR_TOPBAR_H() + (int32)14, sb);
   var help: string = "Viewport: WASD move  E/Q up/down  RMB+mouse look  Shift boost  wheel speed   LMB edit  F focus   F5 play/stop";
   editor_text_out(mdc, view_x + (int32)12, hh - (int32)72, help.chars);
-  var lh: uint8[640];
   var line_buf: uint8[680];
-  var prep: string = "> ";
-  var prep_c: cstring = prep.chars;
-  var prep_len: int32 = (int32)strlen(prep_c);
-  editor_copy_trunc_to_buf(&(lh[0]), 640, explorer_cwd_ptr(es));
-  editor_text_out(mdc, (int32)14, EDITOR_TOPBAR_H() + (int32)34, (cstring)((int64)(&(lh[0]))));
-  var vis: int32 = EXPLORER_VISIBLE_LINES();
-  if (vis > 32) {
-    vis = 32;
+  // Left panel: Roblox-style Game/Services tree (replaces the old filesystem
+  // explorer). game_tree_render draws its own selection highlight + headers.
+  var gt_focused: int32 = 0;
+  if (ui->active_panel == EDITOR_FOCUS_PROJECT_FILES()) {
+    gt_focused = 1;
   }
-  var kk: int32 = 0;
-  while (kk < vis && kk + scr < ec) {
-    var idx_line: int32 = scr + kk;
-    var yl: int32 = EDITOR_BODY_TOP() + kk * EDITOR_LINE_H();
-    var nm: cstring = explorer_entry_name_ptr(es, idx_line);
-    if (explorer_entry_is_dir(es, idx_line) != 0) {
-      Win32_TextOutA(mdc, (int32)10, yl, prep_c, prep_len);
-      Win32_TextOutA(mdc, (int32)30, yl, nm, (int32)strlen(nm));
-    } else {
-      Win32_TextOutA(mdc, (int32)26, yl, nm, (int32)strlen(nm));
-    }
-    kk = kk + 1;
-  }
+  game_tree_render(gt, px, mdc, ww, hh, EDITOR_PANEL_W(), EDITOR_BODY_TOP(), EDITOR_LINE_H(), gt_focused);
+  Win32_SelectObject(mdc, Win32_GetStockObject(SYSTEM_FIXED_FONT_STOCK()));
+  Win32_SetBkMode(mdc, GDI_BKMODE_TRANSPARENT());
   var ac: int32 = asset_manager_count(am);
+  var avc: int32 = asset_visible_count(am);
   editor_copy_trunc_to_buf(&(line_buf[0]), 680, asset_manager_project_root(am));
   Win32_TextOutA(mdc, asset_x + (int32)16, EDITOR_TOPBAR_H() + (int32)34, (cstring)((int64)(&(line_buf[0]))), (int32)strlen((cstring)((int64)(&(line_buf[0])))));
-  // Filter label (cycled with F4)
-  var fk: int32 = asset_manager_filter(am);
+  // Count, drawn next to the title up top (replaces the old "Filter ... 12/45" line).
   var fbuf: uint8[80];
   var fb_c: cstring = (cstring)((int64)(&(fbuf[0])));
-  var fp_pre: string = "Filter ";
-  var fjpos: int32 = fs_copy_into(fb_c, 80, 0, fp_pre.chars);
-  if (fk == AK_ANY()) {
-    var fall: string = "All  (F4)";
-    fjpos = fs_copy_into(fb_c, 80, fjpos, fall.chars);
-  } else {
-    fjpos = fs_copy_into(fb_c, 80, fjpos, asset_kind_label_cstr(fk));
-    var fsuf: string = "  (F4)";
-    fjpos = fs_copy_into(fb_c, 80, fjpos, fsuf.chars);
+  int_to_dec(nt, (int64)avc);
+  var fjpos: int32 = fs_copy_into(fb_c, 80, 0, nt);
+  if (avc != ac) {
+    var slash: string = "/";
+    fjpos = fs_copy_into(fb_c, 80, fjpos, slash.chars);
+    int_to_dec(nt, (int64)ac);
+    fjpos = fs_copy_into(fb_c, 80, fjpos, nt);
   }
   fb_c[fjpos] = 0;
-  editor_text_out(mdc, asset_x + (int32)16, EDITOR_TOPBAR_H() + (int32)50, fb_c);
+  Win32_SetTextColor(mdc, COLORREF_DIM_TEXT());
+  Win32_TextOutA(mdc, asset_x + (int32)68, EDITOR_TOPBAR_H() + (int32)14, fb_c, (int32)strlen(fb_c));
+  Win32_SetTextColor(mdc, COLORREF_WHITE());
 
-  var ai: int32 = 0;
+  // Filter chips: clickable kind filters above the list. F4 still cycles for
+  // keyboard users.
+  var fk: int32 = asset_manager_filter(am);
+  var chip_y: int32 = EDITOR_TOPBAR_H() + (int32)50;
+  var chip_h: int32 = 20;
+  var chip_w: int32 = 42;
+  var chip_x0: int32 = asset_x + (int32)8;
+  editor_draw_asset_chip(px, mdc, ww, hh, chip_x0 + 0 * chip_w, chip_y, chip_w, chip_h, "All",   fk == AK_ANY());
+  editor_draw_asset_chip(px, mdc, ww, hh, chip_x0 + 1 * chip_w, chip_y, chip_w, chip_h, "Mesh",  fk == AK_MESH());
+  editor_draw_asset_chip(px, mdc, ww, hh, chip_x0 + 2 * chip_w, chip_y, chip_w, chip_h, "Tex",   fk == AK_TEXTURE());
+  editor_draw_asset_chip(px, mdc, ww, hh, chip_x0 + 3 * chip_w, chip_y, chip_w, chip_h, "Lua",   fk == AK_LUA());
+  editor_draw_asset_chip(px, mdc, ww, hh, chip_x0 + 4 * chip_w, chip_y, chip_w, chip_h, "Scene", fk == AK_SCENE());
+  editor_draw_asset_chip(px, mdc, ww, hh, chip_x0 + 5 * chip_w, chip_y, chip_w, chip_h, "Mat",   fk == AK_MATERIAL());
+  editor_draw_asset_chip(px, mdc, ww, hh, chip_x0 + 6 * chip_w, chip_y, chip_w, chip_h, "Mtl",   fk == AK_METTLE());
+
   var asc: int32 = asset_scroll(am);
   var asel: int32 = asset_selected_index(am);
   var ymax: int32 = hh / EDITOR_LINE_H() - (int32)6;
   if (ymax > (int32)28) {
     ymax = (int32)28;
   }
-  // Walk all rows; only render those matching the filter. Use a separate visual
-  // index so the filtered list stays contiguous on screen. The selection still
-  // refers to the underlying row index in the manager.
   var visible: int32 = 0;
-  var asset_idx: int32 = asc;
-  while (visible < ymax && asset_idx < ac) {
-    var kid: int32 = asset_row_kind(am, asset_idx);
-    var skip: int32 = 0;
-    if (fk != AK_ANY() && kid != fk) {
-      skip = 1;
+  while (visible < ymax) {
+    var asset_idx: int32 = asset_visible_row_index(am, asc + visible);
+    if (asset_idx < 0) {
+      break;
     }
-    if (skip == 0) {
+    var kid: int32 = asset_row_kind(am, asset_idx);
       var y2: int32 = EDITOR_BODY_TOP() + (int32)20 + visible * EDITOR_LINE_H();
       if (asset_idx == asel) {
         fb_fill_rect(px, ww, hh, asset_x + (int32)8, y2 - (int32)2, asset_r - (int32)8, y2 + EDITOR_LINE_H(), hi);
       }
-      var vf: cstring = asset_row_vfs_cstr(am, asset_idx);
+      var row_state: int32 = asset_row_import_state(am, asset_idx);
+      var stcs: cstring = asset_import_state_label_cstr(row_state);
       var kt: cstring = asset_kind_label_cstr(kid);
-      Win32_TextOutA(mdc, asset_x + (int32)14, y2, kt, (int32)strlen(kt));
-      Win32_TextOutA(mdc, asset_x + (int32)72, y2, vf, (int32)strlen(vf));
+      // Compute size string first so we know how many chars it eats from the
+      // right side, leaving the rest for the (truncated) path.
+      var sz_buf: uint8[16];
+      var sz_c: cstring = (cstring)((int64)(&(sz_buf[0])));
+      var sz_n: int32 = asset_format_size(sz_c, 16, asset_row_size(am, asset_idx));
+      var path_x: int32 = asset_x + (int32)96;
+      var size_x: int32 = asset_r - (int32)12 - sz_n * (int32)8;
+      var path_max_px: int32 = size_x - (int32)6 - path_x;
+      var path_max_chars: int32 = path_max_px / (int32)8;
+      if (path_max_chars < 4) {
+        path_max_chars = 4;
+      }
+      var pbuf: uint8[80];
+      editor_copy_tail_trunc(&(pbuf[0]), 80, asset_row_vfs_cstr(am, asset_idx), path_max_chars);
+      if (row_state == IS_IMPORTED()) {
+        Win32_SetTextColor(mdc, COLORREF_WHITE());
+      } else {
+        Win32_SetTextColor(mdc, COLORREF_DIM_TEXT());
+      }
+      Win32_TextOutA(mdc, asset_x + (int32)14, y2, stcs, (int32)strlen(stcs));
+      Win32_TextOutA(mdc, asset_x + (int32)44, y2, kt, (int32)strlen(kt));
+      Win32_TextOutA(mdc, path_x, y2, (cstring)((int64)(&(pbuf[0]))), (int32)strlen((cstring)((int64)(&(pbuf[0])))));
+      Win32_TextOutA(mdc, size_x, y2, sz_c, sz_n);
+      Win32_SetTextColor(mdc, COLORREF_WHITE());
       visible = visible + 1;
-    }
-    asset_idx = asset_idx + 1;
   }
   if (asel >= 0 && asel < ac) {
+    // Selected path (truncated to panel width by the OS clip; full path stays
+    // visible via the inspector / status bar).
     Win32_SetTextColor(mdc, COLORREF_DIM_TEXT());
-    var ap: string = "Selected";
-    editor_text_out(mdc, asset_x + (int32)16, hh - (int32)68, ap.chars);
-    Win32_TextOutA(mdc, asset_x + (int32)16, hh - (int32)50, asset_row_vfs_cstr(am, asel), (int32)strlen(asset_row_vfs_cstr(am, asel)));
+    Win32_TextOutA(mdc, asset_x + (int32)16, hh - (int32)68, asset_row_vfs_cstr(am, asel), (int32)strlen(asset_row_vfs_cstr(am, asel)));
+    Win32_SetTextColor(mdc, COLORREF_WHITE());
+
+    // Action bar: three buttons across the bottom of the asset panel.
+    var act_y: int32 = hh - (int32)44;
+    var act_h: int32 = 22;
+    var act_w: int32 = (EDITOR_ASSET_W() - (int32)24) / (int32)3;
+    var act_x0: int32 = asset_x + (int32)8;
+    var sel_state: int32 = asset_row_import_state(am, asel);
+    var sel_kind: int32 = asset_row_kind(am, asel);
+    if (sel_state == IS_IMPORTED()) {
+      fb_fill_rect(px, ww, hh, act_x0 + 0 * act_w, act_y, act_x0 + 0 * act_w + act_w - (int32)4, act_y + act_h, swizzle_bgra8(70, 60, 60, 255));
+      editor_draw_button(mdc, act_x0 + 0 * act_w, act_y, "Unimport");
+    } else {
+      fb_fill_rect(px, ww, hh, act_x0 + 0 * act_w, act_y, act_x0 + 0 * act_w + act_w - (int32)4, act_y + act_h, swizzle_bgra8(60, 80, 60, 255));
+      editor_draw_button(mdc, act_x0 + 0 * act_w, act_y, "Import");
+    }
+    var use_bg: uint32 = swizzle_bgra8(55, 55, 66, 255);
+    var use_enabled: int32 = 0;
+    if (sel_kind == AK_MESH() || sel_kind == AK_LUA()) {
+      use_enabled = 1;
+    } else {
+      use_bg = swizzle_bgra8(38, 38, 44, 255);
+    }
+    fb_fill_rect(px, ww, hh, act_x0 + 1 * act_w, act_y, act_x0 + 1 * act_w + act_w - (int32)4, act_y + act_h, use_bg);
+    if (use_enabled != 0) {
+      Win32_SetTextColor(mdc, COLORREF_WHITE());
+    } else {
+      Win32_SetTextColor(mdc, COLORREF_DIM_TEXT());
+    }
+    if (sel_kind == AK_LUA()) {
+      var ula: string = "Assign";
+      editor_text_out(mdc, act_x0 + 1 * act_w + (int32)8, act_y + (int32)4, ula.chars);
+    } else {
+      if (sel_kind == AK_MESH()) {
+        var upl: string = "Place";
+        editor_text_out(mdc, act_x0 + 1 * act_w + (int32)8, act_y + (int32)4, upl.chars);
+      } else {
+        var uns: string = "Use";
+        editor_text_out(mdc, act_x0 + 1 * act_w + (int32)8, act_y + (int32)4, uns.chars);
+      }
+    }
+    Win32_SetTextColor(mdc, COLORREF_WHITE());
+    fb_fill_rect(px, ww, hh, act_x0 + 2 * act_w, act_y, act_x0 + 2 * act_w + act_w - (int32)4, act_y + act_h, swizzle_bgra8(55, 55, 66, 255));
+    editor_draw_button(mdc, act_x0 + 2 * act_w, act_y, "Reveal");
   }
-  editor_draw_inspector(g, ui, sc, mdc);
+  editor_draw_inspector(g, ui, sc, vp, mdc);
   editor_draw_output(g, mdc);
   editor_draw_topbar(g, mdc, proj);
   editor_draw_project_settings(g, ui, proj, mdc);
+  // Modal code editor overlay: covers the viewport region. The caller hides
+  // the Vulkan child while this is open so the GDI overlay is visible.
+  if (game_tree_editor_open(gt) != 0) {
+    var ox0: int32 = EDITOR_PANEL_W() + (int32)8;
+    var oy0: int32 = EDITOR_BODY_TOP() - (int32)28;
+    var ox1: int32 = ww - EDITOR_INSPECTOR_W() - (int32)4;
+    if (ox1 <= ox0 + (int32)200) {
+      ox1 = ww - (int32)8;
+    }
+    var oy1: int32 = hh - (int32)8;
+    game_tree_render_editor(gt, px, mdc, ww, hh, ox0, oy0, ox1 - ox0, oy1 - oy0);
+  }
+  // Right-click context menu draws on top of everything (it can extend past
+  // the left panel into the viewport area).
+  game_tree_render_menu(gt, px, mdc, ww, hh);
   game_win32_present(g);
   return 0;
 }

@@ -1,6 +1,6 @@
 // Playtest manifest read/write.
 //
-// The editor writes this file under .methplay/session_<id>/ before launching
+// The editor writes this file under .mettleplay/session_<id>/ before launching
 // the server and client. Runners load it to agree on snapshot paths, localhost
 // endpoint, tick rate, and log files.
 import "std/conv";

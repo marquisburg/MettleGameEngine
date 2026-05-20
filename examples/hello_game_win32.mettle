@@ -1,10 +1,10 @@
 // Hello Win32 + GDI frame buffer (Windows only).
 //
-// Build (from repo root, with methlang on PATH or use bin\meth-build.bat):
-//   bin\methlang.exe --build --emit-obj --linker internal examples\hello_game_win32.meth -o examples\hello_game_win32.exe
+// Build (from repo root, with mettle on PATH or use bin\mettle-build.bat):
+//   bin\mettle.exe --build --emit-obj --linker internal examples\hello_game_win32.mettle -o examples\hello_game_win32.exe
 //
 // Or:
-//   bin\meth-build.bat examples\hello_game_win32.meth --emit-obj --linker internal -o examples\hello_game_win32.exe
+//   bin\mettle-build.bat examples\hello_game_win32.mettle --emit-obj --linker internal -o examples\hello_game_win32.exe
 
 import "../engine/game_gdi_win32";
 import "std/io";
@@ -12,7 +12,7 @@ import "std/process";
 import "std/win32";
 
 function main() -> int32 {
-  var g: GameWin32* = game_win32_create(cstr("Methlang GDI MVP"), 640, 480);
+  var g: GameWin32* = game_win32_create(cstr("Mettle GDI MVP"), 640, 480);
   if (g == 0) {
     println_err(cstr("game_win32_create failed"));
     return 1;

@@ -23,8 +23,11 @@
 // engine_viewport_input_tick), or after F (frame). Scales: pos_m = metres * 1000;
 // yaw_e4/pitch_e4 = radians * 10000; fwd/rgt_m = unit vector * 1000; speed_mm = fly speed.
 import "engine_mesh";
+import "engine_output_log";
 import "engine_scene";
+import "engine_terrain_store";
 import "game_gdi_win32";
+import "std/conv";
 import "std/io";
 import "std/mem";
 
@@ -88,6 +91,27 @@ export struct EngineViewport {
   manip_axis: int32;
   manip_dragging: int32;
   manip_hover_axis: int32;
+  // Sticky latch: set when a LocalScript drives the camera via the
+  // engine.camera_set_* API. Once set, the playtest client's built-in
+  // default fly-cam stops running so the script owns the camera. Stays 0
+  // forever in editor builds (the editor uses engine_viewport_input_tick).
+  script_camera_active: int32;
+  terrain_sculpt_mode: int32;
+  terrain_brush_op: int32;
+  vk_t_was_down: int32;
+  terrain_brush_radius: float64;
+  terrain_brush_strength: float64;
+  // Last terrain ray-hit under the cursor, in world space. The Vulkan scene
+  // builder consumes these to draw the live brush ring/crosshair. Refreshed
+  // every input_tick: brush_hit_valid is 1 when the cursor is over the
+  // currently-selected terrain entity (regardless of sculpt mode); the ring
+  // is only drawn when terrain_sculpt_mode is also set, but keeping the hit
+  // fresh while just hovering lets us preview without toggling.
+  brush_hit_x: float64;
+  brush_hit_y: float64;
+  brush_hit_z: float64;
+  brush_hit_valid: int32;
+  brush_hit_id: int32;
 }
 
 export function VIEWPORT_VK_LEFT() -> int32 { return 37; }
@@ -100,9 +124,15 @@ export function VIEWPORT_DEBUG_CAMERA_CFRAME() -> int32 {
   return 1;
 }
 
+export function VIEWPORT_DEBUG_TERRAIN_SCULPT() -> int32 {
+  return 1;
+}
+
 function viewport_bytes() -> int64 {
-  // Methlang layout: 12×float64 + 40×int32; round up for calloc slack.
-  return (int64)256;
+  // Layout: 12 leading float64 (96) + 49 int32 mid (196) + 5 trailing float64
+  // (40) + 2 trailing int32 (8) = 340 bytes. Round up with headroom so we
+  // don't trip allocator alignment edge cases.
+  return (int64)384;
 }
 
 // ---- Camera basis -----------------------------------------------------------
@@ -182,6 +212,17 @@ export function engine_viewport_create(g: GameWin32*) -> EngineViewport* {
   vp->manip_axis = 0;
   vp->manip_dragging = 0;
   vp->manip_hover_axis = 0;
+  vp->script_camera_active = 0;
+  vp->terrain_sculpt_mode = 0;
+  vp->terrain_brush_op = TERRAIN_OP_RAISE();
+  vp->vk_t_was_down = 0;
+  vp->terrain_brush_radius = 3.5;
+  vp->terrain_brush_strength = 0.09;
+  vp->brush_hit_x = 0.0;
+  vp->brush_hit_y = 0.0;
+  vp->brush_hit_z = 0.0;
+  vp->brush_hit_valid = 0;
+  vp->brush_hit_id = 0;
   return vp;
 }
 
@@ -199,6 +240,7 @@ export function engine_viewport_reset_input_edges(vp: EngineViewport*) {
   vp->left_was_down = game_input_key_held(1);
   vp->right_was_down = game_input_key_held(2);
   vp->vk_f_was_down = game_input_key_held(70);
+  vp->vk_t_was_down = game_input_key_held(84);
   vp->drag_selected = 0;
   vp->manip_dragging = 0;
   vp->manip_axis = 0;
@@ -229,6 +271,13 @@ function vp_inside(mx: int32, my: int32, vx: int32, vy: int32, vw: int32, vh: in
   if (mx < vx || my < vy) { return 0; }
   if (mx >= vx + vw || my >= vy + vh) { return 0; }
   return 1;
+}
+
+// Must match vk_scene_build_mvp's 60 degree vertical FOV. Selection, gizmo hit
+// testing, CPU fallback drawing, and the Vulkan renderer all need the same
+// projection or the cursor points at a different world ray than the image shows.
+function vp_proj_fov_scale() -> float64 {
+  return 1.73205080756887729353;
 }
 
 // --emit-obj: scaling a struct float member in one expression for i64 cast can
@@ -411,6 +460,98 @@ function vp_debug_print_camera_cframe(vp: EngineViewport*) {
   }
 }
 
+function vp_debug_copy_into(dst: cstring, cap: int32, pos: int32, src: cstring) -> int32 {
+  if (dst == 0 || src == 0 || cap <= 0) {
+    return pos;
+  }
+  var p: int32 = pos;
+  var i: int32 = 0;
+  while (p + 1 < cap && (uint8)(src[i]) != (uint8)0) {
+    dst[p] = src[i];
+    p = p + 1;
+    i = i + 1;
+  }
+  dst[p] = 0;
+  return p;
+}
+
+function vp_debug_append_i64(dst: cstring, cap: int32, pos: int32, v: int64) -> int32 {
+  var tmp: uint8[32];
+  int_to_dec((cstring)((int64)(&(tmp[0]))), v);
+  return vp_debug_copy_into(dst, cap, pos, (cstring)((int64)(&(tmp[0]))));
+}
+
+function vp_debug_scaled(v: float64, scale: float64) -> int64 {
+  if (v < 0.0) {
+    return 0 - (int64)((0.0 - v) * scale);
+  }
+  return (int64)(v * scale);
+}
+
+function vp_terrain_local_in_bounds(lx: float64, lz: float64, hx: float64, hz: float64) -> int32 {
+  // Use integer-scaled comparisons here. The direct object backend has been
+  // brittle with compound float bounds checks, and the debug log proved it can
+  // report in-range local coords as "out-of-bounds".
+  var lxi: int64 = vp_debug_scaled(lx, 1000000.0);
+  var lzi: int64 = vp_debug_scaled(lz, 1000000.0);
+  var hxi: int64 = vp_debug_scaled(hx, 1000000.0);
+  var hzi: int64 = vp_debug_scaled(hz, 1000000.0);
+  if (lxi < 0 - hxi) {
+    return 0;
+  }
+  if (lxi > hxi) {
+    return 0;
+  }
+  if (lzi < 0 - hzi) {
+    return 0;
+  }
+  if (lzi > hzi) {
+    return 0;
+  }
+  return 1;
+}
+
+function vp_debug_log_sculpt(label: cstring, id: int32, mx: int32, my: int32, hit: int32, wx: float64, wy: float64, wz: float64, lx: float64, lz: float64, hx: float64, hz: float64, radius: float64, strength: float64, op: int32, cells: int32) {
+  if (VIEWPORT_DEBUG_TERRAIN_SCULPT() == 0) {
+    return;
+  }
+  var buf: uint8[256];
+  var p: int32 = 0;
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, cstr("[terrain] "));
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, label);
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, cstr(" id="));
+  p = vp_debug_append_i64((cstring)((int64)(&(buf[0]))), 256, p, (int64)id);
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, cstr(" mouse="));
+  p = vp_debug_append_i64((cstring)((int64)(&(buf[0]))), 256, p, (int64)mx);
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, cstr(","));
+  p = vp_debug_append_i64((cstring)((int64)(&(buf[0]))), 256, p, (int64)my);
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, cstr(" hit="));
+  p = vp_debug_append_i64((cstring)((int64)(&(buf[0]))), 256, p, (int64)hit);
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, cstr(" wmm="));
+  p = vp_debug_append_i64((cstring)((int64)(&(buf[0]))), 256, p, vp_debug_scaled(wx, 1000.0));
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, cstr(","));
+  p = vp_debug_append_i64((cstring)((int64)(&(buf[0]))), 256, p, vp_debug_scaled(wy, 1000.0));
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, cstr(","));
+  p = vp_debug_append_i64((cstring)((int64)(&(buf[0]))), 256, p, vp_debug_scaled(wz, 1000.0));
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, cstr(" lmm="));
+  p = vp_debug_append_i64((cstring)((int64)(&(buf[0]))), 256, p, vp_debug_scaled(lx, 1000.0));
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, cstr(","));
+  p = vp_debug_append_i64((cstring)((int64)(&(buf[0]))), 256, p, vp_debug_scaled(lz, 1000.0));
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, cstr(" halfmm="));
+  p = vp_debug_append_i64((cstring)((int64)(&(buf[0]))), 256, p, vp_debug_scaled(hx, 1000.0));
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, cstr(","));
+  p = vp_debug_append_i64((cstring)((int64)(&(buf[0]))), 256, p, vp_debug_scaled(hz, 1000.0));
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, cstr(" rmm="));
+  p = vp_debug_append_i64((cstring)((int64)(&(buf[0]))), 256, p, vp_debug_scaled(radius, 1000.0));
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, cstr(" str_e4="));
+  p = vp_debug_append_i64((cstring)((int64)(&(buf[0]))), 256, p, vp_debug_scaled(strength, 10000.0));
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, cstr(" op="));
+  p = vp_debug_append_i64((cstring)((int64)(&(buf[0]))), 256, p, (int64)op);
+  p = vp_debug_copy_into((cstring)((int64)(&(buf[0]))), 256, p, cstr(" cells="));
+  p = vp_debug_append_i64((cstring)((int64)(&(buf[0]))), 256, p, (int64)cells);
+  output_log_info((cstring)((int64)(&(buf[0]))));
+}
+
 // Returns 1 if look-only pending changed pose. Keyboard translation runs in
 // engine_viewport_input_tick (direct mm); render calls this to flush stray look.
 function vp_apply_pending_camera(vp: EngineViewport*) -> int32 {
@@ -454,7 +595,7 @@ function vp_depth(vp: EngineViewport*, x: float64, y: float64, z: float64) -> fl
   return ry * sp + z1 * cp;
 }
 
-function vp_proj_x(vp: EngineViewport*, x: float64, y: float64, z: float64, vx: int32, vw: int32) -> int32 {
+function vp_proj_x(vp: EngineViewport*, x: float64, y: float64, z: float64, vx: int32, vw: int32, vh: int32) -> int32 {
   var cy: float64 = cos(vp->cam_yaw);
   var sy: float64 = sin(vp->cam_yaw);
   var rx: float64 = x - vp_cam_x_m(vp);
@@ -462,7 +603,7 @@ function vp_proj_x(vp: EngineViewport*, x: float64, y: float64, z: float64, vx: 
   var x1: float64 = rx * cy - rz * sy;
   var d: float64 = vp_depth(vp, x, y, z);
   if (d < 0.15) { d = 0.15; }
-  return vx + vw / 2 + (int32)((x1 / d) * (float64)(vw / 2));
+  return vx + vw / 2 + (int32)((x1 / d) * vp_proj_fov_scale() * (float64)(vh / 2));
 }
 
 function vp_proj_y(vp: EngineViewport*, x: float64, y: float64, z: float64, vy: int32, vw: int32, vh: int32) -> int32 {
@@ -477,7 +618,7 @@ function vp_proj_y(vp: EngineViewport*, x: float64, y: float64, z: float64, vy: 
   var y2: float64 = ry * cp - z1 * sp;
   var d: float64 = vp_depth(vp, x, y, z);
   if (d < 0.15) { d = 0.15; }
-  return vy + vh / 2 - (int32)((y2 / d) * (float64)(vh / 2));
+  return vy + vh / 2 - (int32)((y2 / d) * vp_proj_fov_scale() * (float64)(vh / 2));
 }
 
 function vp_cam_x(vp: EngineViewport*, x: float64, y: float64, z: float64) -> float64 {
@@ -504,14 +645,14 @@ function vp_cam_z(vp: EngineViewport*, x: float64, y: float64, z: float64) -> fl
   return vp_depth(vp, x, y, z);
 }
 
-function vp_proj_cam_x(cx: float64, cz: float64, vx: int32, vw: int32) -> int32 {
+function vp_proj_cam_x(cx: float64, cz: float64, vx: int32, vw: int32, vh: int32) -> int32 {
   if (cz < 0.15) { cz = 0.15; }
-  return vx + vw / 2 + (int32)((cx / cz) * (float64)(vw / 2));
+  return vx + vw / 2 + (int32)((cx / cz) * vp_proj_fov_scale() * (float64)(vh / 2));
 }
 
 function vp_proj_cam_y(cy: float64, cz: float64, vy: int32, vw: int32, vh: int32) -> int32 {
   if (cz < 0.15) { cz = 0.15; }
-  return vy + vh / 2 - (int32)((cy / cz) * (float64)(vh / 2));
+  return vy + vh / 2 - (int32)((cy / cz) * vp_proj_fov_scale() * (float64)(vh / 2));
 }
 
 // Per-frame camera trig + origin (metres). Avoids recomputing cos/sin and
@@ -570,12 +711,12 @@ function vp_depth_basis(b: VpCamBasis*, x: float64, y: float64, z: float64) -> f
   return ry * b->sp + z1 * b->cp;
 }
 
-function vp_proj_x_basis(b: VpCamBasis*, x: float64, y: float64, z: float64, vx: int32, vw: int32) -> int32 {
+function vp_proj_x_basis(b: VpCamBasis*, x: float64, y: float64, z: float64, vx: int32, vw: int32, vh: int32) -> int32 {
   var v: VpVec3;
   vp_world_to_cam_into(b, x, y, z, &v);
   var d: float64 = v.z;
   if (d < 0.15) { d = 0.15; }
-  return vx + vw / 2 + (int32)((v.x / d) * (float64)(vw / 2));
+  return vx + vw / 2 + (int32)((v.x / d) * vp_proj_fov_scale() * (float64)(vh / 2));
 }
 
 function vp_proj_y_basis(b: VpCamBasis*, x: float64, y: float64, z: float64, vy: int32, vw: int32, vh: int32) -> int32 {
@@ -583,7 +724,7 @@ function vp_proj_y_basis(b: VpCamBasis*, x: float64, y: float64, z: float64, vy:
   vp_world_to_cam_into(b, x, y, z, &v);
   var d: float64 = v.z;
   if (d < 0.15) { d = 0.15; }
-  return vy + vh / 2 - (int32)((v.y / d) * (float64)(vh / 2));
+  return vy + vh / 2 - (int32)((v.y / d) * vp_proj_fov_scale() * (float64)(vh / 2));
 }
 
 // ---- Framebuffer drawing ----------------------------------------------------
@@ -733,9 +874,9 @@ function vp_wline_basis(b: VpCamBasis*, px: uint32*, fw: int32, fh: int32, vx: i
     byc = byc + (ayc - byc) * tb;
     bzc = nearz;
   }
-  var sx0: int32 = vp_proj_cam_x(axc, azc, vx, vw);
+  var sx0: int32 = vp_proj_cam_x(axc, azc, vx, vw, vh);
   var sy0: int32 = vp_proj_cam_y(ayc, azc, vy, vw, vh);
-  var sx1: int32 = vp_proj_cam_x(bxc, bzc, vx, vw);
+  var sx1: int32 = vp_proj_cam_x(bxc, bzc, vx, vw, vh);
   var sy1: int32 = vp_proj_cam_y(byc, bzc, vy, vw, vh);
   vp_line(px, fw, fh, vx, vy, vw, vh, sx0, sy0, sx1, sy1, c);
 }
@@ -752,9 +893,9 @@ function vp_wline_basis_thick(b: VpCamBasis*, px: uint32*, fw: int32, fh: int32,
     vp_wline_basis(b, px, fw, fh, vx, vy, vw, vh, ax, ay, az, bx, by, bz, c);
     return;
   }
-  var sx0: int32 = vp_proj_cam_x(va.x, va.z, vx, vw);
+  var sx0: int32 = vp_proj_cam_x(va.x, va.z, vx, vw, vh);
   var sy0: int32 = vp_proj_cam_y(va.y, va.z, vy, vw, vh);
-  var sx1: int32 = vp_proj_cam_x(vb.x, vb.z, vx, vw);
+  var sx1: int32 = vp_proj_cam_x(vb.x, vb.z, vx, vw, vh);
   var sy1: int32 = vp_proj_cam_y(vb.y, vb.z, vy, vw, vh);
   if (thick < 1) { thick = 1; }
   vp_line(px, fw, fh, vx, vy, vw, vh, sx0, sy0, sx1, sy1, c);
@@ -776,7 +917,7 @@ function vp_wsquare_basis(b: VpCamBasis*, px: uint32*, fw: int32, fh: int32, vx:
     return;
   }
   if (half < 2) { half = 2; }
-  var sx: int32 = vp_proj_x_basis(b, wx, wy, wz, vx, vw);
+  var sx: int32 = vp_proj_x_basis(b, wx, wy, wz, vx, vw, vh);
   var sy: int32 = vp_proj_y_basis(b, wx, wy, wz, vy, vw, vh);
   vp_fill(px, fw, fh, sx - half, sy - half, sx + half + 1, sy + half + 1, c);
 }
@@ -811,7 +952,11 @@ function vp_ecorner(sc: Scene*, e: Entity*, idx: int32, axis: int32) -> float64 
   return scene_entity_corner(sc, e, idx, axis);
 }
 
-// Must stay close to vksc_gizmo_radius in engine_vk_scene.meth so hit-test
+function vp_shadow_light_x() -> float64 { return -0.35; }
+function vp_shadow_light_y() -> float64 { return 0.78; }
+function vp_shadow_light_z() -> float64 { return -0.52; }
+
+// Must stay close to vksc_gizmo_radius in engine_vk_scene.mettle so hit-test
 // geometry tracks Vulkan rendering. The radius follows camera depth, keeping
 // handles usable on-screen instead of tiny/fat as the camera moves.
 function vp_gizmo_radius_basis(sc: Scene*, b: VpCamBasis*, e: Entity*) -> float64 {
@@ -824,7 +969,7 @@ function vp_gizmo_radius_basis(sc: Scene*, b: VpCamBasis*, e: Entity*) -> float6
   var d: float64 = vp_depth_basis(b, wx, wy, wz);
   if (d < 2.0) { d = 2.0; }
   var r: float64 = d * 0.16;
-  var base: float64 = e->half * scene_entity_world_scale(sc, e);
+  var base: float64 = scene_entity_radius(sc, e);
   var min_r: float64 = base * 0.75;
   if (min_r < 0.55) { min_r = 0.55; }
   if (r < min_r) { r = min_r; }
@@ -860,7 +1005,7 @@ function vp_entity_screen_culled(sc: Scene*, b: VpCamBasis*, e: Entity*, vx: int
     vp_world_to_cam_into(b, wx, wy, wz, &vc);
     if (vc.z >= 0.12) {
       any = 1;
-      var sx: int32 = vp_proj_cam_x(vc.x, vc.z, vx, vw);
+      var sx: int32 = vp_proj_cam_x(vc.x, vc.z, vx, vw, vh);
       var syv: int32 = vp_proj_cam_y(vc.y, vc.z, vy, vw, vh);
       if (sx < minsx) { minsx = sx; }
       if (sx > maxsx) { maxsx = sx; }
@@ -1033,9 +1178,9 @@ function vp_gizmo_hit_move_scale(sc: Scene*, basis: VpCamBasis*, e: Entity*, mx:
   if (is_scale != 0) {
     r = r * 0.78;
   }
-  // 40px grab radius (squared); matches the rotate-ring tolerance so all
+  // 52px grab radius (squared); handles are controls, not pixel hunts.
   // tools feel equally forgiving.
-  var thr: float64 = 1600.0;
+  var thr: float64 = 2704.0;
   var best_a: int32 = 0;
   var best_d: float64 = 1000000000.0;
   var ai: int32 = 1;
@@ -1049,9 +1194,9 @@ function vp_gizmo_hit_move_scale(sc: Scene*, basis: VpCamBasis*, e: Entity*, mx:
     var ppx1: float64 = ppx0 + dxw * r;
     var ppy1: float64 = ppy0 + dyw * r;
     var ppz1: float64 = ppz0 + dzw * r;
-    var sx0: int32 = vp_proj_x_basis(basis, ppx0, ppy0, ppz0, vx, vw);
+    var sx0: int32 = vp_proj_x_basis(basis, ppx0, ppy0, ppz0, vx, vw, vh);
     var sy0: int32 = vp_proj_y_basis(basis, ppx0, ppy0, ppz0, vy, vw, vh);
-    var sx1: int32 = vp_proj_x_basis(basis, ppx1, ppy1, ppz1, vx, vw);
+    var sx1: int32 = vp_proj_x_basis(basis, ppx1, ppy1, ppz1, vx, vw, vh);
     var sy1: int32 = vp_proj_y_basis(basis, ppx1, ppy1, ppz1, vy, vw, vh);
     if (vp_depth_basis(basis, ppx0, ppy0, ppz0) >= 0.18 && vp_depth_basis(basis, ppx1, ppy1, ppz1) >= 0.18) {
       var dsq: float64 = vp_seg_dist_sq(mx, my, sx0, sy0, sx1, sy1);
@@ -1076,9 +1221,9 @@ function vp_gizmo_hit_rotate(sc: Scene*, basis: VpCamBasis*, e: Entity*, mx: int
     return 0;
   }
   var r: float64 = vp_gizmo_radius_basis(sc, basis, e) * 0.92;
-  // Generous 40px grab band (squared) and 36 segments. Rotation rings project
+  // Generous 52px grab band (squared) and 36 segments. Rotation rings project
   // to thin ellipses; a tight tolerance made them nearly impossible to grab.
-  var thr: float64 = 1600.0;
+  var thr: float64 = 2704.0;
   var best_a: int32 = 0;
   var best_d: float64 = 1000000000.0;
   var seg_n: int32 = 36;
@@ -1105,9 +1250,9 @@ function vp_gizmo_hit_rotate(sc: Scene*, basis: VpCamBasis*, e: Entity*, mx: int
       var qx1: float64 = ox + r * (c1 * rux + s1 * rvx);
       var qy1: float64 = oy + r * (c1 * ruy + s1 * rvy);
       var qz1: float64 = oz + r * (c1 * ruz + s1 * rvz);
-      var sx0: int32 = vp_proj_x_basis(basis, qx0, qy0, qz0, vx, vw);
+      var sx0: int32 = vp_proj_x_basis(basis, qx0, qy0, qz0, vx, vw, vh);
       var sy0: int32 = vp_proj_y_basis(basis, qx0, qy0, qz0, vy, vw, vh);
-      var sx1: int32 = vp_proj_x_basis(basis, qx1, qy1, qz1, vx, vw);
+      var sx1: int32 = vp_proj_x_basis(basis, qx1, qy1, qz1, vx, vw, vh);
       var sy1: int32 = vp_proj_y_basis(basis, qx1, qy1, qz1, vy, vw, vh);
       if (vp_depth_basis(basis, qx0, qy0, qz0) >= 0.18 && vp_depth_basis(basis, qx1, qy1, qz1) >= 0.18) {
         var dsq: float64 = vp_seg_dist_sq(mx, my, sx0, sy0, sx1, sy1);
@@ -1125,10 +1270,10 @@ function vp_gizmo_hit_rotate(sc: Scene*, basis: VpCamBasis*, e: Entity*, mx: int
   // to the camera (the one the user can actually see/grab). This makes the
   // rotate gizmo grabbable even when rings are edge-on.
   if (best_a == 0) {
-    var ocx: int32 = vp_proj_x_basis(basis, ox, oy, oz, vx, vw);
+    var ocx: int32 = vp_proj_x_basis(basis, ox, oy, oz, vx, vw, vh);
     var ocy: int32 = vp_proj_y_basis(basis, ox, oy, oz, vy, vw, vh);
     var rpx: float64 = ox + r;
-    var ddx: float64 = (float64)(vp_proj_x_basis(basis, rpx, oy, oz, vx, vw) - ocx);
+    var ddx: float64 = (float64)(vp_proj_x_basis(basis, rpx, oy, oz, vx, vw, vh) - ocx);
     var rpy: float64 = oy + r;
     var ddy: float64 = (float64)(vp_proj_y_basis(basis, ox, rpy, oz, vy, vw, vh) - ocy);
     var screen_r: float64 = sqrt(ddx * ddx + ddy * ddy);
@@ -1311,9 +1456,100 @@ function vp_entity_edge(sc: Scene*, basis: VpCamBasis*, e: Entity*, px: uint32*,
   vp_wline_basis(basis, px, fw, fh, vx, vy, vw, vh, ax, ay, az, bx, by, bz, c);
 }
 
-// Draw one entity as a wire cube in colour c (all 12 edges of the unit box).
+function vp_draw_entity_shadow(sc: Scene*, basis: VpCamBasis*, e: Entity*, px: uint32*, fw: int32, fh: int32, vx: int32, vy: int32, vw: int32, vh: int32) {
+  if (e == 0 || basis == 0 || e->kind == SK_TERRAIN()) {
+    return;
+  }
+  var c: uint32 = swizzle_bgra8((uint8)32, (uint8)36, (uint8)42, (uint8)255);
+  var cx: float64 = scene_entity_world_pos(sc, e, 0);
+  var cz: float64 = scene_entity_world_pos(sc, e, 2);
+  var radius: float64 = scene_entity_radius(sc, e);
+  var h: float64 = scene_entity_half_y(e) * scene_entity_world_scale(sc, e) * 2.0;
+  if (radius < 0.35) { radius = 0.35; }
+  if (h < 0.35) { h = 0.35; }
+  var dx: float64 = 0.0 - vp_shadow_light_x();
+  var dz: float64 = 0.0 - vp_shadow_light_z();
+  var dl: float64 = sqrt(dx * dx + dz * dz);
+  if (dl < 0.000001) { dl = 1.0; }
+  dx = dx / dl;
+  dz = dz / dl;
+  var pxv: float64 = 0.0 - dz;
+  var pzv: float64 = dx;
+  var len: float64 = radius * 1.20 + h * 0.42;
+  var wid: float64 = radius * 0.72;
+  if (len > 9.0) { len = 9.0; }
+  if (wid > 4.0) { wid = 4.0; }
+  var gy: float64 = scene_ground_height_at(sc, cx, cz, 0.0) + 0.018;
+  var x0: float64 = cx + dx * len;
+  var z0: float64 = cz + dz * len;
+  var y0: float64 = scene_ground_height_at(sc, x0, z0, gy) + 0.018;
+  var x1: float64 = cx + dx * (len * 0.12) + pxv * wid;
+  var z1: float64 = cz + dz * (len * 0.12) + pzv * wid;
+  var y1: float64 = scene_ground_height_at(sc, x1, z1, gy) + 0.018;
+  var x2: float64 = cx - dx * (len * 0.28);
+  var z2: float64 = cz - dz * (len * 0.28);
+  var y2: float64 = scene_ground_height_at(sc, x2, z2, gy) + 0.018;
+  var x3: float64 = cx + dx * (len * 0.12) - pxv * wid;
+  var z3: float64 = cz + dz * (len * 0.12) - pzv * wid;
+  var y3: float64 = scene_ground_height_at(sc, x3, z3, gy) + 0.018;
+  vp_wline_basis(basis, px, fw, fh, vx, vy, vw, vh, x0, y0, z0, x1, y1, z1, c);
+  vp_wline_basis(basis, px, fw, fh, vx, vy, vw, vh, x1, y1, z1, x2, y2, z2, c);
+  vp_wline_basis(basis, px, fw, fh, vx, vy, vw, vh, x2, y2, z2, x3, y3, z3, c);
+  vp_wline_basis(basis, px, fw, fh, vx, vy, vw, vh, x3, y3, z3, x0, y0, z0, c);
+}
+
+function vp_terrain_point(sc: Scene*, e: Entity*, lx: float64, lz: float64, comp: int32) -> float64 {
+  var ly: float64 = scene_terrain_height_local(sc, e, lx, lz);
+  return scene_entity_mesh_world(sc, e, lx, ly, lz, comp);
+}
+
+function vp_draw_terrain(sc: Scene*, basis: VpCamBasis*, e: Entity*, px: uint32*, fw: int32, fh: int32, vx: int32, vy: int32, vw: int32, vh: int32, c: uint32) {
+  if (sc == 0 || basis == 0 || e == 0) {
+    return;
+  }
+  var grid: int32 = 12;
+  var hx: float64 = scene_entity_half_x(e);
+  var hz: float64 = scene_entity_half_z(e);
+  var dx: float64 = (hx * 2.0) / (float64)grid;
+  var dz: float64 = (hz * 2.0) / (float64)grid;
+  var i: int32 = 0;
+  while (i <= grid) {
+    var lx: float64 = 0.0 - hx + (float64)i * dx;
+    var z0: float64 = 0.0 - hz;
+    var z1: float64 = hz;
+    var ax: float64 = vp_terrain_point(sc, e, lx, z0, 0);
+    var ay: float64 = vp_terrain_point(sc, e, lx, z0, 1);
+    var az: float64 = vp_terrain_point(sc, e, lx, z0, 2);
+    var bx: float64 = vp_terrain_point(sc, e, lx, z1, 0);
+    var by: float64 = vp_terrain_point(sc, e, lx, z1, 1);
+    var bz: float64 = vp_terrain_point(sc, e, lx, z1, 2);
+    vp_wline_basis(basis, px, fw, fh, vx, vy, vw, vh, ax, ay, az, bx, by, bz, c);
+    i = i + 1;
+  }
+  i = 0;
+  while (i <= grid) {
+    var lz: float64 = 0.0 - hz + (float64)i * dz;
+    var x0: float64 = 0.0 - hx;
+    var x1: float64 = hx;
+    var cx: float64 = vp_terrain_point(sc, e, x0, lz, 0);
+    var cy: float64 = vp_terrain_point(sc, e, x0, lz, 1);
+    var cz: float64 = vp_terrain_point(sc, e, x0, lz, 2);
+    var dxw: float64 = vp_terrain_point(sc, e, x1, lz, 0);
+    var dyw: float64 = vp_terrain_point(sc, e, x1, lz, 1);
+    var dzw: float64 = vp_terrain_point(sc, e, x1, lz, 2);
+    vp_wline_basis(basis, px, fw, fh, vx, vy, vw, vh, cx, cy, cz, dxw, dyw, dzw, c);
+    i = i + 1;
+  }
+}
+
+// Draw one entity as editable line chrome. Vulkan draws solids; the CPU path
+// uses this as a usable fallback and shows terrain as a height grid.
 function vp_draw_entity(sc: Scene*, basis: VpCamBasis*, e: Entity*, px: uint32*, fw: int32, fh: int32, vx: int32, vy: int32, vw: int32, vh: int32, c: uint32) {
   if (e == 0 || basis == 0) {
+    return;
+  }
+  if (e->kind == SK_TERRAIN()) {
+    vp_draw_terrain(sc, basis, e, px, fw, fh, vx, vy, vw, vh, c);
     return;
   }
   vp_entity_edge(sc, basis, e, px, fw, fh, vx, vy, vw, vh, 0, 1, c);
@@ -1416,9 +1652,9 @@ function vp_pick_edge_dist_sq(basis: VpCamBasis*, sc: Scene*, e: Entity*, mx: in
   if (da < 0.18 || db < 0.18) {
     return 1000000000.0;
   }
-  var sx0: int32 = vp_proj_x_basis(basis, ax, ay, az, vx, vw);
+  var sx0: int32 = vp_proj_x_basis(basis, ax, ay, az, vx, vw, vh);
   var sy0: int32 = vp_proj_y_basis(basis, ax, ay, az, vy, vw, vh);
-  var sx1: int32 = vp_proj_x_basis(basis, bx, by, bz, vx, vw);
+  var sx1: int32 = vp_proj_x_basis(basis, bx, by, bz, vx, vw, vh);
   var sy1: int32 = vp_proj_y_basis(basis, bx, by, bz, vy, vw, vh);
   return vp_seg_dist_sq(mx, my, sx0, sy0, sx1, sy1);
 }
@@ -1502,11 +1738,11 @@ function vp_pick_mesh_dist_sq(basis: VpCamBasis*, sc: Scene*, e: Entity*, m: Mes
     var db: float64 = vp_depth_basis(basis, bxw, byw, bzw);
     var dc: float64 = vp_depth_basis(basis, cxw, cyw, czw);
     if (da >= 0.18 && db >= 0.18 && dc >= 0.18) {
-      var sx0: int32 = vp_proj_x_basis(basis, axw, ayw, azw, vx, vw);
+      var sx0: int32 = vp_proj_x_basis(basis, axw, ayw, azw, vx, vw, vh);
       var sy0: int32 = vp_proj_y_basis(basis, axw, ayw, azw, vy, vw, vh);
-      var sx1: int32 = vp_proj_x_basis(basis, bxw, byw, bzw, vx, vw);
+      var sx1: int32 = vp_proj_x_basis(basis, bxw, byw, bzw, vx, vw, vh);
       var sy1: int32 = vp_proj_y_basis(basis, bxw, byw, bzw, vy, vw, vh);
-      var sx2: int32 = vp_proj_x_basis(basis, cxw, cyw, czw, vx, vw);
+      var sx2: int32 = vp_proj_x_basis(basis, cxw, cyw, czw, vx, vw, vh);
       var sy2: int32 = vp_proj_y_basis(basis, cxw, cyw, czw, vy, vw, vh);
       var td: float64 = vp_point_tri_dist_sq(mx, my, sx0, sy0, sx1, sy1, sx2, sy2);
       if (td < best) {
@@ -1522,10 +1758,369 @@ function vp_pick_mesh_dist_sq(basis: VpCamBasis*, sc: Scene*, e: Entity*, m: Mes
   return best;
 }
 
+function vp_abs_f(v: float64) -> float64 {
+  if (v < 0.0) { return 0.0 - v; }
+  return v;
+}
+
+function vp_pick_ray_dir_world(basis: VpCamBasis*, mx: int32, my: int32, vx: int32, vy: int32, vw: int32, vh: int32, out_v: VpVec3*) {
+  if (basis == 0 || out_v == 0) {
+    return;
+  }
+  var half_proj: float64 = (float64)(vh / 2) * vp_proj_fov_scale();
+  if (half_proj < 1.0) { half_proj = 1.0; }
+  var cx: float64 = ((float64)mx - (float64)(vx + vw / 2)) / half_proj;
+  var cy: float64 = ((float64)(vy + vh / 2) - (float64)my) / half_proj;
+  var cz: float64 = 1.0;
+  var z1: float64 = (0.0 - cy) * basis->sp + cz * basis->cp;
+  var wy: float64 = cy * basis->cp + cz * basis->sp;
+  var wx: float64 = cx * basis->cy + z1 * basis->sy;
+  var wz: float64 = (0.0 - cx) * basis->sy + z1 * basis->cy;
+  var len: float64 = sqrt(wx * wx + wy * wy + wz * wz);
+  if (len < 0.000001) {
+    len = 0.000001;
+  }
+  out_v->x = wx / len;
+  out_v->y = wy / len;
+  out_v->z = wz / len;
+}
+
+function vp_ray_triangle_hit(rox: float64, roy: float64, roz: float64, rdx: float64, rdy: float64, rdz: float64, ax: float64, ay: float64, az: float64, bx: float64, by: float64, bz: float64, cx: float64, cyv: float64, cz: float64, out_t: float64*) -> int32 {
+  var e1x: float64 = bx - ax;
+  var e1y: float64 = by - ay;
+  var e1z: float64 = bz - az;
+  var e2x: float64 = cx - ax;
+  var e2y: float64 = cyv - ay;
+  var e2z: float64 = cz - az;
+  var px: float64 = rdy * e2z - rdz * e2y;
+  var py: float64 = rdz * e2x - rdx * e2z;
+  var pz: float64 = rdx * e2y - rdy * e2x;
+  var det: float64 = e1x * px + e1y * py + e1z * pz;
+  if (vp_abs_f(det) < 0.0000001) {
+    return 0;
+  }
+  var inv_det: float64 = 1.0 / det;
+  var tx: float64 = rox - ax;
+  var ty: float64 = roy - ay;
+  var tz: float64 = roz - az;
+  var u: float64 = (tx * px + ty * py + tz * pz) * inv_det;
+  if (u < 0.0 || u > 1.0) {
+    return 0;
+  }
+  var qx: float64 = ty * e1z - tz * e1y;
+  var qy: float64 = tz * e1x - tx * e1z;
+  var qz: float64 = tx * e1y - ty * e1x;
+  var v: float64 = (rdx * qx + rdy * qy + rdz * qz) * inv_det;
+  if (v < 0.0 || u + v > 1.0) {
+    return 0;
+  }
+  var t: float64 = (e2x * qx + e2y * qy + e2z * qz) * inv_det;
+  if (t < 0.02) {
+    return 0;
+  }
+  if (out_t != 0) {
+    *out_t = t;
+  }
+  return 1;
+}
+
+function vp_ray_obb_hit(sc: Scene*, e: Entity*, rox: float64, roy: float64, roz: float64, rdx: float64, rdy: float64, rdz: float64, out_t: float64*) -> int32 {
+  if (e == 0) {
+    return 0;
+  }
+  var cx: float64 = scene_entity_world_pos(sc, e, 0);
+  var cyv: float64 = scene_entity_world_pos(sc, e, 1);
+  var cz: float64 = scene_entity_world_pos(sc, e, 2);
+  var dx: float64 = rox - cx;
+  var dy: float64 = roy - cyv;
+  var dz: float64 = roz - cz;
+  var ws: float64 = scene_entity_world_scale(sc, e);
+  var tmin: float64 = 0.02;
+  var tmax: float64 = 1000000000.0;
+  var ai: int32 = 0;
+  while (ai < 3) {
+    var ax: float64 = 0.0;
+    var ay: float64 = 0.0;
+    var az: float64 = 0.0;
+    var extent: float64 = scene_entity_half_x(e) * ws;
+    if (ai == 0) {
+      ax = scene_entity_world_rot_vec(sc, e, 1.0, 0.0, 0.0, 0);
+      ay = scene_entity_world_rot_vec(sc, e, 1.0, 0.0, 0.0, 1);
+      az = scene_entity_world_rot_vec(sc, e, 1.0, 0.0, 0.0, 2);
+      extent = scene_entity_half_x(e) * ws;
+    }
+    if (ai == 1) {
+      ax = scene_entity_world_rot_vec(sc, e, 0.0, 1.0, 0.0, 0);
+      ay = scene_entity_world_rot_vec(sc, e, 0.0, 1.0, 0.0, 1);
+      az = scene_entity_world_rot_vec(sc, e, 0.0, 1.0, 0.0, 2);
+      extent = scene_entity_half_y(e) * ws;
+    }
+    if (ai == 2) {
+      ax = scene_entity_world_rot_vec(sc, e, 0.0, 0.0, 1.0, 0);
+      ay = scene_entity_world_rot_vec(sc, e, 0.0, 0.0, 1.0, 1);
+      az = scene_entity_world_rot_vec(sc, e, 0.0, 0.0, 1.0, 2);
+      extent = scene_entity_half_z(e) * ws;
+    }
+    var o: float64 = dx * ax + dy * ay + dz * az;
+    var d: float64 = rdx * ax + rdy * ay + rdz * az;
+    if (vp_abs_f(d) < 0.000001) {
+      if (o < 0.0 - extent || o > extent) {
+        return 0;
+      }
+    } else {
+      var t1: float64 = ((0.0 - extent) - o) / d;
+      var t2: float64 = (extent - o) / d;
+      if (t1 > t2) {
+        var tmp: float64 = t1;
+        t1 = t2;
+        t2 = tmp;
+      }
+      if (t1 > tmin) { tmin = t1; }
+      if (t2 < tmax) { tmax = t2; }
+      if (tmin > tmax) {
+        return 0;
+      }
+    }
+    ai = ai + 1;
+  }
+  if (out_t != 0) {
+    *out_t = tmin;
+  }
+  return 1;
+}
+
+function vp_ray_mesh_hit(sc: Scene*, e: Entity*, m: MeshRecord*, rox: float64, roy: float64, roz: float64, rdx: float64, rdy: float64, rdz: float64, out_t: float64*) -> int32 {
+  if (sc == 0 || e == 0 || m == 0) {
+    return 0;
+  }
+  var best: float64 = 1000000000.0;
+  var hit: int32 = 0;
+  var tri_n: int32 = mesh_record_tri_count(m);
+  var t: int32 = 0;
+  while (t < tri_n) {
+    var ia: int32 = mesh_tri_index(m, t, 0);
+    var ib: int32 = mesh_tri_index(m, t, 1);
+    var ic: int32 = mesh_tri_index(m, t, 2);
+    var ax: float64 = scene_entity_mesh_world(sc, e, mesh_vx(m, ia), mesh_vy(m, ia), mesh_vz(m, ia), 0);
+    var ay: float64 = scene_entity_mesh_world(sc, e, mesh_vx(m, ia), mesh_vy(m, ia), mesh_vz(m, ia), 1);
+    var az: float64 = scene_entity_mesh_world(sc, e, mesh_vx(m, ia), mesh_vy(m, ia), mesh_vz(m, ia), 2);
+    var bx: float64 = scene_entity_mesh_world(sc, e, mesh_vx(m, ib), mesh_vy(m, ib), mesh_vz(m, ib), 0);
+    var by: float64 = scene_entity_mesh_world(sc, e, mesh_vx(m, ib), mesh_vy(m, ib), mesh_vz(m, ib), 1);
+    var bz: float64 = scene_entity_mesh_world(sc, e, mesh_vx(m, ib), mesh_vy(m, ib), mesh_vz(m, ib), 2);
+    var cx: float64 = scene_entity_mesh_world(sc, e, mesh_vx(m, ic), mesh_vy(m, ic), mesh_vz(m, ic), 0);
+    var cyv: float64 = scene_entity_mesh_world(sc, e, mesh_vx(m, ic), mesh_vy(m, ic), mesh_vz(m, ic), 1);
+    var cz: float64 = scene_entity_mesh_world(sc, e, mesh_vx(m, ic), mesh_vy(m, ic), mesh_vz(m, ic), 2);
+    var ht: float64 = 0.0;
+    if (vp_ray_triangle_hit(rox, roy, roz, rdx, rdy, rdz, ax, ay, az, bx, by, bz, cx, cyv, cz, &ht) != 0) {
+      if (ht < best) {
+        best = ht;
+        hit = 1;
+      }
+    }
+    t = t + 1;
+  }
+  if (hit != 0 && out_t != 0) {
+    *out_t = best;
+  }
+  return hit;
+}
+
+function vp_ray_terrain_hit(sc: Scene*, e: Entity*, rox: float64, roy: float64, roz: float64, rdx: float64, rdy: float64, rdz: float64, out_t: float64*) -> int32 {
+  if (sc == 0 || e == 0) {
+    return 0;
+  }
+  // Keep picking tessellation aligned with the rendered terrain. A coarser
+  // pick mesh can leave large visible patches with no reliable sculpt hit.
+  var grid: int32 = 40;
+  var hx: float64 = scene_entity_half_x(e);
+  var hz: float64 = scene_entity_half_z(e);
+  var step_x: float64 = (hx * 2.0) / (float64)grid;
+  var step_z: float64 = (hz * 2.0) / (float64)grid;
+  var best: float64 = 1000000000.0;
+  var hit: int32 = 0;
+  var ix: int32 = 0;
+  while (ix < grid) {
+    var x0: float64 = 0.0 - hx + (float64)ix * step_x;
+    var x1: float64 = x0 + step_x;
+    var iz: int32 = 0;
+    while (iz < grid) {
+      var z0: float64 = 0.0 - hz + (float64)iz * step_z;
+      var z1: float64 = z0 + step_z;
+      var ax: float64 = vp_terrain_point(sc, e, x0, z0, 0);
+      var ay: float64 = vp_terrain_point(sc, e, x0, z0, 1);
+      var az: float64 = vp_terrain_point(sc, e, x0, z0, 2);
+      var bx: float64 = vp_terrain_point(sc, e, x1, z0, 0);
+      var by: float64 = vp_terrain_point(sc, e, x1, z0, 1);
+      var bz: float64 = vp_terrain_point(sc, e, x1, z0, 2);
+      var cx: float64 = vp_terrain_point(sc, e, x0, z1, 0);
+      var cyv: float64 = vp_terrain_point(sc, e, x0, z1, 1);
+      var cz: float64 = vp_terrain_point(sc, e, x0, z1, 2);
+      var dxw: float64 = vp_terrain_point(sc, e, x1, z1, 0);
+      var dyw: float64 = vp_terrain_point(sc, e, x1, z1, 1);
+      var dzw: float64 = vp_terrain_point(sc, e, x1, z1, 2);
+      var ht: float64 = 0.0;
+      if (vp_ray_triangle_hit(rox, roy, roz, rdx, rdy, rdz, ax, ay, az, cx, cyv, cz, bx, by, bz, &ht) != 0) {
+        if (ht < best) {
+          best = ht;
+          hit = 1;
+        }
+      }
+      if (vp_ray_triangle_hit(rox, roy, roz, rdx, rdy, rdz, bx, by, bz, cx, cyv, cz, dxw, dyw, dzw, &ht) != 0) {
+        if (ht < best) {
+          best = ht;
+          hit = 1;
+        }
+      }
+      iz = iz + 1;
+    }
+    ix = ix + 1;
+  }
+  if (hit != 0 && out_t != 0) {
+    *out_t = best;
+  }
+  return hit;
+}
+
+function vp_ray_terrain_base_plane_hit(sc: Scene*, e: Entity*, rox: float64, roy: float64, roz: float64, rdx: float64, rdy: float64, rdz: float64, out_wx: float64*, out_wy: float64*, out_wz: float64*) -> int32 {
+  if (sc == 0 || e == 0 || out_wx == 0 || out_wy == 0 || out_wz == 0) {
+    return 0;
+  }
+  if (vp_abs_f(rdy) < 0.000001) {
+    return 0;
+  }
+  var py: float64 = scene_entity_world_pos(sc, e, 1);
+  var t: float64 = (py - roy) / rdy;
+  if (t < 0.02) {
+    return 0;
+  }
+  var wx: float64 = rox + rdx * t;
+  var wz: float64 = roz + rdz * t;
+  var lx: float64 = 0.0;
+  var lz: float64 = 0.0;
+  scene_terrain_world_to_local_xz_simple(sc, e, wx, wz, &lx, &lz);
+  if (vp_terrain_local_in_bounds(lx, lz, scene_entity_half_x(e), scene_entity_half_z(e)) == 0) {
+    return 0;
+  }
+  *out_wx = wx;
+  *out_wy = scene_terrain_height_world(sc, e, wx, wz);
+  *out_wz = wz;
+  return 1;
+}
+
+function vp_ray_terrain_heightfield_hit(sc: Scene*, e: Entity*, rox: float64, roy: float64, roz: float64, rdx: float64, rdy: float64, rdz: float64, out_wx: float64*, out_wy: float64*, out_wz: float64*) -> int32 {
+  if (sc == 0 || e == 0 || out_wx == 0 || out_wy == 0 || out_wz == 0) {
+    return 0;
+  }
+  var s: float64 = scene_entity_world_scale(sc, e);
+  if (s < 0.000001) { s = 0.000001; }
+  var px: float64 = scene_entity_world_pos(sc, e, 0);
+  var pz: float64 = scene_entity_world_pos(sc, e, 2);
+  var hx: float64 = scene_entity_half_x(e);
+  var hz: float64 = scene_entity_half_z(e);
+  var t0: float64 = 0.02;
+  var t1: float64 = 100000.0;
+  var olx: float64 = (rox - px) / s;
+  var olz: float64 = (roz - pz) / s;
+  var dlx: float64 = rdx / s;
+  var dlz: float64 = rdz / s;
+  if (vp_abs_f(dlx) < 0.0000001) {
+    if (vp_terrain_local_in_bounds(olx, 0.0, hx, 1.0) == 0) {
+      return 0;
+    }
+  } else {
+    var ax0: float64 = ((0.0 - hx) - olx) / dlx;
+    var ax1: float64 = (hx - olx) / dlx;
+    if (ax0 > ax1) {
+      var axt: float64 = ax0;
+      ax0 = ax1;
+      ax1 = axt;
+    }
+    if (ax0 > t0) { t0 = ax0; }
+    if (ax1 < t1) { t1 = ax1; }
+  }
+  if (vp_abs_f(dlz) < 0.0000001) {
+    if (vp_terrain_local_in_bounds(0.0, olz, 1.0, hz) == 0) {
+      return 0;
+    }
+  } else {
+    var az0: float64 = ((0.0 - hz) - olz) / dlz;
+    var az1: float64 = (hz - olz) / dlz;
+    if (az0 > az1) {
+      var azt: float64 = az0;
+      az0 = az1;
+      az1 = azt;
+    }
+    if (az0 > t0) { t0 = az0; }
+    if (az1 < t1) { t1 = az1; }
+  }
+  if (t1 < t0) {
+    return 0;
+  }
+  var prev_t: float64 = t0;
+  var prev_wx: float64 = rox + rdx * prev_t;
+  var prev_wy: float64 = roy + rdy * prev_t;
+  var prev_wz: float64 = roz + rdz * prev_t;
+  var prev_d: float64 = prev_wy - scene_terrain_height_world(sc, e, prev_wx, prev_wz);
+  if (prev_d <= 0.0) {
+    *out_wx = prev_wx;
+    *out_wy = scene_terrain_height_world(sc, e, prev_wx, prev_wz);
+    *out_wz = prev_wz;
+    return 1;
+  }
+  var steps: int32 = 96;
+  var i: int32 = 1;
+  while (i <= steps) {
+    var t: float64 = t0 + (t1 - t0) * (float64)i / (float64)steps;
+    var wx: float64 = rox + rdx * t;
+    var wy: float64 = roy + rdy * t;
+    var wz: float64 = roz + rdz * t;
+    var d: float64 = wy - scene_terrain_height_world(sc, e, wx, wz);
+    if (d <= 0.0) {
+      var lo: float64 = prev_t;
+      var hi: float64 = t;
+      var bi: int32 = 0;
+      while (bi < 8) {
+        var mid: float64 = (lo + hi) * 0.5;
+        var mwx: float64 = rox + rdx * mid;
+        var mwy: float64 = roy + rdy * mid;
+        var mwz: float64 = roz + rdz * mid;
+        var md: float64 = mwy - scene_terrain_height_world(sc, e, mwx, mwz);
+        if (md <= 0.0) {
+          hi = mid;
+        } else {
+          lo = mid;
+        }
+        bi = bi + 1;
+      }
+      var ht: float64 = hi;
+      *out_wx = rox + rdx * ht;
+      *out_wz = roz + rdz * ht;
+      *out_wy = scene_terrain_height_world(sc, e, *out_wx, *out_wz);
+      return 1;
+    }
+    prev_t = t;
+    prev_d = d;
+    i = i + 1;
+  }
+  return 0;
+}
+
+function vp_screen_ray_terrain_world_hit(sc: Scene*, e: Entity*, basis: VpCamBasis*, mx: int32, my: int32, vx: int32, vy: int32, vw: int32, vh: int32, out_wx: float64*, out_wy: float64*, out_wz: float64*) -> int32 {
+  if (sc == 0 || e == 0 || basis == 0 || out_wx == 0 || out_wy == 0 || out_wz == 0) {
+    return 0;
+  }
+  var dir: VpVec3;
+  vp_pick_ray_dir_world(basis, mx, my, vx, vy, vw, vh, &dir);
+  if (vp_ray_terrain_heightfield_hit(sc, e, basis->ox, basis->oy, basis->oz, dir.x, dir.y, dir.z, out_wx, out_wy, out_wz) != 0) {
+    return 1;
+  }
+  return vp_ray_terrain_base_plane_hit(sc, e, basis->ox, basis->oy, basis->oz, dir.x, dir.y, dir.z, out_wx, out_wy, out_wz);
+}
+
 // Screen-space hit test against the visible wire footprint. The old projected
 // rectangle made empty air inside a large box selectable; this uses edge/corner
 // proximity plus a small centre target, with depth only breaking close ties.
-function vp_pick_scene(basis: VpCamBasis*, sc: Scene*, meshes: MeshStore*, mx: int32, my: int32, vx: int32, vy: int32, vw: int32, vh: int32) -> int32 {
+function vp_pick_scene_screen_fallback(basis: VpCamBasis*, sc: Scene*, meshes: MeshStore*, mx: int32, my: int32, vx: int32, vy: int32, vw: int32, vh: int32) -> int32 {
   if (basis == 0 || sc == 0) {
     return 0;
   }
@@ -1557,7 +2152,7 @@ function vp_pick_scene(basis: VpCamBasis*, sc: Scene*, meshes: MeshStore*, mx: i
       if (d >= 0.18) {
         any = 1;
         if (d < nearest_d) { nearest_d = d; }
-        var sx: int32 = vp_proj_x_basis(basis, wx, wy, wz, vx, vw);
+        var sx: int32 = vp_proj_x_basis(basis, wx, wy, wz, vx, vw, vh);
         var syv: int32 = vp_proj_y_basis(basis, wx, wy, wz, vy, vw, vh);
         if (sx < minsx) { minsx = sx; }
         if (sx > maxsx) { maxsx = sx; }
@@ -1623,7 +2218,142 @@ function vp_pick_scene(basis: VpCamBasis*, sc: Scene*, meshes: MeshStore*, mx: i
   return best_id;
 }
 
+// Primary picking path: cast through the cursor and hit the actual solid
+// surfaces. The old screen-edge picker remains only as a no-solid fallback for
+// tiny/degenerate cases.
+function vp_pick_scene(basis: VpCamBasis*, sc: Scene*, meshes: MeshStore*, mx: int32, my: int32, vx: int32, vy: int32, vw: int32, vh: int32) -> int32 {
+  if (basis == 0 || sc == 0) {
+    return 0;
+  }
+  var dir: VpVec3;
+  vp_pick_ray_dir_world(basis, mx, my, vx, vy, vw, vh, &dir);
+  var best_id: int32 = 0;
+  var best_t: float64 = 1000000000.0;
+  var i: int32 = 0;
+  var n: int32 = scene_count(sc);
+  while (i < n) {
+    var e: Entity* = scene_row(sc, i);
+    i = i + 1;
+    if (e == 0) {
+      continue;
+    }
+    if ((e->flags & SE_FLAG_HIDDEN()) != 0) {
+      continue;
+    }
+    var ht: float64 = 0.0;
+    var hit: int32 = 0;
+    if (e->kind == SK_TERRAIN()) {
+      hit = vp_ray_terrain_hit(sc, e, basis->ox, basis->oy, basis->oz, dir.x, dir.y, dir.z, &ht);
+    } else {
+      if (e->kind == SK_MESH() && meshes != 0 && e->mesh_id != 0) {
+        var mr: MeshRecord* = mesh_store_find(meshes, e->mesh_id);
+        hit = vp_ray_mesh_hit(sc, e, mr, basis->ox, basis->oy, basis->oz, dir.x, dir.y, dir.z, &ht);
+        if (hit == 0) {
+          hit = vp_ray_obb_hit(sc, e, basis->ox, basis->oy, basis->oz, dir.x, dir.y, dir.z, &ht);
+        }
+      } else {
+        hit = vp_ray_obb_hit(sc, e, basis->ox, basis->oy, basis->oz, dir.x, dir.y, dir.z, &ht);
+      }
+    }
+    if (hit != 0 && ht < best_t) {
+      best_t = ht;
+      best_id = e->id;
+    }
+  }
+  if (best_id != 0) {
+    return best_id;
+  }
+  return vp_pick_scene_screen_fallback(basis, sc, meshes, mx, my, vx, vy, vw, vh);
+}
+
 // ---- Input ------------------------------------------------------------------
+// ---- Public camera control (script-driven game camera, gap 1.1) ------------
+//
+// The playtest client no longer runs the editor fly-cam (engine_viewport_
+// input_tick). Instead a LocalScript drives the camera through these. Position
+// is authoritative in cam_store_*_mm (metres*1000 int — the struct's float +=
+// is unreliable under --emit-obj); yaw/pitch live in the float fields the
+// projection reads directly.
+
+export function engine_viewport_cam_set_pos(vp: EngineViewport*, x: float64, y: float64, z: float64) {
+  if (vp == 0) {
+    return;
+  }
+  vp_store_cam_mm(vp, (int32)(x * 1000.0), (int32)(y * 1000.0), (int32)(z * 1000.0));
+}
+
+export function engine_viewport_cam_get_x(vp: EngineViewport*) -> float64 {
+  if (vp == 0) { return 0.0; }
+  return vp_cam_x_m(vp);
+}
+export function engine_viewport_cam_get_y(vp: EngineViewport*) -> float64 {
+  if (vp == 0) { return 0.0; }
+  return vp_cam_y_m(vp);
+}
+export function engine_viewport_cam_get_z(vp: EngineViewport*) -> float64 {
+  if (vp == 0) { return 0.0; }
+  return vp_cam_z_m(vp);
+}
+
+// Yaw/pitch in radians. Pitch is clamped to keep the camera from flipping over
+// the poles (same +/-1.5 rad limit the editor fly-cam uses).
+//
+// IMPORTANT: spell the negative bound as `0.0 - 1.50`, not `-1.50`. Mettle's
+// frontend has been brittle parsing a unary-minus float literal in a relational
+// expression — e.g. `pitch < -1.50` could miscompile such that any pitch below
+// zero triggered the lower clamp, snapping the camera straight down the moment
+// you looked even a hair below the horizon. Same trick used elsewhere in this
+// file (vp_sanitize pre-scales to int64 to dodge the same hazard).
+export function engine_viewport_cam_set_look(vp: EngineViewport*, yaw: float64, pitch: float64) {
+  if (vp == 0) {
+    return;
+  }
+  var lo: float64 = 0.0 - 1.50;
+  var hi: float64 = 1.50;
+  if (pitch < lo) { pitch = lo; }
+  if (pitch > hi) { pitch = hi; }
+  vp->cam_yaw = yaw;
+  vp->cam_pitch = pitch;
+}
+
+export function engine_viewport_cam_get_yaw(vp: EngineViewport*) -> float64 {
+  if (vp == 0) { return 0.0; }
+  return vp->cam_yaw;
+}
+export function engine_viewport_cam_get_pitch(vp: EngineViewport*) -> float64 {
+  if (vp == 0) { return 0.0; }
+  return vp->cam_pitch;
+}
+
+// Unit forward / right basis vectors for the current yaw/pitch, so a script
+// can do WASD-relative movement without reimplementing the trig.
+export function engine_viewport_cam_forward(vp: EngineViewport*, axis: int32) -> float64 {
+  if (vp == 0) { return 0.0; }
+  return vp_fwd(vp, axis);
+}
+export function engine_viewport_cam_right(vp: EngineViewport*, axis: int32) -> float64 {
+  if (vp == 0) { return 0.0; }
+  return vp_rgt(vp, axis);
+}
+
+// Sticky latch: a LocalScript that calls engine.camera_set_pos / camera_set_look
+// flips this on, and the playtest client's built-in default fly-cam steps
+// aside permanently for that session. Read by engine_play_client; written by
+// the Lua camera bindings.
+export function engine_viewport_mark_script_camera(vp: EngineViewport*) {
+  if (vp == 0) {
+    return;
+  }
+  vp->script_camera_active = 1;
+}
+
+export function engine_viewport_script_camera_active(vp: EngineViewport*) -> int32 {
+  if (vp == 0) {
+    return 0;
+  }
+  return vp->script_camera_active;
+}
+
 export function engine_viewport_sync_scene(vp: EngineViewport*, sc: Scene*) {
   if (vp == 0) {
     return;
@@ -1878,6 +2608,99 @@ export function engine_viewport_input_tick(vp: EngineViewport*, sc: Scene*, mesh
   var pick_basis: VpCamBasis;
   vp_cam_basis_fill(vp, &pick_basis);
 
+  var t_down: int32 = vp_key(84);
+  if (allow_viewport_keys != 0 && sc != 0 && t_down != 0 && vp->vk_t_was_down == 0) {
+    var stt: Entity* = scene_selected_row(sc);
+    if (stt != 0 && stt->kind == SK_TERRAIN() && sc->terrain != 0 && terrain_store_has(sc->terrain, stt->id) != 0) {
+      if (vp->terrain_sculpt_mode != 0) {
+        vp->terrain_sculpt_mode = 0;
+      } else {
+        vp->terrain_sculpt_mode = 1;
+      }
+      changed = 1;
+    }
+  }
+  vp->vk_t_was_down = t_down;
+
+  // Sculpt mode is "on" any time the user pressed T while a terrain is
+  // selected, regardless of whether that terrain has a heightmap yet —
+  // the click handler below lazily creates one on first stamp. The old
+  // gate required terrain_store_has != 0, which meant pressing T then
+  // LMB silently did nothing when the user hadn't manually pressed the
+  // "Create heightmap" inspector button first. That was the "sculpting
+  // does nothing" bug.
+  var sculpt_active: int32 = 0;
+  if (sc != 0 && vp->terrain_sculpt_mode != 0) {
+    var ste0: Entity* = scene_selected_row(sc);
+    if (ste0 != 0 && ste0->kind == SK_TERRAIN()) {
+      sculpt_active = 1;
+    }
+  }
+
+  // Refresh the cached brush-hit point any time the cursor is over any
+  // terrain entity in the scene (selected OR hovered). The scene-builder
+  // uses this to draw the live brush ring — making it work on hover-only is
+  // critical UX: the user shouldn't have to know to click the terrain in
+  // the scene tree before they can see what their brush is about to paint.
+  // Selection is then used only to pick WHICH terrain receives the stamp
+  // on click.
+  //
+  // Search order: prefer the selected terrain (so the ring snaps to the one
+  // you intend to sculpt), fall back to any terrain the ray actually hits.
+  vp->brush_hit_valid = 0;
+  if (sc != 0 && in_vp != 0) {
+    var bhx: float64 = 0.0;
+    var bhy: float64 = 0.0;
+    var bhz: float64 = 0.0;
+    var brush_tid: int32 = 0;
+    var bhe: Entity* = scene_selected_row(sc);
+    if (bhe != 0 && bhe->kind == SK_TERRAIN()) {
+      if (vp_screen_ray_terrain_world_hit(sc, bhe, &pick_basis, vp->mouse_x, vp->mouse_y, vx, vy, vw, vh, &bhx, &bhy, &bhz) != 0) {
+        brush_tid = bhe->id;
+      }
+    }
+    if (brush_tid == 0) {
+      var btn: int32 = scene_count(sc);
+      var bti: int32 = 0;
+      var btbest: float64 = 1000000000000.0;
+      while (bti < btn) {
+        var bte: Entity* = scene_row(sc, bti);
+        bti = bti + 1;
+        if (bte == 0) { continue; }
+        if (bte->kind != SK_TERRAIN()) { continue; }
+        if ((bte->flags & SE_FLAG_HIDDEN()) != 0) { continue; }
+        var tx: float64 = 0.0;
+        var ty: float64 = 0.0;
+        var tz: float64 = 0.0;
+        if (vp_screen_ray_terrain_world_hit(sc, bte, &pick_basis, vp->mouse_x, vp->mouse_y, vx, vy, vw, vh, &tx, &ty, &tz) != 0) {
+          // pick the nearest hit — terrains shouldn't overlap normally but
+          // we should handle that case anyway.
+          var dx: float64 = tx - pick_basis.ox;
+          var dy: float64 = ty - pick_basis.oy;
+          var dz: float64 = tz - pick_basis.oz;
+          var dd: float64 = dx * dx + dy * dy + dz * dz;
+          if (dd < btbest) {
+            btbest = dd;
+            brush_tid = bte->id;
+            bhx = tx;
+            bhy = ty;
+            bhz = tz;
+          }
+        }
+      }
+    }
+    if (brush_tid != 0) {
+      vp->brush_hit_x = bhx;
+      vp->brush_hit_y = bhy;
+      vp->brush_hit_z = bhz;
+      vp->brush_hit_id = brush_tid;
+      vp->brush_hit_valid = 1;
+    }
+  }
+  if (vp->brush_hit_valid == 0) {
+    vp->brush_hit_id = 0;
+  }
+
   if (right_down == 0) {
     var mdx: int32 = vp->mouse_x - vp->prev_mouse_x;
     var mdy: int32 = vp->mouse_y - vp->prev_mouse_y;
@@ -1890,134 +2713,199 @@ export function engine_viewport_input_tick(vp: EngineViewport*, sc: Scene*, mesh
         scene_set_hover(sc, 0);
       }
     }
+    // Sculpt: when sculpt mode is on, LMB stamps the cached brush hit. We
+    // use the cached vp->brush_hit_* (which is the SAME data the visible
+    // ring is drawn from) so the stamp lands exactly where the user sees
+    // the ring — no more "I clicked but nothing happened, the ring was
+    // showing me one thing and the math was using another".
+    //
+    // Auto-create-and-bind: if the hovered terrain doesn't have a heightmap
+    // yet, the first click creates one on the fly. That removes the
+    // "Why is sculpting broken?" mystery when the user just placed a fresh
+    // terrain and started painting without clicking "Create heightmap"
+    // in the inspector.
+    // Sculpt: when sculpt mode is on, LMB stamps directly at the current
+    // cursor position. We re-do the ray cast here rather than trusting the
+    // cached vp->brush_hit_* fields — those reads were intermittently
+    // returning stale data, which manifested as "sculpting only works in
+    // one spot regardless of where I clicked". The cost of repeating the
+    // ray-terrain hit is negligible.
+    if (sculpt_active != 0 && in_vp != 0 && left_down != 0 && vp->fly_active == 0 && sc != 0) {
+      var ste3: Entity* = scene_selected_row(sc);
+      if (ste3 != 0 && ste3->kind == SK_TERRAIN()) {
+        if (sc->terrain != 0 && terrain_store_has(sc->terrain, ste3->id) == 0) {
+          // Lazy heightmap allocation. 65x65 matches the editor-button
+          // default in engine_editor_ui so saved sculpts load cleanly later.
+          scene_terrain_bind_heightmap_from_procedural(sc, ste3->id, 65, 65, cstr(""));
+        }
+        var wpx: float64 = 0.0;
+        var wpy: float64 = 0.0;
+        var wpz: float64 = 0.0;
+        if (vp_screen_ray_terrain_world_hit(sc, ste3, &pick_basis, vp->mouse_x, vp->mouse_y, vx, vy, vw, vh, &wpx, &wpy, &wpz) != 0) {
+          var hhx: float64 = scene_entity_half_x(ste3);
+          var hhz: float64 = scene_entity_half_z(ste3);
+          var lx: float64 = 0.0;
+          var lz: float64 = 0.0;
+          scene_terrain_world_to_local_xz_simple(sc, ste3, wpx, wpz, &lx, &lz);
+          if (vp_terrain_local_in_bounds(lx, lz, hhx, hhz) != 0) {
+            var str_mult: float64 = 1.0;
+            if (vp->left_was_down != 0) {
+              str_mult = 0.22;
+            }
+            if (sc->terrain != 0 && terrain_store_has(sc->terrain, ste3->id) != 0) {
+              var stamp_strength: float64 = vp->terrain_brush_strength * str_mult;
+              var stamp_cells: int32 = terrain_store_brush_stamp(sc->terrain, ste3->id, lx, lz, vp->terrain_brush_radius, stamp_strength, vp->terrain_brush_op, hhx, hhz, shift_down);
+              vp_debug_log_sculpt(cstr("stamp"), ste3->id, vp->mouse_x, vp->mouse_y, 1, wpx, wpy, wpz, lx, lz, hhx, hhz, vp->terrain_brush_radius, stamp_strength, vp->terrain_brush_op, stamp_cells);
+              changed = 1;
+            } else {
+              vp_debug_log_sculpt(cstr("no-store"), ste3->id, vp->mouse_x, vp->mouse_y, 1, wpx, wpy, wpz, lx, lz, hhx, hhz, vp->terrain_brush_radius, vp->terrain_brush_strength * str_mult, vp->terrain_brush_op, 0);
+            }
+          } else {
+            vp_debug_log_sculpt(cstr("out-of-bounds"), ste3->id, vp->mouse_x, vp->mouse_y, 1, wpx, wpy, wpz, lx, lz, hhx, hhz, vp->terrain_brush_radius, vp->terrain_brush_strength, vp->terrain_brush_op, 0);
+          }
+        } else {
+          if (vp->left_was_down == 0) {
+            vp_debug_log_sculpt(cstr("miss"), ste3->id, vp->mouse_x, vp->mouse_y, 0, 0.0, 0.0, 0.0, 0.0, 0.0, scene_entity_half_x(ste3), scene_entity_half_z(ste3), vp->terrain_brush_radius, vp->terrain_brush_strength, vp->terrain_brush_op, 0);
+          }
+        }
+      }
+    }
     var ghit: int32 = 0;
-    if (in_vp != 0 && sc != 0 && vp->fly_active == 0) {
-      var sel_click: Entity* = scene_selected_row(sc);
-      if (sel_click != 0 && (vp->manip_dragging == 0 || left_down == 0)) {
-        if (vp->active_tool == 1) {
-          ghit = vp_gizmo_hit_move_scale(sc, &pick_basis, sel_click, vp->mouse_x, vp->mouse_y, vx, vy, vw, vh, 0);
-        } else {
-          if (vp->active_tool == 3) {
-            ghit = vp_gizmo_hit_move_scale(sc, &pick_basis, sel_click, vp->mouse_x, vp->mouse_y, vx, vy, vw, vh, 1);
+    if (sculpt_active == 0) {
+      if (in_vp != 0 && sc != 0 && vp->fly_active == 0) {
+        var sel_click: Entity* = scene_selected_row(sc);
+        if (sel_click != 0 && (vp->manip_dragging == 0 || left_down == 0)) {
+          if (vp->active_tool == 1) {
+            ghit = vp_gizmo_hit_move_scale(sc, &pick_basis, sel_click, vp->mouse_x, vp->mouse_y, vx, vy, vw, vh, 0);
           } else {
-            if (vp->active_tool == 2) {
-              ghit = vp_gizmo_hit_rotate(sc, &pick_basis, sel_click, vp->mouse_x, vp->mouse_y, vx, vy, vw, vh);
+            if (vp->active_tool == 3) {
+              ghit = vp_gizmo_hit_move_scale(sc, &pick_basis, sel_click, vp->mouse_x, vp->mouse_y, vx, vy, vw, vh, 1);
+            } else {
+              if (vp->active_tool == 2) {
+                ghit = vp_gizmo_hit_rotate(sc, &pick_basis, sel_click, vp->mouse_x, vp->mouse_y, vx, vy, vw, vh);
+              }
             }
           }
-        }
-      } else {
-        if (vp->manip_dragging != 0) {
-          ghit = vp->manip_axis;
+        } else {
+          if (vp->manip_dragging != 0) {
+            ghit = vp->manip_axis;
+          }
         }
       }
-    }
-    vp->manip_hover_axis = ghit;
-    if (in_vp != 0 && left_down != 0 && vp->left_was_down == 0 && sc != 0) {
-      if (ghit != 0) {
-        vp->manip_axis = ghit;
-        vp->manip_dragging = 1;
-        vp->manip_hover_axis = ghit;
-        changed = 1;
-      } else {
-        if (vp->hover_id != 0) {
-          vp->selected_id = vp->hover_id;
-          scene_set_selected(sc, vp->hover_id);
-          vp->drag_selected = 1;
+      vp->manip_hover_axis = ghit;
+      if (in_vp != 0 && left_down != 0 && vp->left_was_down == 0 && sc != 0) {
+        if (ghit != 0) {
+          vp->manip_axis = ghit;
+          vp->manip_dragging = 1;
+          vp->manip_hover_axis = ghit;
+          changed = 1;
         } else {
-          vp->selected_id = 0;
-          scene_set_selected(sc, 0);
-          vp->drag_selected = 0;
-        }
-        changed = 1;
-      }
-    }
-    if (left_down == 0) {
-      vp->drag_selected = 0;
-      vp->manip_dragging = 0;
-      vp->manip_axis = 0;
-    }
-    if (in_vp != 0 && left_down != 0 && vp->manip_dragging != 0 && vp->manip_axis != 0 && sc != 0) {
-      var sel2: Entity* = scene_selected_row(sc);
-      if (sel2 != 0) {
-        var swx: float64 = scene_entity_world_pos(sc, sel2, 0);
-        var swy: float64 = scene_entity_world_pos(sc, sel2, 1);
-        var swz: float64 = scene_entity_world_pos(sc, sel2, 2);
-        if (vp->active_tool == 1) {
-          var axw: float64 = vp_gizmo_axis_world(sc, sel2, vp->manip_axis, 0);
-          var ayw: float64 = vp_gizmo_axis_world(sc, sel2, vp->manip_axis, 1);
-          var azw: float64 = vp_gizmo_axis_world(sc, sel2, vp->manip_axis, 2);
-          var pe: float64 = 0.05;
-          var qmx: float64 = swx + axw * pe;
-          var qmy: float64 = swy + ayw * pe;
-          var qmz: float64 = swz + azw * pe;
-          var psx0: int32 = vp_proj_x_basis(&pick_basis, swx, swy, swz, vx, vw);
-          var psy0: int32 = vp_proj_y_basis(&pick_basis, swx, swy, swz, vy, vw, vh);
-          var psx1: int32 = vp_proj_x_basis(&pick_basis, qmx, qmy, qmz, vx, vw);
-          var psy1: int32 = vp_proj_y_basis(&pick_basis, qmx, qmy, qmz, vy, vw, vh);
-          var Axs: float64 = (float64)(psx1 - psx0);
-          var Ays: float64 = (float64)(psy1 - psy0);
-          var denom: float64 = Axs * Axs + Ays * Ays;
-          if (denom < 4.0) {
-            denom = 4.0;
-          }
-          var tm: float64 = ((float64)mdx * Axs + (float64)mdy * Ays) / denom;
-          var move_k: float64 = 0.018;
-          scene_entity_translate_world(sc, sel2, axw * tm * move_k, ayw * tm * move_k, azw * tm * move_k);
-        } else {
-          if (vp->active_tool == 3) {
-            var axw2: float64 = vp_gizmo_axis_world(sc, sel2, vp->manip_axis, 0);
-            var ayw2: float64 = vp_gizmo_axis_world(sc, sel2, vp->manip_axis, 1);
-            var azw2: float64 = vp_gizmo_axis_world(sc, sel2, vp->manip_axis, 2);
-            var pe2: float64 = 0.05;
-            var qmx2: float64 = swx + axw2 * pe2;
-            var qmy2: float64 = swy + ayw2 * pe2;
-            var qmz2: float64 = swz + azw2 * pe2;
-            var psx0b: int32 = vp_proj_x_basis(&pick_basis, swx, swy, swz, vx, vw);
-            var psy0b: int32 = vp_proj_y_basis(&pick_basis, swx, swy, swz, vy, vw, vh);
-            var psx1b: int32 = vp_proj_x_basis(&pick_basis, qmx2, qmy2, qmz2, vx, vw);
-            var psy1b: int32 = vp_proj_y_basis(&pick_basis, qmx2, qmy2, qmz2, vy, vw, vh);
-            var Axs2: float64 = (float64)(psx1b - psx0b);
-            var Ays2: float64 = (float64)(psy1b - psy0b);
-            var denom2: float64 = Axs2 * Axs2 + Ays2 * Ays2;
-            if (denom2 < 4.0) {
-              denom2 = 4.0;
-            }
-            var ts: float64 = ((float64)mdx * Axs2 + (float64)mdy * Ays2) / denom2;
-            var ns2: float64 = sel2->scale + ts * 0.014;
-            if (ns2 < 0.05) { ns2 = 0.05; }
-            if (ns2 > 40.0) { ns2 = 40.0; }
-            sel2->scale = ns2;
+          if (vp->hover_id != 0) {
+            vp->selected_id = vp->hover_id;
+            scene_set_selected(sc, vp->hover_id);
+            vp->drag_selected = 1;
           } else {
-            if (vp->active_tool == 2) {
-              // World-aligned ring (matches render + hit-test).
-              var ruxr: float64 = vp_gizmo_ring_u_world(vp->manip_axis, 0);
-              var ruyr: float64 = vp_gizmo_ring_u_world(vp->manip_axis, 1);
-              var ruzr: float64 = vp_gizmo_ring_u_world(vp->manip_axis, 2);
-              var rad_r: float64 = vp_gizmo_radius_basis(sc, &pick_basis, sel2) * 0.92;
-              var nwx: float64 = swx + ruxr * rad_r;
-              var nwy: float64 = swy + ruyr * rad_r;
-              var nwz: float64 = swz + ruzr * rad_r;
-              var oxs: int32 = vp_proj_x_basis(&pick_basis, swx, swy, swz, vx, vw);
-              var oys: int32 = vp_proj_y_basis(&pick_basis, swx, swy, swz, vy, vw, vh);
-              var nxs: int32 = vp_proj_x_basis(&pick_basis, nwx, nwy, nwz, vx, vw);
-              var nys: int32 = vp_proj_y_basis(&pick_basis, nwx, nwy, nwz, vy, vw, vh);
-              var rx: float64 = (float64)(nxs - oxs);
-              var ry: float64 = (float64)(nys - oys);
-              var tx: float64 = 0.0 - ry;
-              var ty: float64 = rx;
-              var tlen: float64 = sqrt(tx * tx + ty * ty);
-              if (tlen < 1.0) {
-                tlen = 1.0;
+            vp->selected_id = 0;
+            scene_set_selected(sc, 0);
+            vp->drag_selected = 0;
+          }
+          changed = 1;
+        }
+      }
+      if (left_down == 0) {
+        vp->drag_selected = 0;
+        vp->manip_dragging = 0;
+        vp->manip_axis = 0;
+      }
+      if (in_vp != 0 && left_down != 0 && vp->manip_dragging != 0 && vp->manip_axis != 0 && sc != 0) {
+        var sel2: Entity* = scene_selected_row(sc);
+        if (sel2 != 0) {
+          var swx: float64 = scene_entity_world_pos(sc, sel2, 0);
+          var swy: float64 = scene_entity_world_pos(sc, sel2, 1);
+          var swz: float64 = scene_entity_world_pos(sc, sel2, 2);
+          if (vp->active_tool == 1) {
+            var axw: float64 = vp_gizmo_axis_world(sc, sel2, vp->manip_axis, 0);
+            var ayw: float64 = vp_gizmo_axis_world(sc, sel2, vp->manip_axis, 1);
+            var azw: float64 = vp_gizmo_axis_world(sc, sel2, vp->manip_axis, 2);
+            var pe: float64 = 0.05;
+            var qmx: float64 = swx + axw * pe;
+            var qmy: float64 = swy + ayw * pe;
+            var qmz: float64 = swz + azw * pe;
+            var psx0: int32 = vp_proj_x_basis(&pick_basis, swx, swy, swz, vx, vw, vh);
+            var psy0: int32 = vp_proj_y_basis(&pick_basis, swx, swy, swz, vy, vw, vh);
+            var psx1: int32 = vp_proj_x_basis(&pick_basis, qmx, qmy, qmz, vx, vw, vh);
+            var psy1: int32 = vp_proj_y_basis(&pick_basis, qmx, qmy, qmz, vy, vw, vh);
+            var Axs: float64 = (float64)(psx1 - psx0);
+            var Ays: float64 = (float64)(psy1 - psy0);
+            var denom: float64 = Axs * Axs + Ays * Ays;
+            if (denom < 4.0) {
+              denom = 4.0;
+            }
+            var tm: float64 = ((float64)mdx * Axs + (float64)mdy * Ays) / denom;
+            var move_k: float64 = 0.018;
+            scene_entity_translate_world(sc, sel2, axw * tm * move_k, ayw * tm * move_k, azw * tm * move_k);
+          } else {
+            if (vp->active_tool == 3) {
+              var axw2: float64 = vp_gizmo_axis_world(sc, sel2, vp->manip_axis, 0);
+              var ayw2: float64 = vp_gizmo_axis_world(sc, sel2, vp->manip_axis, 1);
+              var azw2: float64 = vp_gizmo_axis_world(sc, sel2, vp->manip_axis, 2);
+              var pe2: float64 = 0.05;
+              var qmx2: float64 = swx + axw2 * pe2;
+              var qmy2: float64 = swy + ayw2 * pe2;
+              var qmz2: float64 = swz + azw2 * pe2;
+              var psx0b: int32 = vp_proj_x_basis(&pick_basis, swx, swy, swz, vx, vw, vh);
+              var psy0b: int32 = vp_proj_y_basis(&pick_basis, swx, swy, swz, vy, vw, vh);
+              var psx1b: int32 = vp_proj_x_basis(&pick_basis, qmx2, qmy2, qmz2, vx, vw, vh);
+              var psy1b: int32 = vp_proj_y_basis(&pick_basis, qmx2, qmy2, qmz2, vy, vw, vh);
+              var Axs2: float64 = (float64)(psx1b - psx0b);
+              var Ays2: float64 = (float64)(psy1b - psy0b);
+              var denom2: float64 = Axs2 * Axs2 + Ays2 * Ays2;
+              if (denom2 < 4.0) {
+                denom2 = 4.0;
               }
-              var dang: float64 = ((float64)mdx * tx + (float64)mdy * ty) / tlen * 0.0065;
-              if (vp->manip_axis == 2) {
-                dang = 0.0 - dang;
+              var ts: float64 = ((float64)mdx * Axs2 + (float64)mdy * Ays2) / denom2;
+              var ns2: float64 = sel2->scale + ts * 0.014;
+              if (ns2 < 0.05) { ns2 = 0.05; }
+              if (ns2 > 40.0) { ns2 = 40.0; }
+              sel2->scale = ns2;
+            } else {
+              if (vp->active_tool == 2) {
+                var ruxr: float64 = vp_gizmo_ring_u_world(vp->manip_axis, 0);
+                var ruyr: float64 = vp_gizmo_ring_u_world(vp->manip_axis, 1);
+                var ruzr: float64 = vp_gizmo_ring_u_world(vp->manip_axis, 2);
+                var rad_r: float64 = vp_gizmo_radius_basis(sc, &pick_basis, sel2) * 0.92;
+                var nwx: float64 = swx + ruxr * rad_r;
+                var nwy: float64 = swy + ruyr * rad_r;
+                var nwz: float64 = swz + ruzr * rad_r;
+                var oxs: int32 = vp_proj_x_basis(&pick_basis, swx, swy, swz, vx, vw, vh);
+                var oys: int32 = vp_proj_y_basis(&pick_basis, swx, swy, swz, vy, vw, vh);
+                var nxs: int32 = vp_proj_x_basis(&pick_basis, nwx, nwy, nwz, vx, vw, vh);
+                var nys: int32 = vp_proj_y_basis(&pick_basis, nwx, nwy, nwz, vy, vw, vh);
+                var rx: float64 = (float64)(nxs - oxs);
+                var ry: float64 = (float64)(nys - oys);
+                var tx: float64 = 0.0 - ry;
+                var ty: float64 = rx;
+                var tlen: float64 = sqrt(tx * tx + ty * ty);
+                if (tlen < 1.0) {
+                  tlen = 1.0;
+                }
+                var dang: float64 = ((float64)mdx * tx + (float64)mdy * ty) / tlen * 0.0065;
+                if (vp->manip_axis == 2) {
+                  dang = 0.0 - dang;
+                }
+                scene_entity_rotate_world_axis(sel2, vp->manip_axis, dang);
               }
-              scene_entity_rotate_world_axis(sel2, vp->manip_axis, dang);
             }
           }
+          changed = 1;
         }
-        changed = 1;
+      }
+    } else {
+      vp->manip_hover_axis = 0;
+      if (left_down == 0) {
+        vp->drag_selected = 0;
+        vp->manip_dragging = 0;
+        vp->manip_axis = 0;
       }
     }
   }
@@ -2051,6 +2939,28 @@ export function engine_viewport_input_tick(vp: EngineViewport*, sc: Scene*, mesh
         if (ds < 0.05) { ds = 0.05; }
         ssel->scale = ds;
         changed = 1;
+      }
+      if (allow_viewport_keys != 0 && ssel->kind == SK_TERRAIN() && sc->terrain != 0 && terrain_store_has(sc->terrain, ssel->id) != 0) {
+        if (vp_key(219) != 0) {
+          vp->terrain_brush_radius = vp->terrain_brush_radius - 0.15;
+          if (vp->terrain_brush_radius < 0.2) { vp->terrain_brush_radius = 0.2; }
+          changed = 1;
+        }
+        if (vp_key(221) != 0) {
+          vp->terrain_brush_radius = vp->terrain_brush_radius + 0.15;
+          if (vp->terrain_brush_radius > 45.0) { vp->terrain_brush_radius = 45.0; }
+          changed = 1;
+        }
+        if (vp_key(188) != 0) {
+          vp->terrain_brush_strength = vp->terrain_brush_strength - 0.01;
+          if (vp->terrain_brush_strength < 0.005) { vp->terrain_brush_strength = 0.005; }
+          changed = 1;
+        }
+        if (vp_key(190) != 0) {
+          vp->terrain_brush_strength = vp->terrain_brush_strength + 0.01;
+          if (vp->terrain_brush_strength > 0.6) { vp->terrain_brush_strength = 0.6; }
+          changed = 1;
+        }
       }
     }
   }
@@ -2093,16 +3003,18 @@ export function engine_viewport_render(vp: EngineViewport*, sc: Scene*, g: GameW
   var basis: VpCamBasis;
   vp_cam_basis_fill(vp, &basis);
 
-  // World floor grid on y=0 (this is what makes motion legible).
-  var floor: uint32 = swizzle_bgra8((uint8)52, (uint8)60, (uint8)70, (uint8)255);
-  var span: int32 = 20;
-  var i: int32 = 0 - span;
-  while (i <= span) {
-    var f: float64 = (float64)i;
-    var s: float64 = (float64)span;
-    vp_wline_basis(&basis, px, fw, fh, vx, vy, vw, vh, f, 0.0, 0.0 - s, f, 0.0, s, floor);
-    vp_wline_basis(&basis, px, fw, fh, vx, vy, vw, vh, 0.0 - s, 0.0, f, s, 0.0, f, floor);
-    i = i + 2;
+  // World floor grid is a helper only; terrain scenes own the ground plane.
+  if (scene_has_visible_terrain(sc) == 0) {
+    var floor: uint32 = swizzle_bgra8((uint8)52, (uint8)60, (uint8)70, (uint8)255);
+    var span: int32 = 20;
+    var i: int32 = 0 - span;
+    while (i <= span) {
+      var f: float64 = (float64)i;
+      var s: float64 = (float64)span;
+      vp_wline_basis(&basis, px, fw, fh, vx, vy, vw, vh, f, 0.0, 0.0 - s, f, 0.0, s, floor);
+      vp_wline_basis(&basis, px, fw, fh, vx, vy, vw, vh, 0.0 - s, 0.0, f, s, 0.0, f, floor);
+      i = i + 2;
+    }
   }
   // Origin axes (solid lines — less blend work than the Wu grid).
   vp_wline_basis(&basis, px, fw, fh, vx, vy, vw, vh, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, swizzle_bgra8((uint8)210, (uint8)80, (uint8)80, (uint8)255));
@@ -2113,6 +3025,16 @@ export function engine_viewport_render(vp: EngineViewport*, sc: Scene*, g: GameW
   var c_sel: uint32 = swizzle_bgra8((uint8)255, (uint8)210, (uint8)95, (uint8)255);
   var c_hover: uint32 = swizzle_bgra8((uint8)180, (uint8)235, (uint8)255, (uint8)255);
   if (sc != 0) {
+    var shi: int32 = 0;
+    var shn: int32 = scene_count(sc);
+    while (shi < shn) {
+      var she: Entity* = scene_row(sc, shi);
+      shi = shi + 1;
+      if (she == 0) { continue; }
+      if ((she->flags & SE_FLAG_HIDDEN()) != 0) { continue; }
+      vp_draw_entity_shadow(sc, &basis, she, px, fw, fh, vx, vy, vw, vh);
+    }
+
     var sel_id: int32 = scene_selected_id(sc);
     var hov_id: int32 = scene_hover_id(sc);
     var ei: int32 = 0;

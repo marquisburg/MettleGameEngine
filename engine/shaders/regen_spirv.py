@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Regenerate engine/engine_vk_shaders.meth from the GLSL in this directory.
+"""Regenerate engine/engine_vk_shaders.mettle from the GLSL in this directory.
 
 No SPIR-V compiler ships on the build machine and the Windows SDK dxc.exe has
 SPIR-V codegen disabled, so this fetches the official Khronos prebuilt
 glslangValidator on demand, compiles tri.vert / tri.frag to SPIR-V, then emits
-the words as Methlang uint32-fill functions.
+the words as Mettle uint32-fill functions.
 
 Usage (from repo root):  python engine/shaders/regen_spirv.py
 Requires network on first run (caches glslang under engine/shaders/.glslang).
@@ -22,7 +22,7 @@ GLSLANG_DIR = os.path.join(HERE, ".glslang")
 GLSLANG_EXE = os.path.join(GLSLANG_DIR, "bin", "glslangValidator.exe")
 GLSLANG_URL = ("https://github.com/KhronosGroup/glslang/releases/download/"
                "main-tot/glslang-master-windows-Release.zip")
-OUT = os.path.join(REPO, "engine", "engine_vk_shaders.meth")
+OUT = os.path.join(REPO, "engine", "engine_vk_shaders.mettle")
 SPIRV_MAGIC = 0x07230203
 
 

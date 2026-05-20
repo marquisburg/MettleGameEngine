@@ -1,0 +1,6 @@
+// Root: import chain root -> probe_mid -> probe_bad_leaf.
+import "probe_mid";
+
+function main() -> int32 {
+  return mid_fn(2);
+}

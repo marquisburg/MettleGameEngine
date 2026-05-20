@@ -2,7 +2,7 @@
 // Build the host with:  --link-arg -lvulkan-1
 //
 // HARD RULE: declare every struct field in Vulkan spec order with the correct
-// type. Methlang lays fields out in declaration order and AUTO-ALIGNS them to
+// type. Mettle lays fields out in declaration order and AUTO-ALIGNS them to
 // the target C ABI (verified empirically: a uint32 followed by an int64 places
 // the int64 at offset 8, exactly like C). So do NOT add manual padding fields
 // here -- doing so double-pads and shifts every pointer, which the driver
@@ -19,7 +19,7 @@ import "std/mem";
 // Forward declaration: the flattened module can emit exported functions before
 // later-defined helpers, so calls to vk_say from the exported create functions
 // resolve only with this prototype (same pattern as game_gdi_win32).
-function vk_say(msg: string);
+export function vk_say(msg: string);
 
 // ---- Structure type enum values (subset we use) -----------------------------
 function VK_ST_APPLICATION_INFO() -> uint32 { return (uint32)0; }
@@ -744,14 +744,14 @@ function vkctx_bytes() -> int64 {
   return (int64)1024;
 }
 
-function vk_say(msg: string) {
+export function vk_say(msg: string) {
   print(cstr(msg));
   newline();
   fflush(get_stdout());
 }
 
-function vk_create_depth(ctx: VkContext*, w: uint32, h: uint32) -> int32;
-function vk_destroy_depth(ctx: VkContext*);
+export function vk_create_depth(ctx: VkContext*, w: uint32, h: uint32) -> int32;
+export function vk_destroy_depth(ctx: VkContext*);
 
 // QUEUE_GRAPHICS_BIT = 1.
 function vk_pick_graphics_family(phys: int64) -> int32 {
@@ -1444,7 +1444,7 @@ function vk_create_vertex_buffer(ctx: VkContext*, capacity: int64) -> int32 {
 
 // Depth image (D32_SFLOAT = 126), device-local, + view. Rebuilt on resize.
 // VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT = 0x20; aspect DEPTH = 2.
-function vk_create_depth(ctx: VkContext*, w: uint32, h: uint32) -> int32 {
+export function vk_create_depth(ctx: VkContext*, w: uint32, h: uint32) -> int32 {
   ctx->depth_format = (uint32)126;
   var ici: VkImageCreateInfo;
   ici.s_type = (uint32)14;
@@ -1514,7 +1514,7 @@ function vk_create_depth(ctx: VkContext*, w: uint32, h: uint32) -> int32 {
   return 1;
 }
 
-function vk_destroy_depth(ctx: VkContext*) {
+export function vk_destroy_depth(ctx: VkContext*) {
   if (ctx == 0 || ctx->device == 0) {
     return;
   }
@@ -1769,9 +1769,9 @@ export function vk_context_create_pipeline(ctx: VkContext*) -> int32 {
   }
   ctx->pipeline = pipe;
 
-  // Solid mesh pipeline: same vertex format and shader, triangle topology,
-  // depth test/write enabled. Lighting is baked into per-face vertex colors by
-  // engine_vk_scene for now.
+  // Solid scene pipeline: same vertex format and shader, triangle topology,
+  // depth test/write enabled. Lighting and projected shadows are baked into
+  // vertex colors/geometry by engine_vk_scene for now.
   ias.topology = (uint32)3;
   dss.depth_write_enable = (uint32)1;
   var solid_pipe: int64 = 0;
@@ -1786,7 +1786,8 @@ export function vk_context_create_pipeline(ctx: VkContext*) -> int32 {
   ctx->solid_pipeline = solid_pipe;
 
   // Persistent host-visible vertex buffer. 24 bytes/vertex (vec3 pos + vec3
-  // color); 4MB leaves room for imported OBJ triangles plus editor chrome.
+  // color); 4MB leaves room for imported OBJ triangles, projected shadows,
+  // and editor chrome.
   if (ctx->vbuf_buffer == 0) {
     if (vk_create_vertex_buffer(ctx, (int64)4194304) == 0) {
       return 0;
@@ -1904,10 +1905,14 @@ export function vk_draw_frame(ctx: VkContext*, mvp16: float32*) -> int32 {
     return 0;
   }
 
+  // Sky clear: dusky blue-grey so the world doesn't read as floating in
+  // black void. Matches the cool sky tint used by the hemisphere shader in
+  // engine_vk_scene; bumping above ~0.20 starts to look washed out and
+  // hurts contrast against bright lit surfaces.
   var clears: VkClearValue[2];
-  clears[0].r = (float32)0.05;
-  clears[0].g = (float32)0.06;
-  clears[0].b = (float32)0.10;
+  clears[0].r = (float32)0.18;
+  clears[0].g = (float32)0.22;
+  clears[0].b = (float32)0.28;
   clears[0].a = (float32)1.0;
   clears[1].r = (float32)1.0;
   clears[1].g = (float32)0.0;

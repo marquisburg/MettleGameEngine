@@ -1,0 +1,1658 @@
+// Editor scene model: a fixed-capacity array of entities the viewport renders,
+// picks, and edits. Replaces the single hardcoded cube that used to live as
+// loose model_* fields on EngineViewport.
+//
+// Storage mirrors engine_assets.mettle: a small calloc'd header struct plus a
+// malloc'd row blob. Rows are addressed by (int64)base + i*scene_row_bytes()
+// then cast back to Entity* (the --emit-obj backend is reliable with this
+// pattern; it is the same one the asset registry uses).
+//
+// Struct field order follows the engine convention (see engine_viewport.mettle):
+// all 8-byte members first, all int32 after. Entity rotation is a normalized
+// quaternion; Euler values only appear at legacy scene-file import boundaries.
+import "engine_fs_win32";
+import "engine_terrain_store";
+import "std/conv";
+import "std/mem";
+
+extern function sqrt(x: float64) -> float64 = "sqrt";
+extern function sin(x: float64) -> float64 = "sin";
+extern function cos(x: float64) -> float64 = "cos";
+
+// Entity kinds. Cubes/boxes/terrain are built-in renderable primitives; mesh
+// entities reference imported mesh data by mesh_id/path.
+export function SK_CUBE() -> int32 {
+  return 0;
+}
+
+export function SK_BOX() -> int32 {
+  return 1;
+}
+
+export function SK_MESH() -> int32 {
+  return 2;
+}
+
+export function SK_TERRAIN() -> int32 {
+  return 3;
+}
+
+// Entity flags (bitfield in flags).
+export function SE_FLAG_NONE() -> int32 {
+  return 0;
+}
+
+export function SE_FLAG_HIDDEN() -> int32 {
+  return 1;
+}
+
+export function SE_FLAG_COLLIDER() -> int32 {
+  return 2;
+}
+
+export function SE_FLAG_TRIGGER() -> int32 {
+  return 4;
+}
+
+// 8-byte members first (16 float64), then int32 members.
+// Rotation order for verts / gizmos: roll (local Z) → pitch (local X) → yaw
+// (world +Y), compatible with the prior pitch-then-yaw cube when roll = 0.
+//
+// Appearance/physics block (transparency..mass, color_rgba) is the typed
+// property maturation: instead of every property being a loose float, the
+// engine carries a small typed surface that the inspector, scene file, and
+// Lua all read through one descriptor table (see scene_prop_* below).
+export struct Entity {
+  pos_x: float64;
+  pos_y: float64;
+  pos_z: float64;
+  rot_x: float64;
+  rot_y: float64;
+  rot_z: float64;
+  rot_w: float64;
+  scale: float64;
+  half: float64;
+  size_x: float64;
+  size_y: float64;
+  size_z: float64;
+  transparency: float64;   // 0 = opaque, 1 = invisible (rendered + raycast)
+  reflectance: float64;    // 0..1 environment reflection mix (renderer hint)
+  mass: float64;           // kg; 0 lets the engine derive from volume*density
+  density: float64;        // kg/m^3; default 1.0 (used when mass == 0)
+  id: int32;
+  kind: int32;
+  flags: int32;
+  parent_id: int32;
+  mesh_id: int32;
+  script_id: int32;
+  script_enabled: int32;
+  material_id: int32;
+  color_rgba: int32;       // packed 0xAARRGGBB surface color (A unused = 255)
+  prop_flags: int32;       // PF_* typed booleans (anchored/locked/cast shadow…)
+  name: uint8[64];
+  mesh_path: uint8[520];
+  lua_script: uint8[260];
+}
+
+export struct Scene {
+  rows: Entity*;
+  terrain: TerrainStore*;
+  cap: int32;
+  count: int32;
+  selected_id: int32;
+  hover_id: int32;
+  next_id: int32;
+  _hdr_pad: int32;
+}
+
+// 16 * 8 (float64), int32 metadata, and fixed editor strings; rounded up for
+// backend slack. Layout: 128 (16 f64) + 40 (10 i32) + 64 (name) + 520
+// (mesh_path) + 260 (lua_script) = 1012 -> 1056 with slack. The row size grew
+// from 1024 when the typed appearance/physics block was added; scene files are
+// a clean break (mettlescene 5), so no on-disk migration is needed.
+export function scene_row_bytes() -> int64 {
+  return (int64)1056;
+}
+
+// ---- Typed property flags (Entity.prop_flags bitfield) ---------------------
+// These are the "matured" booleans that used to be implicit or absent. Kept
+// separate from `flags` (SE_FLAG_*) so the renderer/collision bits and the
+// editor-facing toggles evolve independently.
+export function PF_NONE() -> int32 { return 0; }
+export function PF_ANCHORED() -> int32 { return 1; }      // physics: immovable
+export function PF_LOCKED() -> int32 { return 2; }        // editor: no select/drag
+export function PF_CAST_SHADOW() -> int32 { return 4; }   // renderer: blob shadow
+export function PF_CAN_COLLIDE() -> int32 { return 8; }   // runtime collide (vs SE_FLAG_COLLIDER edit intent)
+
+export function scene_entity_prop_flag(e: Entity*, bit: int32) -> int32 {
+  if (e == 0) { return 0; }
+  if ((e->prop_flags & bit) != 0) { return 1; }
+  return 0;
+}
+
+export function scene_entity_set_prop_flag(e: Entity*, bit: int32, on: int32) {
+  if (e == 0) { return; }
+  if (on != 0) {
+    e->prop_flags = e->prop_flags | bit;
+  } else {
+    e->prop_flags = e->prop_flags & (0 - 1 - bit);
+  }
+}
+
+// Packed-color helpers. Storage is 0x00RRGGBB in an int32; the renderer wants
+// 0..1 floats, the inspector wants 0..255 ints, the scene file stores the raw
+// int. One representation, three views.
+export function scene_color_pack(r: int32, g: int32, b: int32) -> int32 {
+  if (r < 0) { r = 0; }
+  if (r > 255) { r = 255; }
+  if (g < 0) { g = 0; }
+  if (g > 255) { g = 255; }
+  if (b < 0) { b = 0; }
+  if (b > 255) { b = 255; }
+  return (r * 65536) + (g * 256) + b;
+}
+
+export function scene_color_r(packed: int32) -> int32 {
+  return (packed / 65536) & 255;
+}
+
+export function scene_color_g(packed: int32) -> int32 {
+  return (packed / 256) & 255;
+}
+
+export function scene_color_b(packed: int32) -> int32 {
+  return packed & 255;
+}
+
+export function scene_entity_color_comp_f(e: Entity*, comp: int32) -> float64 {
+  if (e == 0) { return 0.7; }
+  var p: int32 = e->color_rgba;
+  if (p == 0) {
+    return 0.0;
+  }
+  var v: int32 = scene_color_b(p);
+  if (comp == 0) { v = scene_color_r(p); }
+  if (comp == 1) { v = scene_color_g(p); }
+  return (float64)v / 255.0;
+}
+
+// 1 if the entity has an explicit (non-default) color the renderer should use
+// instead of its kind-based palette albedo.
+export function scene_entity_has_color(e: Entity*) -> int32 {
+  if (e == 0 || e->color_rgba == 0) {
+    return 0;
+  }
+  return 1;
+}
+
+function scene_header_bytes() -> int64 {
+  return (int64)64;
+}
+
+function scene_copy_cstr(dst: cstring, dst_cap: int32, src: cstring) {
+  if (dst == 0 || dst_cap <= 0) {
+    return;
+  }
+  if (src == 0) {
+    dst[0] = 0;
+    return;
+  }
+  var i: int32 = 0;
+  while (i + 1 < dst_cap) {
+    var b: uint8 = (uint8)(src[i]);
+    dst[i] = b;
+    if (b == (uint8)0) {
+      return;
+    }
+    i = i + 1;
+  }
+  dst[dst_cap - 1] = 0;
+}
+
+function scene_default_name(e: Entity*) {
+  if (e == 0) {
+    return;
+  }
+  var out: cstring = (cstring)((int64)(&(e->name[0])));
+  var cube: string = "Cube ";
+  var box: string = "Box ";
+  var mesh: string = "Mesh ";
+  var terrain: string = "Terrain ";
+  var ent: string = "Entity ";
+  var src: cstring = ent.chars;
+  if (e->kind == SK_CUBE()) {
+    src = cube.chars;
+  } else {
+    if (e->kind == SK_BOX()) {
+      src = box.chars;
+    } else {
+      if (e->kind == SK_MESH()) {
+        src = mesh.chars;
+      } else {
+        if (e->kind == SK_TERRAIN()) {
+          src = terrain.chars;
+        }
+      }
+    }
+  }
+  var j: int32 = 0;
+  var k: int32 = 0;
+  while (j + 1 < 64 && (uint8)(src[k]) != (uint8)0) {
+    out[j] = src[k];
+    j = j + 1;
+    k = k + 1;
+  }
+  var nb: uint8[24];
+  int_to_dec((cstring)((int64)(&(nb[0]))), (int64)e->id);
+  k = 0;
+  while (j + 1 < 64 && nb[k] != (uint8)0) {
+    out[j] = nb[k];
+    j = j + 1;
+    k = k + 1;
+  }
+  out[j] = 0;
+}
+
+export function scene_create(cap: int32) -> Scene* {
+  if (cap <= 0) {
+    cap = 256;
+  }
+  if (cap > 8192) {
+    cap = 8192;
+  }
+  var raw: cstring = calloc((int64)1, scene_header_bytes());
+  if (raw == 0) {
+    return 0;
+  }
+  var sc: Scene* = (Scene*)raw;
+  sc->cap = cap;
+  sc->count = 0;
+  sc->selected_id = 0;
+  sc->hover_id = 0;
+  sc->next_id = 1;
+  sc->terrain = terrain_store_create(128);
+  if (sc->terrain == 0) {
+    free(raw);
+    return 0;
+  }
+  var blob: cstring = calloc(scene_row_bytes(), (int64)cap);
+  if (blob == 0) {
+    if (sc->terrain != 0) {
+      terrain_store_destroy(sc->terrain);
+    }
+    free(raw);
+    return 0;
+  }
+  sc->rows = (Entity*)blob;
+  return sc;
+}
+
+export function scene_destroy(sc: Scene*) {
+  if (sc == 0) {
+    return;
+  }
+  if (sc->terrain != 0) {
+    terrain_store_destroy(sc->terrain);
+    sc->terrain = 0;
+  }
+  if (sc->rows != 0) {
+    free((cstring)sc->rows);
+    sc->rows = 0;
+  }
+  free((cstring)sc);
+}
+
+export function scene_count(sc: Scene*) -> int32 {
+  if (sc == 0) {
+    return 0;
+  }
+  return sc->count;
+}
+
+export function scene_clear(sc: Scene*) {
+  if (sc == 0) {
+    return;
+  }
+  if (sc->terrain != 0) {
+    terrain_store_clear(sc->terrain);
+  }
+  sc->count = 0;
+  sc->selected_id = 0;
+  sc->hover_id = 0;
+  sc->next_id = 1;
+}
+
+// Row pointer by index [0, count). Returns 0 on any out-of-range / null.
+export function scene_row(sc: Scene*, i: int32) -> Entity* {
+  if (sc == 0) {
+    return 0;
+  }
+  if (i < 0 || i >= sc->count) {
+    return 0;
+  }
+  var base: Entity* = sc->rows;
+  if (base == 0) {
+    return 0;
+  }
+  var off: int64 = (int64)i * scene_row_bytes();
+  var rawp: cstring = (cstring)((int64)base + off);
+  return (Entity*)rawp;
+}
+
+// Find a row by stable id. Returns 0 if no entity has that id.
+export function scene_find(sc: Scene*, id: int32) -> Entity* {
+  if (sc == 0 || id == 0) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < sc->count) {
+    var e: Entity* = scene_row(sc, i);
+    if (e != 0 && e->id == id) {
+      return e;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+function scene_cstr_eq(a: cstring, b: cstring) -> int32 {
+  if (a == 0 || b == 0) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < 64) {
+    var ca: uint8 = (uint8)(a[i]);
+    var cb: uint8 = (uint8)(b[i]);
+    if (ca != cb) {
+      return 0;
+    }
+    if (ca == (uint8)0) {
+      return 1;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// First entity whose display name equals `name` (exact, case-sensitive), or 0.
+// Linear scan — entity counts are small; callers that need it hot should cache
+// the returned id (it's stable for the entity's lifetime).
+export function scene_find_by_name(sc: Scene*, name: cstring) -> Entity* {
+  if (sc == 0 || name == 0) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < sc->count) {
+    var e: Entity* = scene_row(sc, i);
+    if (e != 0 && scene_cstr_eq((cstring)((int64)(&(e->name[0]))), name) != 0) {
+      return e;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Index of the row holding id, or -1.
+export function scene_index_of(sc: Scene*, id: int32) -> int32 {
+  if (sc == 0 || id == 0) {
+    return -1;
+  }
+  var i: int32 = 0;
+  while (i < sc->count) {
+    var e: Entity* = scene_row(sc, i);
+    if (e != 0 && e->id == id) {
+      return i;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+function scene_quat_len(x: float64, y: float64, z: float64, w: float64) -> float64 {
+  return sqrt(x * x + y * y + z * z + w * w);
+}
+
+export function scene_entity_normalize_rotation(e: Entity*) {
+  if (e == 0) {
+    return;
+  }
+  var L: float64 = scene_quat_len(e->rot_x, e->rot_y, e->rot_z, e->rot_w);
+  if (L < 0.000001) {
+    e->rot_x = 0.0;
+    e->rot_y = 0.0;
+    e->rot_z = 0.0;
+    e->rot_w = 1.0;
+    return;
+  }
+  e->rot_x = e->rot_x / L;
+  e->rot_y = e->rot_y / L;
+  e->rot_z = e->rot_z / L;
+  e->rot_w = e->rot_w / L;
+}
+
+export function scene_entity_set_identity_rotation(e: Entity*) {
+  if (e == 0) {
+    return;
+  }
+  e->rot_x = 0.0;
+  e->rot_y = 0.0;
+  e->rot_z = 0.0;
+  e->rot_w = 1.0;
+}
+
+export function scene_entity_half_x(e: Entity*) -> float64 {
+  if (e == 0) {
+    return 1.0;
+  }
+  if (e->size_x > 0.0) {
+    return e->size_x;
+  }
+  if (e->half > 0.0) {
+    return e->half;
+  }
+  return 1.0;
+}
+
+export function scene_entity_half_y(e: Entity*) -> float64 {
+  if (e == 0) {
+    return 1.0;
+  }
+  if (e->size_y > 0.0) {
+    return e->size_y;
+  }
+  if (e->half > 0.0) {
+    return e->half;
+  }
+  return 1.0;
+}
+
+export function scene_entity_half_z(e: Entity*) -> float64 {
+  if (e == 0) {
+    return 1.0;
+  }
+  if (e->size_z > 0.0) {
+    return e->size_z;
+  }
+  if (e->half > 0.0) {
+    return e->half;
+  }
+  return 1.0;
+}
+
+export function scene_entity_set_size(e: Entity*, sx: float64, sy: float64, sz: float64) {
+  if (e == 0) {
+    return;
+  }
+  if (sx < 0.02) { sx = 0.02; }
+  if (sy < 0.02) { sy = 0.02; }
+  if (sz < 0.02) { sz = 0.02; }
+  e->size_x = sx;
+  e->size_y = sy;
+  e->size_z = sz;
+  var h: float64 = sx;
+  if (sy > h) { h = sy; }
+  if (sz > h) { h = sz; }
+  e->half = h;
+}
+
+// Legacy import helper. The old editor order was roll(local Z) -> pitch(local X)
+// -> yaw(world +Y), so compose q = q_yaw * q_pitch * q_roll.
+export function scene_entity_set_rotation_euler_legacy(e: Entity*, yaw: float64, pitch: float64, roll: float64) {
+  if (e == 0) {
+    return;
+  }
+  var hy: float64 = yaw * 0.5;
+  var hp: float64 = pitch * 0.5;
+  var hr: float64 = roll * 0.5;
+  var qyx: float64 = 0.0;
+  var qyy: float64 = sin(hy);
+  var qyz: float64 = 0.0;
+  var qyw: float64 = cos(hy);
+  var qpx: float64 = sin(hp);
+  var qpy: float64 = 0.0;
+  var qpz: float64 = 0.0;
+  var qpw: float64 = cos(hp);
+  var qrx: float64 = 0.0;
+  var qry: float64 = 0.0;
+  var qrz: float64 = sin(hr);
+  var qrw: float64 = cos(hr);
+  var ax: float64 = qyw * qpx + qyx * qpw + qyy * qpz - qyz * qpy;
+  var ay: float64 = qyw * qpy - qyx * qpz + qyy * qpw + qyz * qpx;
+  var az: float64 = qyw * qpz + qyx * qpy - qyy * qpx + qyz * qpw;
+  var aw: float64 = qyw * qpw - qyx * qpx - qyy * qpy - qyz * qpz;
+  e->rot_x = aw * qrx + ax * qrw + ay * qrz - az * qry;
+  e->rot_y = aw * qry - ax * qrz + ay * qrw + az * qrx;
+  e->rot_z = aw * qrz + ax * qry - ay * qrx + az * qrw;
+  e->rot_w = aw * qrw - ax * qrx - ay * qry - az * qrz;
+  scene_entity_normalize_rotation(e);
+}
+
+// World-axis rotation for editor/runtime gizmos. Axes: 1=X, 2=Y, 3=Z.
+export function scene_entity_rotate_world_axis(e: Entity*, axis: int32, radians: float64) {
+  if (e == 0) {
+    return;
+  }
+  var s: float64 = sin(radians * 0.5);
+  var dx: float64 = 0.0;
+  var dy: float64 = 0.0;
+  var dz: float64 = 0.0;
+  if (axis == 1) { dx = s; }
+  if (axis == 2) { dy = s; }
+  if (axis == 3) { dz = s; }
+  var dw: float64 = cos(radians * 0.5);
+  var ox: float64 = e->rot_x;
+  var oy: float64 = e->rot_y;
+  var oz: float64 = e->rot_z;
+  var ow: float64 = e->rot_w;
+  e->rot_x = dw * ox + dx * ow + dy * oz - dz * oy;
+  e->rot_y = dw * oy - dx * oz + dy * ow + dz * ox;
+  e->rot_z = dw * oz + dx * oy - dy * ox + dz * ow;
+  e->rot_w = dw * ow - dx * ox - dy * oy - dz * oz;
+  scene_entity_normalize_rotation(e);
+}
+
+export function scene_entity_rot_vec_comp(e: Entity*, x: float64, y: float64, z: float64, comp: int32) -> float64 {
+  if (e == 0) {
+    return 0.0;
+  }
+  var qx: float64 = e->rot_x;
+  var qy: float64 = e->rot_y;
+  var qz: float64 = e->rot_z;
+  var qw: float64 = e->rot_w;
+  var tx: float64 = 2.0 * (qy * z - qz * y);
+  var ty: float64 = 2.0 * (qz * x - qx * z);
+  var tz: float64 = 2.0 * (qx * y - qy * x);
+  var rx: float64 = x + qw * tx + (qy * tz - qz * ty);
+  var ry: float64 = y + qw * ty + (qz * tx - qx * tz);
+  var rz: float64 = z + qw * tz + (qx * ty - qy * tx);
+  if (comp == 0) { return rx; }
+  if (comp == 1) { return ry; }
+  return rz;
+}
+
+function scene_entity_inv_rot_vec_comp(e: Entity*, x: float64, y: float64, z: float64, comp: int32) -> float64 {
+  if (e == 0) {
+    return 0.0;
+  }
+  var qx: float64 = 0.0 - e->rot_x;
+  var qy: float64 = 0.0 - e->rot_y;
+  var qz: float64 = 0.0 - e->rot_z;
+  var qw: float64 = e->rot_w;
+  var tx: float64 = 2.0 * (qy * z - qz * y);
+  var ty: float64 = 2.0 * (qz * x - qx * z);
+  var tz: float64 = 2.0 * (qx * y - qy * x);
+  var rx: float64 = x + qw * tx + (qy * tz - qz * ty);
+  var ry: float64 = y + qw * ty + (qz * tx - qx * tz);
+  var rz: float64 = z + qw * tz + (qx * ty - qy * tx);
+  if (comp == 0) { return rx; }
+  if (comp == 1) { return ry; }
+  return rz;
+}
+
+export function scene_world_scale_guard(sc: Scene*, e: Entity*, guard: int32) -> float64;
+export function scene_world_rot_vec_guard(sc: Scene*, e: Entity*, x: float64, y: float64, z: float64, comp: int32, guard: int32) -> float64;
+
+function scene_world_pos_guard(sc: Scene*, e: Entity*, comp: int32, guard: int32) -> float64 {
+  if (e == 0) {
+    return 0.0;
+  }
+  if (sc == 0 || e->parent_id == 0 || guard > 128) {
+    if (comp == 0) { return e->pos_x; }
+    if (comp == 1) { return e->pos_y; }
+    return e->pos_z;
+  }
+  var p: Entity* = scene_find(sc, e->parent_id);
+  if (p == 0) {
+    if (comp == 0) { return e->pos_x; }
+    if (comp == 1) { return e->pos_y; }
+    return e->pos_z;
+  }
+  var ps: float64 = scene_world_scale_guard(sc, p, guard + 1);
+  var lx: float64 = e->pos_x * ps;
+  var ly: float64 = e->pos_y * ps;
+  var lz: float64 = e->pos_z * ps;
+  var rx: float64 = scene_world_rot_vec_guard(sc, p, lx, ly, lz, 0, guard + 1);
+  var ry: float64 = scene_world_rot_vec_guard(sc, p, lx, ly, lz, 1, guard + 1);
+  var rz: float64 = scene_world_rot_vec_guard(sc, p, lx, ly, lz, 2, guard + 1);
+  if (comp == 0) { return scene_world_pos_guard(sc, p, 0, guard + 1) + rx; }
+  if (comp == 1) { return scene_world_pos_guard(sc, p, 1, guard + 1) + ry; }
+  return scene_world_pos_guard(sc, p, 2, guard + 1) + rz;
+}
+
+export function scene_world_rot_vec_guard(sc: Scene*, e: Entity*, x: float64, y: float64, z: float64, comp: int32, guard: int32) -> float64 {
+  if (e == 0) {
+    return 0.0;
+  }
+  var lx: float64 = scene_entity_rot_vec_comp(e, x, y, z, 0);
+  var ly: float64 = scene_entity_rot_vec_comp(e, x, y, z, 1);
+  var lz: float64 = scene_entity_rot_vec_comp(e, x, y, z, 2);
+  if (sc == 0 || e->parent_id == 0 || guard > 128) {
+    if (comp == 0) { return lx; }
+    if (comp == 1) { return ly; }
+    return lz;
+  }
+  var p: Entity* = scene_find(sc, e->parent_id);
+  if (p == 0) {
+    if (comp == 0) { return lx; }
+    if (comp == 1) { return ly; }
+    return lz;
+  }
+  return scene_world_rot_vec_guard(sc, p, lx, ly, lz, comp, guard + 1);
+}
+
+export function scene_world_scale_guard(sc: Scene*, e: Entity*, guard: int32) -> float64 {
+  if (e == 0) {
+    return 1.0;
+  }
+  if (sc == 0 || e->parent_id == 0 || guard > 128) {
+    return e->scale;
+  }
+  var p: Entity* = scene_find(sc, e->parent_id);
+  if (p == 0) {
+    return e->scale;
+  }
+  return e->scale * scene_world_scale_guard(sc, p, guard + 1);
+}
+
+export function scene_entity_world_pos(sc: Scene*, e: Entity*, comp: int32) -> float64 {
+  return scene_world_pos_guard(sc, e, comp, 0);
+}
+
+export function scene_entity_world_rot_vec(sc: Scene*, e: Entity*, x: float64, y: float64, z: float64, comp: int32) -> float64 {
+  return scene_world_rot_vec_guard(sc, e, x, y, z, comp, 0);
+}
+
+export function scene_entity_world_scale(sc: Scene*, e: Entity*) -> float64 {
+  return scene_world_scale_guard(sc, e, 0);
+}
+
+export function scene_entity_radius(sc: Scene*, e: Entity*) -> float64 {
+  if (e == 0) {
+    return 1.0;
+  }
+  var h: float64 = scene_entity_half_x(e);
+  var hy: float64 = scene_entity_half_y(e);
+  var hz: float64 = scene_entity_half_z(e);
+  if (hy > h) { h = hy; }
+  if (hz > h) { h = hz; }
+  return h * scene_entity_world_scale(sc, e);
+}
+
+export function scene_entity_corner(sc: Scene*, e: Entity*, idx: int32, comp: int32) -> float64 {
+  if (e == 0) {
+    return 0.0;
+  }
+  var sx: float64 = -1.0;
+  var sy: float64 = -1.0;
+  var sz: float64 = -1.0;
+  if ((idx & 1) != 0) { sx = 1.0; }
+  if ((idx & 2) != 0) { sy = 1.0; }
+  if ((idx & 4) != 0) { sz = 1.0; }
+  var ws: float64 = scene_entity_world_scale(sc, e);
+  sx = sx * scene_entity_half_x(e) * ws;
+  sy = sy * scene_entity_half_y(e) * ws;
+  sz = sz * scene_entity_half_z(e) * ws;
+  var wx: float64 = scene_entity_world_rot_vec(sc, e, sx, sy, sz, 0);
+  var wy: float64 = scene_entity_world_rot_vec(sc, e, sx, sy, sz, 1);
+  var wz: float64 = scene_entity_world_rot_vec(sc, e, sx, sy, sz, 2);
+  if (comp == 0) { return scene_entity_world_pos(sc, e, 0) + wx; }
+  if (comp == 1) { return scene_entity_world_pos(sc, e, 1) + wy; }
+  return scene_entity_world_pos(sc, e, 2) + wz;
+}
+
+export function scene_entity_mesh_world(sc: Scene*, e: Entity*, x: float64, y: float64, z: float64, comp: int32) -> float64 {
+  if (e == 0) {
+    return 0.0;
+  }
+  var s: float64 = scene_entity_world_scale(sc, e);
+  var wx: float64 = scene_entity_world_rot_vec(sc, e, x * s, y * s, z * s, 0);
+  var wy: float64 = scene_entity_world_rot_vec(sc, e, x * s, y * s, z * s, 1);
+  var wz: float64 = scene_entity_world_rot_vec(sc, e, x * s, y * s, z * s, 2);
+  if (comp == 0) { return scene_entity_world_pos(sc, e, 0) + wx; }
+  if (comp == 1) { return scene_entity_world_pos(sc, e, 1) + wy; }
+  return scene_entity_world_pos(sc, e, 2) + wz;
+}
+
+export function scene_has_visible_terrain(sc: Scene*) -> int32 {
+  if (sc == 0) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < sc->count) {
+    var e: Entity* = scene_row(sc, i);
+    if (e != 0 && e->kind == SK_TERRAIN() && (e->flags & SE_FLAG_HIDDEN()) == 0) {
+      return 1;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+export function scene_entity_translate_world(sc: Scene*, e: Entity*, dx: float64, dy: float64, dz: float64) {
+  if (e == 0) {
+    return;
+  }
+  if (sc == 0 || e->parent_id == 0) {
+    e->pos_x = e->pos_x + dx;
+    e->pos_y = e->pos_y + dy;
+    e->pos_z = e->pos_z + dz;
+    return;
+  }
+  var p: Entity* = scene_find(sc, e->parent_id);
+  if (p == 0) {
+    e->pos_x = e->pos_x + dx;
+    e->pos_y = e->pos_y + dy;
+    e->pos_z = e->pos_z + dz;
+    return;
+  }
+  var ps: float64 = scene_entity_world_scale(sc, p);
+  if (ps < 0.000001) {
+    ps = 0.000001;
+  }
+  var lx: float64 = scene_entity_inv_rot_vec_comp(p, dx, dy, dz, 0) / ps;
+  var ly: float64 = scene_entity_inv_rot_vec_comp(p, dx, dy, dz, 1) / ps;
+  var lz: float64 = scene_entity_inv_rot_vec_comp(p, dx, dy, dz, 2) / ps;
+  e->pos_x = e->pos_x + lx;
+  e->pos_y = e->pos_y + ly;
+  e->pos_z = e->pos_z + lz;
+}
+
+export function scene_terrain_height_procedural_local(e: Entity*, lx: float64, lz: float64) -> float64 {
+  if (e == 0) {
+    return 0.0;
+  }
+  var amp: float64 = e->size_y;
+  if (amp <= 0.0) {
+    amp = 0.22;
+  }
+  var hx: float64 = scene_entity_half_x(e);
+  var hz: float64 = scene_entity_half_z(e);
+  if (hx < 0.001) { hx = 0.001; }
+  if (hz < 0.001) { hz = 0.001; }
+  var ax: float64 = lx / hx;
+  var az: float64 = lz / hz;
+  if (ax < 0.0) { ax = 0.0 - ax; }
+  if (az < 0.0) { az = 0.0 - az; }
+  var edge: float64 = 1.0 - ax;
+  if (1.0 - az < edge) { edge = 1.0 - az; }
+  if (edge < 0.0) { edge = 0.0; }
+  if (edge > 1.0) { edge = 1.0; }
+  var fade: float64 = edge * edge * (3.0 - 2.0 * edge);
+  var broad: float64 = sin(lx * 0.13) * 0.42 + cos(lz * 0.11) * 0.34;
+  var detail: float64 = sin((lx + lz) * 0.055) * 0.18 + cos((lx - lz) * 0.071) * 0.12;
+  return (broad + detail) * amp * fade;
+}
+
+export function scene_terrain_height_local(sc: Scene*, e: Entity*, lx: float64, lz: float64) -> float64 {
+  if (e == 0) {
+    return 0.0;
+  }
+  if (sc != 0 && sc->terrain != 0 && terrain_store_has(sc->terrain, e->id) != 0) {
+    var hx: float64 = scene_entity_half_x(e);
+    var hz: float64 = scene_entity_half_z(e);
+    return terrain_store_sample(sc->terrain, e->id, lx, lz, hx, hz);
+  }
+  return scene_terrain_height_procedural_local(e, lx, lz);
+}
+
+export function scene_terrain_height_world(sc: Scene*, e: Entity*, wx: float64, wz: float64) -> float64 {
+  if (e == 0) {
+    return 0.0;
+  }
+  var s: float64 = scene_entity_world_scale(sc, e);
+  if (s < 0.000001) {
+    s = 0.000001;
+  }
+  var lx: float64 = (wx - scene_entity_world_pos(sc, e, 0)) / s;
+  var lz: float64 = (wz - scene_entity_world_pos(sc, e, 2)) / s;
+  return scene_entity_world_pos(sc, e, 1) + scene_terrain_height_local(sc, e, lx, lz) * s;
+}
+
+export function scene_terrain_contains_xz(sc: Scene*, e: Entity*, wx: float64, wz: float64) -> int32 {
+  if (e == 0 || e->kind != SK_TERRAIN()) {
+    return 0;
+  }
+  var s: float64 = scene_entity_world_scale(sc, e);
+  if (s < 0.000001) { s = 0.000001; }
+  var lx: float64 = (wx - scene_entity_world_pos(sc, e, 0)) / s;
+  var lz: float64 = (wz - scene_entity_world_pos(sc, e, 2)) / s;
+  if (lx < 0.0 - scene_entity_half_x(e) || lx > scene_entity_half_x(e)) { return 0; }
+  if (lz < 0.0 - scene_entity_half_z(e) || lz > scene_entity_half_z(e)) { return 0; }
+  return 1;
+}
+
+function scene_aabb_min_comp(sc: Scene*, e: Entity*, comp: int32) -> float64 {
+  var best: float64 = scene_entity_corner(sc, e, 0, comp);
+  var i: int32 = 1;
+  while (i < 8) {
+    var v: float64 = scene_entity_corner(sc, e, i, comp);
+    if (v < best) { best = v; }
+    i = i + 1;
+  }
+  if (e != 0 && e->kind == SK_TERRAIN() && comp == 1) {
+    best = scene_entity_world_pos(sc, e, 1) - scene_entity_half_y(e) * scene_entity_world_scale(sc, e) - 0.1;
+  }
+  return best;
+}
+
+function scene_aabb_max_comp(sc: Scene*, e: Entity*, comp: int32) -> float64 {
+  var best: float64 = scene_entity_corner(sc, e, 0, comp);
+  var i: int32 = 1;
+  while (i < 8) {
+    var v: float64 = scene_entity_corner(sc, e, i, comp);
+    if (v > best) { best = v; }
+    i = i + 1;
+  }
+  if (e != 0 && e->kind == SK_TERRAIN() && comp == 1) {
+    best = scene_entity_world_pos(sc, e, 1) + scene_entity_half_y(e) * scene_entity_world_scale(sc, e) + 0.1;
+  }
+  return best;
+}
+
+export function scene_entity_aabb_min(sc: Scene*, e: Entity*, comp: int32) -> float64 {
+  if (sc == 0 || e == 0) { return 0.0; }
+  return scene_aabb_min_comp(sc, e, comp);
+}
+
+export function scene_entity_aabb_max(sc: Scene*, e: Entity*, comp: int32) -> float64 {
+  if (sc == 0 || e == 0) { return 0.0; }
+  return scene_aabb_max_comp(sc, e, comp);
+}
+
+export function scene_entity_collidable(e: Entity*) -> int32 {
+  if (e == 0) {
+    return 0;
+  }
+  if ((e->flags & SE_FLAG_COLLIDER()) != 0 && (e->flags & SE_FLAG_HIDDEN()) == 0) {
+    return 1;
+  }
+  return 0;
+}
+
+export function scene_entities_overlap(sc: Scene*, a: Entity*, b: Entity*) -> int32 {
+  if (sc == 0 || a == 0 || b == 0) {
+    return 0;
+  }
+  if (scene_aabb_max_comp(sc, a, 0) < scene_aabb_min_comp(sc, b, 0)) { return 0; }
+  if (scene_aabb_min_comp(sc, a, 0) > scene_aabb_max_comp(sc, b, 0)) { return 0; }
+  if (scene_aabb_max_comp(sc, a, 1) < scene_aabb_min_comp(sc, b, 1)) { return 0; }
+  if (scene_aabb_min_comp(sc, a, 1) > scene_aabb_max_comp(sc, b, 1)) { return 0; }
+  if (scene_aabb_max_comp(sc, a, 2) < scene_aabb_min_comp(sc, b, 2)) { return 0; }
+  if (scene_aabb_min_comp(sc, a, 2) > scene_aabb_max_comp(sc, b, 2)) { return 0; }
+  return 1;
+}
+
+export function scene_first_collision(sc: Scene*, entity_id: int32) -> int32 {
+  if (sc == 0 || entity_id == 0) {
+    return 0;
+  }
+  var e: Entity* = scene_find(sc, entity_id);
+  if (e == 0) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < sc->count) {
+    var other: Entity* = scene_row(sc, i);
+    if (other != 0 && other->id != entity_id && scene_entity_collidable(other) != 0) {
+      if (other->kind == SK_TERRAIN()) {
+        var cx: float64 = scene_entity_world_pos(sc, e, 0);
+        var cz: float64 = scene_entity_world_pos(sc, e, 2);
+        if (scene_terrain_contains_xz(sc, other, cx, cz) != 0) {
+          var bottom: float64 = scene_aabb_min_comp(sc, e, 1);
+          var ground: float64 = scene_terrain_height_world(sc, other, cx, cz);
+          if (bottom < ground - 0.02) {
+            return other->id;
+          }
+        }
+      } else {
+        if (scene_entities_overlap(sc, e, other) != 0) {
+          return other->id;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+export function scene_ground_height_at(sc: Scene*, wx: float64, wz: float64, fallback_y: float64) -> float64 {
+  if (sc == 0) {
+    return fallback_y;
+  }
+  var best: float64 = fallback_y;
+  var found: int32 = 0;
+  var i: int32 = 0;
+  while (i < sc->count) {
+    var e: Entity* = scene_row(sc, i);
+    if (e != 0 && e->kind == SK_TERRAIN() && scene_terrain_contains_xz(sc, e, wx, wz) != 0) {
+      var h: float64 = scene_terrain_height_world(sc, e, wx, wz);
+      if (found == 0 || h > best) {
+        best = h;
+        found = 1;
+      }
+    }
+    i = i + 1;
+  }
+  return best;
+}
+
+export function scene_copy_into(dst: Scene*, src: Scene*) -> int32 {
+  if (dst == 0 || src == 0 || dst->cap < src->count) {
+    return 0;
+  }
+  dst->count = src->count;
+  dst->selected_id = src->selected_id;
+  dst->hover_id = src->hover_id;
+  dst->next_id = src->next_id;
+  if (src->count > 0) {
+    memcpy((cstring)dst->rows, (cstring)src->rows, scene_row_bytes() * (int64)src->count);
+  }
+  if (dst->terrain != 0 && src != 0 && src->terrain != 0) {
+    terrain_store_copy_from(dst->terrain, src->terrain);
+  }
+  return 1;
+}
+
+// Append an entity. Returns its new stable id, or 0 if the scene is full.
+export function scene_add(sc: Scene*, kind: int32, x: float64, y: float64, z: float64, half: float64) -> int32 {
+  if (sc == 0) {
+    return 0;
+  }
+  if (sc->count >= sc->cap) {
+    return 0;
+  }
+  var e: Entity* = scene_row(sc, sc->count);
+  if (e == 0) {
+    // count is in range by the check above; scene_row guards on count, so seat
+    // the new row directly past the live range.
+    var base: Entity* = sc->rows;
+    if (base == 0) {
+      return 0;
+    }
+    var off: int64 = (int64)sc->count * scene_row_bytes();
+    e = (Entity*)((cstring)((int64)base + off));
+  }
+  memset((cstring)e, 0, scene_row_bytes());
+  e->pos_x = x;
+  e->pos_y = y;
+  e->pos_z = z;
+  scene_entity_set_identity_rotation(e);
+  e->scale = 1.0;
+  if (half <= 0.0) {
+    half = 1.0;
+  }
+  e->half = half;
+  e->size_x = half;
+  e->size_y = half;
+  e->size_z = half;
+  e->kind = kind;
+  e->flags = SE_FLAG_COLLIDER();
+  e->parent_id = 0;
+  e->mesh_id = 0;
+  e->script_id = 0;
+  e->script_enabled = 0;
+  e->material_id = 0;
+  // Typed defaults: opaque, matte, shadow-casting, collidable, unanchored.
+  e->transparency = 0.0;
+  e->reflectance = 0.0;
+  e->mass = 0.0;
+  e->density = 1.0;
+  e->color_rgba = 0;
+  e->prop_flags = PF_CAST_SHADOW() | PF_CAN_COLLIDE();
+  var new_id: int32 = sc->next_id;
+  e->id = new_id;
+  scene_default_name(e);
+  e->mesh_path[0] = 0;
+  e->lua_script[0] = 0;
+  sc->next_id = new_id + 1;
+  sc->count = sc->count + 1;
+  return new_id;
+}
+
+export function scene_add_terrain(sc: Scene*, x: float64, y: float64, z: float64, half_x: float64, half_z: float64, amp: float64) -> int32 {
+  if (half_x <= 0.0) { half_x = 16.0; }
+  if (half_z <= 0.0) { half_z = 16.0; }
+  if (amp <= 0.0) { amp = 0.22; }
+  var h: float64 = half_x;
+  if (half_z > h) { h = half_z; }
+  var id: int32 = scene_add(sc, SK_TERRAIN(), x, y, z, h);
+  var e: Entity* = scene_find(sc, id);
+  if (e != 0) {
+    e->size_x = half_x;
+    e->size_y = amp;
+    e->size_z = half_z;
+    e->flags = SE_FLAG_COLLIDER();
+    scene_default_name(e);
+  }
+  return id;
+}
+
+export function scene_entity_name(e: Entity*) -> cstring {
+  if (e == 0) {
+    return (cstring)0;
+  }
+  return (cstring)((int64)(&(e->name[0])));
+}
+
+export function scene_entity_mesh_path(e: Entity*) -> cstring {
+  if (e == 0) {
+    return (cstring)0;
+  }
+  return (cstring)((int64)(&(e->mesh_path[0])));
+}
+
+export function scene_entity_lua_script(e: Entity*) -> cstring {
+  if (e == 0) {
+    return (cstring)0;
+  }
+  return (cstring)((int64)(&(e->lua_script[0])));
+}
+
+export function scene_entity_set_lua_script(e: Entity*, path: cstring) {
+  if (e == 0) {
+    return;
+  }
+  scene_copy_cstr((cstring)((int64)(&(e->lua_script[0]))), 260, path);
+  if (e->lua_script[0] == (uint8)0) {
+    e->script_enabled = 0;
+  } else {
+    e->script_enabled = 1;
+  }
+}
+
+export function scene_entity_clear_lua_script(e: Entity*) {
+  if (e == 0) {
+    return;
+  }
+  e->lua_script[0] = 0;
+  e->script_enabled = 0;
+}
+
+export function scene_set_name(sc: Scene*, id: int32, name: cstring) -> int32 {
+  var e: Entity* = scene_find(sc, id);
+  if (e == 0) {
+    return 0;
+  }
+  scene_copy_cstr((cstring)((int64)(&(e->name[0]))), 64, name);
+  if (e->name[0] == (uint8)0) {
+    scene_default_name(e);
+  }
+  return 1;
+}
+
+export function scene_set_mesh_ref(sc: Scene*, id: int32, mesh_id: int32, mesh_path: cstring, half: float64) -> int32 {
+  var e: Entity* = scene_find(sc, id);
+  if (e == 0) {
+    return 0;
+  }
+  e->kind = SK_MESH();
+  e->mesh_id = mesh_id;
+  if (half > 0.0) {
+    e->half = half;
+    e->size_x = half;
+    e->size_y = half;
+    e->size_z = half;
+  }
+  scene_copy_cstr((cstring)((int64)(&(e->mesh_path[0]))), 520, mesh_path);
+  return 1;
+}
+
+function scene_is_descendant(sc: Scene*, maybe_child: int32, maybe_parent: int32) -> int32 {
+  var cur: int32 = maybe_child;
+  var guard: int32 = 0;
+  while (cur != 0 && guard < 256) {
+    if (cur == maybe_parent) {
+      return 1;
+    }
+    var e: Entity* = scene_find(sc, cur);
+    if (e == 0) {
+      return 0;
+    }
+    cur = e->parent_id;
+    guard = guard + 1;
+  }
+  return 0;
+}
+
+export function scene_set_parent(sc: Scene*, child_id: int32, parent_id: int32) -> int32 {
+  if (sc == 0 || child_id == 0) {
+    return 0;
+  }
+  var child: Entity* = scene_find(sc, child_id);
+  if (child == 0) {
+    return 0;
+  }
+  if (parent_id == child_id) {
+    return 0;
+  }
+  if (parent_id != 0) {
+    var parent: Entity* = scene_find(sc, parent_id);
+    if (parent == 0) {
+      return 0;
+    }
+    if (scene_is_descendant(sc, parent_id, child_id) != 0) {
+      return 0;
+    }
+  }
+  child->parent_id = parent_id;
+  return 1;
+}
+
+// Remove the entity with id (swap-with-last; order is not preserved). Clears
+// selection/hover if they referred to it. Returns 1 if something was removed.
+export function scene_remove(sc: Scene*, id: int32) -> int32 {
+  if (sc == 0 || id == 0) {
+    return 0;
+  }
+  var idx: int32 = scene_index_of(sc, id);
+  if (idx < 0) {
+    return 0;
+  }
+  var last: int32 = sc->count - 1;
+  if (idx != last) {
+    var dst: Entity* = scene_row(sc, idx);
+    var src: Entity* = scene_row(sc, last);
+    if (dst != 0 && src != 0) {
+      memcpy((cstring)dst, (cstring)src, scene_row_bytes());
+    }
+  }
+  sc->count = sc->count - 1;
+  if (sc->terrain != 0) {
+    terrain_store_remove(sc->terrain, id);
+  }
+  if (sc->selected_id == id) {
+    sc->selected_id = 0;
+  }
+  if (sc->hover_id == id) {
+    sc->hover_id = 0;
+  }
+  var ci: int32 = 0;
+  while (ci < sc->count) {
+    var ce: Entity* = scene_row(sc, ci);
+    if (ce != 0 && ce->parent_id == id) {
+      ce->parent_id = 0;
+    }
+    ci = ci + 1;
+  }
+  return 1;
+}
+
+// ---- Selection / hover ------------------------------------------------------
+export function scene_selected_id(sc: Scene*) -> int32 {
+  if (sc == 0) {
+    return 0;
+  }
+  return sc->selected_id;
+}
+
+export function scene_set_selected(sc: Scene*, id: int32) {
+  if (sc == 0) {
+    return;
+  }
+  if (id != 0 && scene_find(sc, id) == 0) {
+    id = 0;
+  }
+  sc->selected_id = id;
+}
+
+export function scene_selected_row(sc: Scene*) -> Entity* {
+  if (sc == 0) {
+    return 0;
+  }
+  return scene_find(sc, sc->selected_id);
+}
+
+export function scene_hover_id(sc: Scene*) -> int32 {
+  if (sc == 0) {
+    return 0;
+  }
+  return sc->hover_id;
+}
+
+export function scene_set_hover(sc: Scene*, id: int32) {
+  if (sc == 0) {
+    return;
+  }
+  sc->hover_id = id;
+}
+
+function scene_terrain_join_child_trim(rel: cstring) -> cstring {
+  if (rel == 0) {
+    return rel;
+  }
+  if ((uint8)(rel[0]) == (uint8)46 && (uint8)(rel[1]) == (uint8)92) {
+    return (cstring)((int64)rel + (int64)2);
+  }
+  if ((uint8)(rel[0]) == (uint8)46 && (uint8)(rel[1]) == (uint8)47) {
+    return (cstring)((int64)rel + (int64)2);
+  }
+  return rel;
+}
+
+export function scene_terrain_reload_all(sc: Scene*, project_root: cstring) {
+  if (sc == 0 || sc->terrain == 0) {
+    return;
+  }
+  terrain_store_clear(sc->terrain);
+  if (project_root == 0 || (uint8)(project_root[0]) == (uint8)0) {
+    return;
+  }
+  var i: int32 = 0;
+  while (i < sc->count) {
+    var e: Entity* = scene_row(sc, i);
+    if (e != 0 && e->kind == SK_TERRAIN() && (uint8)(e->mesh_path[0]) != (uint8)0) {
+      var child: cstring = scene_terrain_join_child_trim((cstring)((int64)(&(e->mesh_path[0]))));
+      var full: uint8[1024];
+      if (fs_path_join_child((cstring)((int64)(&(full[0]))), 1024, project_root, child) == 0) {
+        terrain_store_load_file(sc->terrain, e->id, (cstring)((int64)(&(full[0]))));
+      }
+    }
+    i = i + 1;
+  }
+}
+
+export function scene_terrain_save_dirty_maps(sc: Scene*, project_root: cstring) {
+  if (sc == 0 || sc->terrain == 0) {
+    return;
+  }
+  if (project_root == 0 || (uint8)(project_root[0]) == (uint8)0) {
+    return;
+  }
+  var i: int32 = 0;
+  while (i < sc->count) {
+    var e: Entity* = scene_row(sc, i);
+    if (e != 0 && e->kind == SK_TERRAIN() && (uint8)(e->mesh_path[0]) != (uint8)0) {
+      if (terrain_store_is_dirty(sc->terrain, e->id) != 0) {
+        var child: cstring = scene_terrain_join_child_trim((cstring)((int64)(&(e->mesh_path[0]))));
+        var full: uint8[1024];
+        if (fs_path_join_child((cstring)((int64)(&(full[0]))), 1024, project_root, child) == 0) {
+          terrain_store_save_file(sc->terrain, e->id, (cstring)((int64)(&(full[0]))));
+        }
+      }
+    }
+    i = i + 1;
+  }
+}
+
+export function scene_terrain_bind_heightmap_from_procedural(sc: Scene*, id: int32, nx: int32, nz: int32, rel_path: cstring) -> int32 {
+  var e: Entity* = scene_find(sc, id);
+  if (e == 0 || e->kind != SK_TERRAIN() || sc->terrain == 0 || rel_path == 0) {
+    return 0;
+  }
+  scene_copy_cstr((cstring)((int64)(&(e->mesh_path[0]))), 520, rel_path);
+  if (terrain_store_create_grid(sc->terrain, id, nx, nz) == 0) {
+    return 0;
+  }
+  var hx: float64 = scene_entity_half_x(e);
+  var hz: float64 = scene_entity_half_z(e);
+  var pnx: int32 = terrain_store_patch_nx(sc->terrain, id);
+  var pnz: int32 = terrain_store_patch_nz(sc->terrain, id);
+  if (pnx < 2 || pnz < 2) {
+    return 0;
+  }
+  var dnx: float64 = (float64)pnx - 1.0;
+  var dnz: float64 = (float64)pnz - 1.0;
+  var iz: int32 = 0;
+  while (iz < pnz) {
+    var ix: int32 = 0;
+    while (ix < pnx) {
+      var lx: float64 = 0.0 - hx + (2.0 * hx) * (float64)ix / dnx;
+      var lz: float64 = 0.0 - hz + (2.0 * hz) * (float64)iz / dnz;
+      var h: float64 = scene_terrain_height_procedural_local(e, lx, lz);
+      terrain_store_set_cell(sc->terrain, id, ix, iz, h);
+      ix = ix + 1;
+    }
+    iz = iz + 1;
+  }
+  return 1;
+}
+
+export function scene_terrain_world_to_local_xz_simple(sc: Scene*, e: Entity*, wx: float64, wz: float64, out_lx: float64*, out_lz: float64*) {
+  if (e == 0 || out_lx == 0 || out_lz == 0) {
+    return;
+  }
+  var s: float64 = scene_entity_world_scale(sc, e);
+  if (s < 0.000001) {
+    s = 0.000001;
+  }
+  var px: float64 = scene_entity_world_pos(sc, e, 0);
+  var pz: float64 = scene_entity_world_pos(sc, e, 2);
+  *out_lx = (wx - px) / s;
+  *out_lz = (wz - pz) / s;
+}
+
+// Seed a fresh scene with a reference layout (one editable cube near origin
+// plus the spatial-landmark boxes the viewport used to draw statically).
+export function scene_seed_default(sc: Scene*) {
+  if (sc == 0) {
+    return;
+  }
+  scene_clear(sc);
+  var first: int32 = scene_add(sc, SK_CUBE(), 0.0, 1.0, 0.0, 1.0);
+  var terrain: int32 = scene_add_terrain(sc, 0.0, 0.0, 0.0, 22.0, 22.0, 1.8);
+  scene_set_name(sc, terrain, cstr("Terrain"));
+  scene_add(sc, SK_BOX(), 6.0, 1.0, 4.0, 1.0);
+  scene_add(sc, SK_BOX(), -7.0, 1.5, -3.0, 1.5);
+  scene_add(sc, SK_BOX(), -4.0, 0.6, 9.0, 0.6);
+  scene_add(sc, SK_BOX(), 10.0, 2.0, -8.0, 2.0);
+  sc->selected_id = first;
+  sc->hover_id = 0;
+}
+
+// ===========================================================================
+// Property descriptor table — the single source of truth for "what editable
+// properties an entity has". The inspector, the scene file, and the Lua
+// binding all go through scene_prop_* instead of hardcoding field numbers.
+//
+// Each property has a stable id (1..N), a type, a UI group, and (for numeric
+// types) a clamp range + display scale/decimals. Adding a property is now one
+// row here plus its accessor case — no parallel switch in three files.
+//
+// Property ids are intentionally NOT contiguous with the old 1..21 inspector
+// field numbers (those mixed in viewport terrain-brush state). Terrain brush
+// controls stay editor-side; this table is purely the entity model.
+// ===========================================================================
+
+export function PT_STRING() -> int32 { return 1; }
+export function PT_FLOAT() -> int32 { return 2; }
+export function PT_INT() -> int32 { return 3; }
+export function PT_BOOL() -> int32 { return 4; }
+export function PT_COLOR8() -> int32 { return 5; }  // 0..255 int color channel
+
+// UI groups (inspector draws a header per group, in this order).
+export function PG_GENERAL() -> int32 { return 0; }
+export function PG_TRANSFORM() -> int32 { return 1; }
+export function PG_APPEARANCE() -> int32 { return 2; }
+export function PG_PHYSICS() -> int32 { return 3; }
+export function PG_BEHAVIOR() -> int32 { return 4; }
+
+// Stable property ids.
+export function PROP_NAME() -> int32 { return 1; }
+export function PROP_POS_X() -> int32 { return 2; }
+export function PROP_POS_Y() -> int32 { return 3; }
+export function PROP_POS_Z() -> int32 { return 4; }
+export function PROP_ROT_X() -> int32 { return 5; }
+export function PROP_ROT_Y() -> int32 { return 6; }
+export function PROP_ROT_Z() -> int32 { return 7; }
+export function PROP_ROT_W() -> int32 { return 8; }
+export function PROP_SCALE() -> int32 { return 9; }
+export function PROP_SIZE_X() -> int32 { return 10; }
+export function PROP_SIZE_Y() -> int32 { return 11; }
+export function PROP_SIZE_Z() -> int32 { return 12; }
+export function PROP_COLOR_R() -> int32 { return 13; }
+export function PROP_COLOR_G() -> int32 { return 14; }
+export function PROP_COLOR_B() -> int32 { return 15; }
+export function PROP_TRANSPARENCY() -> int32 { return 16; }
+export function PROP_REFLECTANCE() -> int32 { return 17; }
+export function PROP_MATERIAL() -> int32 { return 18; }
+export function PROP_ANCHORED() -> int32 { return 19; }
+export function PROP_CAN_COLLIDE() -> int32 { return 20; }
+export function PROP_LOCKED() -> int32 { return 21; }
+export function PROP_CAST_SHADOW() -> int32 { return 22; }
+export function PROP_MASS() -> int32 { return 23; }
+export function PROP_DENSITY() -> int32 { return 24; }
+export function PROP_KIND() -> int32 { return 25; }
+export function PROP_PARENT() -> int32 { return 26; }
+export function PROP_TRIGGER() -> int32 { return 27; }
+
+export function scene_prop_count() -> int32 { return 27; }
+
+// Property metadata. Implemented as switches (Mettle has no const tables);
+// callers treat them as a data table. Order of ids = inspector order.
+export function scene_prop_type(id: int32) -> int32 {
+  if (id == PROP_NAME()) { return PT_STRING(); }
+  if (id == PROP_KIND() || id == PROP_PARENT() || id == PROP_MATERIAL()) { return PT_INT(); }
+  if (id == PROP_COLOR_R() || id == PROP_COLOR_G() || id == PROP_COLOR_B()) { return PT_COLOR8(); }
+  if (id == PROP_ANCHORED() || id == PROP_CAN_COLLIDE() || id == PROP_LOCKED() || id == PROP_CAST_SHADOW() || id == PROP_TRIGGER()) { return PT_BOOL(); }
+  return PT_FLOAT();
+}
+
+export function scene_prop_group(id: int32) -> int32 {
+  if (id == PROP_NAME() || id == PROP_KIND() || id == PROP_PARENT()) { return PG_GENERAL(); }
+  if (id >= PROP_POS_X() && id <= PROP_SIZE_Z()) { return PG_TRANSFORM(); }
+  if (id == PROP_COLOR_R() || id == PROP_COLOR_G() || id == PROP_COLOR_B() || id == PROP_TRANSPARENCY() || id == PROP_REFLECTANCE() || id == PROP_MATERIAL() || id == PROP_CAST_SHADOW()) { return PG_APPEARANCE(); }
+  if (id == PROP_ANCHORED() || id == PROP_CAN_COLLIDE() || id == PROP_MASS() || id == PROP_DENSITY() || id == PROP_TRIGGER()) { return PG_PHYSICS(); }
+  return PG_BEHAVIOR();
+}
+
+export function scene_prop_group_label(group: int32) -> cstring {
+  if (group == PG_GENERAL())    { var a: string = "General";    return a.chars; }
+  if (group == PG_TRANSFORM())  { var b: string = "Transform";  return b.chars; }
+  if (group == PG_APPEARANCE()) { var c: string = "Appearance"; return c.chars; }
+  if (group == PG_PHYSICS())    { var d: string = "Physics";    return d.chars; }
+  var e: string = "Behavior";
+  return e.chars;
+}
+
+export function scene_prop_label(id: int32) -> cstring {
+  if (id == PROP_NAME())         { var a: string = "Name";         return a.chars; }
+  if (id == PROP_POS_X())        { var b: string = "Pos X";        return b.chars; }
+  if (id == PROP_POS_Y())        { var c: string = "Pos Y";        return c.chars; }
+  if (id == PROP_POS_Z())        { var d: string = "Pos Z";        return d.chars; }
+  if (id == PROP_ROT_X())        { var e: string = "Quat X";       return e.chars; }
+  if (id == PROP_ROT_Y())        { var f: string = "Quat Y";       return f.chars; }
+  if (id == PROP_ROT_Z())        { var g: string = "Quat Z";       return g.chars; }
+  if (id == PROP_ROT_W())        { var h: string = "Quat W";       return h.chars; }
+  if (id == PROP_SCALE())        { var i: string = "Scale";        return i.chars; }
+  if (id == PROP_SIZE_X())       { var j: string = "Size X";       return j.chars; }
+  if (id == PROP_SIZE_Y())       { var k: string = "Size Y";       return k.chars; }
+  if (id == PROP_SIZE_Z())       { var l: string = "Size Z";       return l.chars; }
+  if (id == PROP_COLOR_R())      { var m: string = "Color R";      return m.chars; }
+  if (id == PROP_COLOR_G())      { var n: string = "Color G";      return n.chars; }
+  if (id == PROP_COLOR_B())      { var o: string = "Color B";      return o.chars; }
+  if (id == PROP_TRANSPARENCY()) { var p: string = "Transparency"; return p.chars; }
+  if (id == PROP_REFLECTANCE())  { var q: string = "Reflectance";  return q.chars; }
+  if (id == PROP_MATERIAL())     { var r: string = "Material";     return r.chars; }
+  if (id == PROP_ANCHORED())     { var s: string = "Anchored";     return s.chars; }
+  if (id == PROP_CAN_COLLIDE())  { var t: string = "CanCollide";   return t.chars; }
+  if (id == PROP_LOCKED())       { var u: string = "Locked";       return u.chars; }
+  if (id == PROP_CAST_SHADOW())  { var v: string = "CastShadow";   return v.chars; }
+  if (id == PROP_MASS())         { var w: string = "Mass";         return w.chars; }
+  if (id == PROP_DENSITY())      { var x: string = "Density";      return x.chars; }
+  if (id == PROP_KIND())         { var y: string = "Kind";         return y.chars; }
+  if (id == PROP_PARENT())       { var z: string = "Parent";       return z.chars; }
+  if (id == PROP_TRIGGER())      { var aa: string = "Trigger";     return aa.chars; }
+  var un: string = "?";
+  return un.chars;
+}
+
+// Short stable token used as the scene-file key (no spaces, lower snake).
+export function scene_prop_key(id: int32) -> cstring {
+  if (id == PROP_NAME())         { var a: string = "name";         return a.chars; }
+  if (id == PROP_POS_X())        { var b: string = "px";           return b.chars; }
+  if (id == PROP_POS_Y())        { var c: string = "py";           return c.chars; }
+  if (id == PROP_POS_Z())        { var d: string = "pz";           return d.chars; }
+  if (id == PROP_ROT_X())        { var e: string = "qx";           return e.chars; }
+  if (id == PROP_ROT_Y())        { var f: string = "qy";           return f.chars; }
+  if (id == PROP_ROT_Z())        { var g: string = "qz";           return g.chars; }
+  if (id == PROP_ROT_W())        { var h: string = "qw";           return h.chars; }
+  if (id == PROP_SCALE())        { var i: string = "scale";        return i.chars; }
+  if (id == PROP_SIZE_X())       { var j: string = "sx";           return j.chars; }
+  if (id == PROP_SIZE_Y())       { var k: string = "sy";           return k.chars; }
+  if (id == PROP_SIZE_Z())       { var l: string = "sz";           return l.chars; }
+  if (id == PROP_COLOR_R())      { var m: string = "cr";           return m.chars; }
+  if (id == PROP_COLOR_G())      { var n: string = "cg";           return n.chars; }
+  if (id == PROP_COLOR_B())      { var o: string = "cb";           return o.chars; }
+  if (id == PROP_TRANSPARENCY()) { var p: string = "transp";       return p.chars; }
+  if (id == PROP_REFLECTANCE())  { var q: string = "reflect";      return q.chars; }
+  if (id == PROP_MATERIAL())     { var r: string = "mat";          return r.chars; }
+  if (id == PROP_ANCHORED())     { var s: string = "anchored";     return s.chars; }
+  if (id == PROP_CAN_COLLIDE())  { var t: string = "cancollide";   return t.chars; }
+  if (id == PROP_LOCKED())       { var u: string = "locked";       return u.chars; }
+  if (id == PROP_CAST_SHADOW())  { var v: string = "castshadow";   return v.chars; }
+  if (id == PROP_MASS())         { var w: string = "mass";         return w.chars; }
+  if (id == PROP_DENSITY())      { var x: string = "density";      return x.chars; }
+  if (id == PROP_KIND())         { var y: string = "kind";         return y.chars; }
+  if (id == PROP_PARENT())       { var z: string = "parent";       return z.chars; }
+  if (id == PROP_TRIGGER())      { var aa: string = "trigger";     return aa.chars; }
+  var un: string = "?";
+  return un.chars;
+}
+
+// Display scale/decimals for PT_FLOAT (used by inspector formatting + IO).
+export function scene_prop_scale(id: int32) -> int64 {
+  if (id == PROP_ROT_X() || id == PROP_ROT_Y() || id == PROP_ROT_Z() || id == PROP_ROT_W()) {
+    return (int64)1000000;
+  }
+  if (id == PROP_TRANSPARENCY() || id == PROP_REFLECTANCE()) {
+    return (int64)10000;
+  }
+  return (int64)1000;
+}
+
+export function scene_prop_decimals(id: int32) -> int32 {
+  if (id == PROP_ROT_X() || id == PROP_ROT_Y() || id == PROP_ROT_Z() || id == PROP_ROT_W()) {
+    return 6;
+  }
+  if (id == PROP_TRANSPARENCY() || id == PROP_REFLECTANCE()) {
+    return 4;
+  }
+  return 3;
+}
+
+// Clamp a numeric value to the property's valid range. Identity for ids that
+// have no constraint.
+export function scene_prop_clamp_num(id: int32, v: float64) -> float64 {
+  if (id == PROP_SCALE()) {
+    if (v < 0.05) { return 0.05; }
+    if (v > 40.0) { return 40.0; }
+    return v;
+  }
+  if (id == PROP_TRANSPARENCY() || id == PROP_REFLECTANCE()) {
+    if (v < 0.0) { return 0.0; }
+    if (v > 1.0) { return 1.0; }
+    return v;
+  }
+  if (id == PROP_COLOR_R() || id == PROP_COLOR_G() || id == PROP_COLOR_B()) {
+    if (v < 0.0) { return 0.0; }
+    if (v > 255.0) { return 255.0; }
+    return v;
+  }
+  if (id == PROP_MASS() || id == PROP_DENSITY()) {
+    if (v < 0.0) { return 0.0; }
+    return v;
+  }
+  return v;
+}
+
+// Whether this property applies to a given entity kind. Lets the inspector
+// hide e.g. Size on a terrain (which uses size_* as amplitude) cleanly.
+export function scene_prop_applies(id: int32, kind: int32) -> int32 {
+  if (kind == SK_TERRAIN()) {
+    if (id == PROP_COLOR_R() || id == PROP_COLOR_G() || id == PROP_COLOR_B() || id == PROP_TRANSPARENCY() || id == PROP_REFLECTANCE() || id == PROP_MASS() || id == PROP_DENSITY()) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+// ---- Generic numeric get/set ----------------------------------------------
+// Numeric view of every non-string property. PT_BOOL reads 0/1; PT_COLOR8
+// reads 0..255; PT_INT reads the int as a float64. set clamps via
+// scene_prop_clamp_num and keeps derived state (rotation normalize) correct.
+
+export function scene_prop_get_num(sc: Scene*, e: Entity*, id: int32) -> float64 {
+  if (e == 0) { return 0.0; }
+  if (id == PROP_POS_X()) { return e->pos_x; }
+  if (id == PROP_POS_Y()) { return e->pos_y; }
+  if (id == PROP_POS_Z()) { return e->pos_z; }
+  if (id == PROP_ROT_X()) { return e->rot_x; }
+  if (id == PROP_ROT_Y()) { return e->rot_y; }
+  if (id == PROP_ROT_Z()) { return e->rot_z; }
+  if (id == PROP_ROT_W()) { return e->rot_w; }
+  if (id == PROP_SCALE()) { return e->scale; }
+  if (id == PROP_SIZE_X()) { return e->size_x; }
+  if (id == PROP_SIZE_Y()) { return e->size_y; }
+  if (id == PROP_SIZE_Z()) { return e->size_z; }
+  if (id == PROP_COLOR_R()) { return (float64)scene_color_r(e->color_rgba); }
+  if (id == PROP_COLOR_G()) { return (float64)scene_color_g(e->color_rgba); }
+  if (id == PROP_COLOR_B()) { return (float64)scene_color_b(e->color_rgba); }
+  if (id == PROP_TRANSPARENCY()) { return e->transparency; }
+  if (id == PROP_REFLECTANCE()) { return e->reflectance; }
+  if (id == PROP_MATERIAL()) { return (float64)e->material_id; }
+  if (id == PROP_ANCHORED()) { return (float64)scene_entity_prop_flag(e, PF_ANCHORED()); }
+  if (id == PROP_CAN_COLLIDE()) { return (float64)scene_entity_prop_flag(e, PF_CAN_COLLIDE()); }
+  if (id == PROP_LOCKED()) { return (float64)scene_entity_prop_flag(e, PF_LOCKED()); }
+  if (id == PROP_CAST_SHADOW()) { return (float64)scene_entity_prop_flag(e, PF_CAST_SHADOW()); }
+  if (id == PROP_MASS()) { return e->mass; }
+  if (id == PROP_DENSITY()) { return e->density; }
+  if (id == PROP_KIND()) { return (float64)e->kind; }
+  if (id == PROP_PARENT()) { return (float64)e->parent_id; }
+  if (id == PROP_TRIGGER()) {
+    if ((e->flags & SE_FLAG_TRIGGER()) != 0) { return 1.0; }
+    return 0.0;
+  }
+  return 0.0;
+}
+
+function scene_prop_set_color_comp(e: Entity*, comp: int32, v: int32) {
+  var r: int32 = scene_color_r(e->color_rgba);
+  var g: int32 = scene_color_g(e->color_rgba);
+  var b: int32 = scene_color_b(e->color_rgba);
+  if (comp == 0) { r = v; }
+  if (comp == 1) { g = v; }
+  if (comp == 2) { b = v; }
+  var packed: int32 = scene_color_pack(r, g, b);
+  // 0 means "no explicit color" (renderer falls back to palette). Pure black
+  // would collide with that sentinel, so nudge it to (1,1,1).
+  if (packed == 0) {
+    packed = scene_color_pack(1, 1, 1);
+  }
+  e->color_rgba = packed;
+}
+
+export function scene_prop_set_num(sc: Scene*, e: Entity*, id: int32, raw: float64) -> int32 {
+  if (e == 0) { return 0; }
+  var v: float64 = scene_prop_clamp_num(id, raw);
+  if (id == PROP_POS_X()) { e->pos_x = v; return 1; }
+  if (id == PROP_POS_Y()) { e->pos_y = v; return 1; }
+  if (id == PROP_POS_Z()) { e->pos_z = v; return 1; }
+  if (id == PROP_ROT_X()) { e->rot_x = v; scene_entity_normalize_rotation(e); return 1; }
+  if (id == PROP_ROT_Y()) { e->rot_y = v; scene_entity_normalize_rotation(e); return 1; }
+  if (id == PROP_ROT_Z()) { e->rot_z = v; scene_entity_normalize_rotation(e); return 1; }
+  if (id == PROP_ROT_W()) { e->rot_w = v; scene_entity_normalize_rotation(e); return 1; }
+  if (id == PROP_SCALE()) { e->scale = v; return 1; }
+  if (id == PROP_SIZE_X()) { scene_entity_set_size(e, v, e->size_y, e->size_z); return 1; }
+  if (id == PROP_SIZE_Y()) { scene_entity_set_size(e, e->size_x, v, e->size_z); return 1; }
+  if (id == PROP_SIZE_Z()) { scene_entity_set_size(e, e->size_x, e->size_y, v); return 1; }
+  if (id == PROP_COLOR_R()) { scene_prop_set_color_comp(e, 0, (int32)(v + 0.5)); return 1; }
+  if (id == PROP_COLOR_G()) { scene_prop_set_color_comp(e, 1, (int32)(v + 0.5)); return 1; }
+  if (id == PROP_COLOR_B()) { scene_prop_set_color_comp(e, 2, (int32)(v + 0.5)); return 1; }
+  if (id == PROP_TRANSPARENCY()) { e->transparency = v; return 1; }
+  if (id == PROP_REFLECTANCE()) { e->reflectance = v; return 1; }
+  if (id == PROP_MATERIAL()) { e->material_id = (int32)(v + 0.5); return 1; }
+  if (id == PROP_ANCHORED()) { scene_entity_set_prop_flag(e, PF_ANCHORED(), (int32)(v + 0.5)); return 1; }
+  if (id == PROP_CAN_COLLIDE()) { scene_entity_set_prop_flag(e, PF_CAN_COLLIDE(), (int32)(v + 0.5)); return 1; }
+  if (id == PROP_LOCKED()) { scene_entity_set_prop_flag(e, PF_LOCKED(), (int32)(v + 0.5)); return 1; }
+  if (id == PROP_CAST_SHADOW()) { scene_entity_set_prop_flag(e, PF_CAST_SHADOW(), (int32)(v + 0.5)); return 1; }
+  if (id == PROP_MASS()) { e->mass = v; return 1; }
+  if (id == PROP_DENSITY()) { e->density = v; return 1; }
+  if (id == PROP_KIND()) { e->kind = (int32)(v + 0.5); return 1; }
+  if (id == PROP_PARENT()) {
+    if (sc != 0) { scene_set_parent(sc, e->id, (int32)(v + 0.5)); }
+    return 1;
+  }
+  if (id == PROP_TRIGGER()) {
+    if ((int32)(v + 0.5) != 0) {
+      e->flags = e->flags | SE_FLAG_TRIGGER();
+    } else {
+      e->flags = e->flags & (0 - 1 - SE_FLAG_TRIGGER());
+    }
+    return 1;
+  }
+  return 0;
+}
+
+// Effective mass: explicit mass if set, otherwise volume * density. Volume is
+// the world AABB extents (good enough for gameplay tuning, not a physics SDK).
+export function scene_entity_effective_mass(sc: Scene*, e: Entity*) -> float64 {
+  if (e == 0) { return 0.0; }
+  if (e->mass > 0.0) { return e->mass; }
+  var ws: float64 = scene_entity_world_scale(sc, e);
+  var vx: float64 = scene_entity_half_x(e) * 2.0 * ws;
+  var vy: float64 = scene_entity_half_y(e) * 2.0 * ws;
+  var vz: float64 = scene_entity_half_z(e) * 2.0 * ws;
+  var d: float64 = e->density;
+  if (d <= 0.0) { d = 1.0; }
+  return vx * vy * vz * d;
+}

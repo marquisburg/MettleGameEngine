@@ -11,7 +11,7 @@
 //
 // Allocation follows engine conventions: calloc header struct + malloc row
 // blob. All 8-byte fields first in structs. Constants returned via functions
-// because Methlang lacks top-level constant expressions.
+// because Mettle lacks top-level constant expressions.
 import "std/mem";
 
 export function SVC_WORKSPACE() -> int32 { return 1; }

@@ -1,6 +1,6 @@
 // Scene save/load for the editor. Text format, versioned, line-oriented, and
 // intentionally easy to inspect:
-//   methscene 1
+//   mettlescene 1
 //   selected <id>
 //   entity
 //   id <id>
@@ -10,9 +10,14 @@
 //   rot_urad <yaw> <pitch> <roll> (legacy read-only import)
 //   scale_u <scale>
 //   half_u <half>
+//   size_u <half_x> <half_y> <half_z> (v4+)
+//   flags <bitfield>                  (v4+, hidden/collider/trigger)
+//   material <id>                     (v4+)
 //   parent <id>
 //   script <id> <enabled>
 //   mesh_path <absolute-or-project path>
+//     For kind terrain (SK_TERRAIN), non-empty mesh_path is a project-relative
+//     .mthmap heightmap (see scene_terrain_reload_all); empty means procedural.
 //   lua_script <project-relative-or-absolute .lua path>   (v3+)
 //   name <display name>
 //   end
@@ -120,36 +125,42 @@ function sio_parse_i64_after(line: cstring, prefix_len: int32) -> int64 {
   return atol((cstring)((int64)line + (int64)prefix_len));
 }
 
-function sio_write_entity(fp: cstring, e: Entity*) {
+// mettlescene 5 (clean break): the entity body is descriptor-driven. Structural
+// lines (id/script/flags/half/mesh_path/lua_script) are written explicitly;
+// every editable property is one `p <key> <value>` line emitted straight from
+// the engine_scene property table, so adding a property never touches this
+// file again. Floats are stored as per-property scaled ints (integer-clean for
+// the object backend, same trick the old format used).
+function sio_write_prop_value(fp: cstring, sc: Scene*, e: Entity*, id: int32) {
+  var t: int32 = scene_prop_type(id);
+  if (t == PT_STRING()) {
+    // name is the only string property; written verbatim (tail-read on load).
+    fputs(scene_entity_name(e), fp);
+    return;
+  }
+  if (t == PT_FLOAT()) {
+    var sc_i: int64 = scene_prop_scale(id);
+    sio_write_i64(fp, sio_scaled(scene_prop_get_num(sc, e, id), (float64)sc_i));
+    return;
+  }
+  // PT_INT / PT_BOOL / PT_COLOR8 all serialize as a plain integer.
+  sio_write_i64(fp, (int64)((int32)(scene_prop_get_num(sc, e, id) + 0.5)));
+}
+
+function sio_write_entity(fp: cstring, sc: Scene*, e: Entity*) {
   if (fp == 0 || e == 0) {
     return;
   }
   fputs(cstr("entity\n"), fp);
   sio_write_line_i64(fp, "id ", (int64)e->id);
-  sio_write_line_i64(fp, "kind ", (int64)e->kind);
-  sio_write_line_i64(fp, "parent ", (int64)e->parent_id);
   fputs(cstr("script "), fp);
   sio_write_i64(fp, (int64)e->script_id);
   fputs(cstr(" "), fp);
   sio_write_i64(fp, (int64)e->script_enabled);
   fputs(cstr("\n"), fp);
-  fputs(cstr("pos_mm "), fp);
-  sio_write_i64(fp, sio_scaled(e->pos_x, 1000.0));
-  fputs(cstr(" "), fp);
-  sio_write_i64(fp, sio_scaled(e->pos_y, 1000.0));
-  fputs(cstr(" "), fp);
-  sio_write_i64(fp, sio_scaled(e->pos_z, 1000.0));
-  fputs(cstr("\n"), fp);
-  fputs(cstr("rot_q "), fp);
-  sio_write_i64(fp, sio_scaled(e->rot_x, 1000000.0));
-  fputs(cstr(" "), fp);
-  sio_write_i64(fp, sio_scaled(e->rot_y, 1000000.0));
-  fputs(cstr(" "), fp);
-  sio_write_i64(fp, sio_scaled(e->rot_z, 1000000.0));
-  fputs(cstr(" "), fp);
-  sio_write_i64(fp, sio_scaled(e->rot_w, 1000000.0));
-  fputs(cstr("\n"), fp);
-  sio_write_line_i64(fp, "scale_u ", sio_scaled(e->scale, 1000000.0));
+  // SE_FLAG_* (collider/trigger/hidden) is orthogonal to the prop table's
+  // PF_* booleans; persist it raw so the renderer/collision bits round-trip.
+  sio_write_line_i64(fp, "flags ", (int64)e->flags);
   sio_write_line_i64(fp, "half_u ", sio_scaled(e->half, 1000000.0));
   fputs(cstr("mesh_path "), fp);
   fputs(scene_entity_mesh_path(e), fp);
@@ -159,32 +170,100 @@ function sio_write_entity(fp: cstring, e: Entity*) {
     fputs(scene_entity_lua_script(e), fp);
     fputs(cstr("\n"), fp);
   }
-  fputs(cstr("name "), fp);
-  fputs(scene_entity_name(e), fp);
-  fputs(cstr("\nend\n"), fp);
+  var id: int32 = 1;
+  var pn: int32 = scene_prop_count();
+  while (id <= pn) {
+    fputs(cstr("p "), fp);
+    fputs(scene_prop_key(id), fp);
+    fputs(cstr(" "), fp);
+    sio_write_prop_value(fp, sc, e, id);
+    fputs(cstr("\n"), fp);
+    id = id + 1;
+  }
+  fputs(cstr("end\n"), fp);
 }
 
-export function scene_io_save(path: cstring, sc: Scene*) -> int32 {
+export function scene_io_save(path: cstring, sc: Scene*, project_root: cstring) -> int32 {
   if (path == 0 || sc == 0) {
     return 0;
+  }
+  if (project_root != 0 && (uint8)(project_root[0]) != (uint8)0) {
+    scene_terrain_save_dirty_maps(sc, project_root);
   }
   var fp: cstring = fopen(path, cstr("w"));
   if (fp == 0) {
     return 0;
   }
-  fputs(cstr("methscene 3\n"), fp);
+  fputs(cstr("mettlescene 5\n"), fp);
   sio_write_line_i64(fp, "selected ", (int64)scene_selected_id(sc));
   var n: int32 = scene_count(sc);
   var i: int32 = 0;
   while (i < n) {
     var e: Entity* = scene_row(sc, i);
     if (e != 0) {
-      sio_write_entity(fp, e);
+      sio_write_entity(fp, sc, e);
     }
     i = i + 1;
   }
   fclose(fp);
   return 1;
+}
+
+// Match a property by its scene_prop_key, return its id or 0.
+function sio_prop_id_for_key(key: cstring) -> int32 {
+  if (key == 0) { return 0; }
+  var id: int32 = 1;
+  var pn: int32 = scene_prop_count();
+  while (id <= pn) {
+    var k: cstring = scene_prop_key(id);
+    var i: int32 = 0;
+    var eq: int32 = 1;
+    while (i < 32) {
+      var a: uint8 = (uint8)(key[i]);
+      var b: uint8 = (uint8)(k[i]);
+      if (a != b) { eq = 0; }
+      if (a != b) { i = 32; } else {
+        if (a == (uint8)0) { i = 32; } else { i = i + 1; }
+      }
+    }
+    if (eq != 0) { return id; }
+    id = id + 1;
+  }
+  return 0;
+}
+
+// Apply one "p <key> <rest>" line to the current entity via the prop table.
+function sio_apply_prop_line(sc: Scene*, e: Entity*, lc: cstring) {
+  if (e == 0) { return; }
+  var key: uint8[40];
+  var pos: int32 = sio_next_token(lc, 2, (cstring)((int64)(&(key[0]))), 40);
+  var id: int32 = sio_prop_id_for_key((cstring)((int64)(&(key[0]))));
+  if (id == 0) { return; }
+  if (scene_prop_type(id) == PT_STRING()) {
+    // Tail after "p <key> " is the raw name (may contain spaces).
+    while (pos < 1024 && (uint8)(lc[pos]) == (uint8)32) { pos = pos + 1; }
+    sio_copy_tail((cstring)((int64)(&(e->name[0]))), 64, lc, pos);
+    if (e->name[0] == (uint8)0) {
+      e->name[0] = 0;
+    }
+    return;
+  }
+  var tok: uint8[64];
+  sio_next_token(lc, pos, (cstring)((int64)(&(tok[0]))), 64);
+  var raw: int64 = sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0])))));
+  if (id == PROP_PARENT()) {
+    // scene_set_parent validates the parent exists, but children can appear
+    // before their parent in the file. Store the link raw; cycles can't form
+    // because every id is unique and the editor re-validates on reparent.
+    e->parent_id = (int32)raw;
+    return;
+  }
+  if (scene_prop_type(id) == PT_FLOAT()) {
+    var s: int64 = scene_prop_scale(id);
+    scene_prop_set_num(sc, e, id, sio_unscaled(raw, (float64)s));
+  } else {
+    scene_prop_set_num(sc, e, id, (float64)raw);
+  }
 }
 
 function sio_apply_mesh_path(e: Entity*, meshes: MeshStore*) {
@@ -205,7 +284,7 @@ function sio_apply_mesh_path(e: Entity*, meshes: MeshStore*) {
   }
 }
 
-export function scene_io_load(path: cstring, sc: Scene*, meshes: MeshStore*) -> int32 {
+export function scene_io_load(path: cstring, sc: Scene*, meshes: MeshStore*, project_root: cstring) -> int32 {
   if (path == 0 || sc == 0) {
     return 0;
   }
@@ -232,7 +311,10 @@ export function scene_io_load(path: cstring, sc: Scene*, meshes: MeshStore*) -> 
         cur = scene_find(sc, new_id);
       } else {
         if (sio_starts(lc, "end") != 0) {
-          sio_apply_mesh_path(cur, meshes);
+          if (cur != 0) {
+            scene_entity_normalize_rotation(cur);
+            sio_apply_mesh_path(cur, meshes);
+          }
           cur = 0;
         } else {
           if (cur != 0) {
@@ -240,71 +322,29 @@ export function scene_io_load(path: cstring, sc: Scene*, meshes: MeshStore*) -> 
               cur->id = (int32)sio_parse_i64_after(lc, 3);
               if (cur->id > max_id) { max_id = cur->id; }
             } else {
-              if (sio_starts(lc, "kind ") != 0) {
-                cur->kind = (int32)sio_parse_i64_after(lc, 5);
+              if (sio_starts(lc, "script ") != 0) {
+                var sp: int32 = 7;
+                sp = sio_next_token(lc, sp, (cstring)((int64)(&(tok[0]))), 64);
+                cur->script_id = (int32)atol((cstring)((int64)(&(tok[0]))));
+                sp = sio_next_token(lc, sp, (cstring)((int64)(&(tok[0]))), 64);
+                cur->script_enabled = (int32)atol((cstring)((int64)(&(tok[0]))));
               } else {
-                if (sio_starts(lc, "parent ") != 0) {
-                  cur->parent_id = (int32)sio_parse_i64_after(lc, 7);
+                if (sio_starts(lc, "flags ") != 0) {
+                  cur->flags = (int32)sio_parse_i64_after(lc, 6);
                 } else {
-                  if (sio_starts(lc, "script ") != 0) {
-                    var sp: int32 = 7;
-                    sp = sio_next_token(lc, sp, (cstring)((int64)(&(tok[0]))), 64);
-                    cur->script_id = (int32)atol((cstring)((int64)(&(tok[0]))));
-                    sp = sio_next_token(lc, sp, (cstring)((int64)(&(tok[0]))), 64);
-                    cur->script_enabled = (int32)atol((cstring)((int64)(&(tok[0]))));
+                  if (sio_starts(lc, "half_u ") != 0) {
+                    cur->half = sio_unscaled(sio_parse_i64_after(lc, 7), 1000000.0);
                   } else {
-                    if (sio_starts(lc, "scale_u ") != 0) {
-                    cur->scale = sio_unscaled(sio_parse_i64_after(lc, 8), 1000000.0);
-                  } else {
-                    if (sio_starts(lc, "half_u ") != 0) {
-                      cur->half = sio_unscaled(sio_parse_i64_after(lc, 7), 1000000.0);
+                    if (sio_starts(lc, "mesh_path ") != 0) {
+                      sio_copy_tail((cstring)((int64)(&(cur->mesh_path[0]))), 520, lc, 10);
                     } else {
-                      if (sio_starts(lc, "name ") != 0) {
-                        sio_copy_tail((cstring)((int64)(&(cur->name[0]))), 64, lc, 5);
+                      if (sio_starts(lc, "lua_script ") != 0) {
+                        sio_copy_tail((cstring)((int64)(&(cur->lua_script[0]))), 260, lc, 11);
                       } else {
-                        if (sio_starts(lc, "mesh_path ") != 0) {
-                          sio_copy_tail((cstring)((int64)(&(cur->mesh_path[0]))), 520, lc, 10);
-                        } else {
-                        if (sio_starts(lc, "lua_script ") != 0) {
-                          sio_copy_tail((cstring)((int64)(&(cur->lua_script[0]))), 260, lc, 11);
-                        } else {
-                          if (sio_starts(lc, "pos_mm ") != 0) {
-                            var p: int32 = 7;
-                            p = sio_next_token(lc, p, (cstring)((int64)(&(tok[0]))), 64);
-                            cur->pos_x = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000.0);
-                            p = sio_next_token(lc, p, (cstring)((int64)(&(tok[0]))), 64);
-                            cur->pos_y = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000.0);
-                            p = sio_next_token(lc, p, (cstring)((int64)(&(tok[0]))), 64);
-                            cur->pos_z = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000.0);
-                          } else {
-                            if (sio_starts(lc, "rot_q ") != 0) {
-                              var qp: int32 = 6;
-                              qp = sio_next_token(lc, qp, (cstring)((int64)(&(tok[0]))), 64);
-                              cur->rot_x = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000000.0);
-                              qp = sio_next_token(lc, qp, (cstring)((int64)(&(tok[0]))), 64);
-                              cur->rot_y = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000000.0);
-                              qp = sio_next_token(lc, qp, (cstring)((int64)(&(tok[0]))), 64);
-                              cur->rot_z = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000000.0);
-                              qp = sio_next_token(lc, qp, (cstring)((int64)(&(tok[0]))), 64);
-                              cur->rot_w = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000000.0);
-                              scene_entity_normalize_rotation(cur);
-                            } else {
-                              if (sio_starts(lc, "rot_urad ") != 0) {
-                              var rp: int32 = 9;
-                              rp = sio_next_token(lc, rp, (cstring)((int64)(&(tok[0]))), 64);
-                              var lyaw: float64 = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000000.0);
-                              rp = sio_next_token(lc, rp, (cstring)((int64)(&(tok[0]))), 64);
-                              var lpitch: float64 = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000000.0);
-                              rp = sio_next_token(lc, rp, (cstring)((int64)(&(tok[0]))), 64);
-                              var lroll: float64 = sio_unscaled(sio_legacy_sanitize_scaled(atol((cstring)((int64)(&(tok[0]))))), 1000000.0);
-                              scene_entity_set_rotation_euler_legacy(cur, lyaw, lpitch, lroll);
-                              }
-                            }
-                          }
-                        }
+                        if (sio_starts(lc, "p ") != 0) {
+                          sio_apply_prop_line(sc, cur, lc);
                         }
                       }
-                    }
                     }
                   }
                 }
@@ -323,6 +363,9 @@ export function scene_io_load(path: cstring, sc: Scene*, meshes: MeshStore*) -> 
     if (first != 0) {
       scene_set_selected(sc, first->id);
     }
+  }
+  if (project_root != 0 && (uint8)(project_root[0]) != (uint8)0) {
+    scene_terrain_reload_all(sc, project_root);
   }
   return 1;
 }

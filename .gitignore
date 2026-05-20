@@ -1,9 +1,7 @@
-
-# Vulkan shader regen toolchain cache (re-downloaded on demand)
 engine/shaders/.glslang/
 docs/
 bin/
-.methplay/
+.mettleplay/
 .claude/
 src/
 sword-of-artorias/
@@ -19,3 +17,4 @@ lua-5.5.0.tar.gz
 *.s
 *.dll
 *.mproj
+*.log

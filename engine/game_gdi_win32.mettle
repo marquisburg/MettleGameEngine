@@ -1,6 +1,6 @@
 // Windows-only MIN game loop: Win32 window + PeekMessage dispatch + StretchDIBits
 // from a caller-owned RGBA (BGRA packed) framebuffer. Targets --build --emit-obj
-// --linker internal (kernel32/user32/gdi32 already resolved by Methlang linker).
+// --linker internal (kernel32/user32/gdi32 already resolved by Mettle linker).
 //
 import "std/mem";
 
@@ -38,10 +38,68 @@ export struct GameWin32 {
   child_y: int32;
   child_w: int32;
   child_h: int32;
+  char_head: int32;
+  char_tail: int32;
+  char_buf: uint8[256];
 }
 
 var GAME_WIN32_ACTIVE: GameWin32* = 0;
 var GAME_WIN32_WHEEL_ACCUM: int32 = 0;
+
+// WM_CHAR ring buffer. The wndproc pushes translated characters (post
+// keyboard-layout / shift / dead-key), consumers drain in FIFO order. This is
+// the correct foundation for text entry (code editor, name fields) instead of
+// hand-mapping VK codes to glyphs. 256 slots is ample for one frame of typing
+// at any human rate; overflow silently drops the oldest unread char.
+//
+// The object backend only allows scalar globals, so the buffer storage lives
+// in the GameWin32 struct (char_buf / char_head / char_tail) and is reached
+// via the GAME_WIN32_ACTIVE singleton — same pattern as key_bits*.
+
+function game_win32_char_push(ch: uint8) {
+  var g: GameWin32* = GAME_WIN32_ACTIVE;
+  if (g == 0) {
+    return;
+  }
+  var nxt: int32 = (g->char_head + 1) % 256;
+  if (nxt == g->char_tail) {
+    // Full: advance tail (drop oldest) so newest keystroke is never lost.
+    g->char_tail = (g->char_tail + 1) % 256;
+  }
+  g->char_buf[g->char_head] = ch;
+  g->char_head = nxt;
+}
+
+// Pops the next typed character, or 0 if the queue is empty. Returns printable
+// ASCII (32..126) and carriage-return (13) / backspace (8) / tab (9); other
+// control chars are filtered by the wndproc before they reach here.
+export function game_win32_poll_char() -> int32 {
+  var g: GameWin32* = GAME_WIN32_ACTIVE;
+  if (g == 0) {
+    return 0;
+  }
+  if (g->char_tail == g->char_head) {
+    return 0;
+  }
+  var c: uint8 = g->char_buf[g->char_tail];
+  g->char_tail = (g->char_tail + 1) % 256;
+  return (int32)c;
+}
+
+// Discards any queued characters. Call when entering a mode that shouldn't
+// receive buffered keystrokes typed before it opened.
+export function game_win32_flush_chars() {
+  var g: GameWin32* = GAME_WIN32_ACTIVE;
+  if (g == 0) {
+    return;
+  }
+  g->char_head = 0;
+  g->char_tail = 0;
+}
+
+export function WM_CHAR_VAL() -> uint32 {
+  return 258;
+}
 
 export struct Win32Rect {
   left: int32;
@@ -338,6 +396,19 @@ export extern function Win32_BeginPaint(hwnd: int64, ps: Win32PaintStruct*) -> i
 export extern function Win32_EndPaint(hwnd: int64, ps: Win32PaintStruct*) -> int32 = "EndPaint";
 export extern function Win32_InvalidateRect(hwnd: int64, rect: Win32Rect*, erase: int32) -> int32 = "InvalidateRect";
 
+// Clipboard (user32) + memory (kernel32). Used by the script editor's
+// Ctrl+C/X/V. CF_TEXT (1) is plain ANSI text — matches the editor's uint8 buf.
+export extern function Win32_OpenClipboard(hwnd: int64) -> int32 = "OpenClipboard";
+export extern function Win32_CloseClipboard() -> int32 = "CloseClipboard";
+export extern function Win32_EmptyClipboard() -> int32 = "EmptyClipboard";
+export extern function Win32_GetClipboardData(format: uint32) -> int64 = "GetClipboardData";
+export extern function Win32_SetClipboardData(format: uint32, mem: int64) -> int64 = "SetClipboardData";
+export extern function Win32_IsClipboardFormatAvailable(format: uint32) -> int32 = "IsClipboardFormatAvailable";
+export extern function Win32_GlobalAlloc(flags: uint32, bytes: int64) -> int64 = "GlobalAlloc";
+export extern function Win32_GlobalLock(mem: int64) -> cstring = "GlobalLock";
+export extern function Win32_GlobalUnlock(mem: int64) -> int32 = "GlobalUnlock";
+export extern function Win32_GlobalFree(mem: int64) -> int64 = "GlobalFree";
+
 export function swizzle_bgra8(r: uint8, g: uint8, b: uint8, a: uint8) -> uint32 {
   var ur: uint32 = (uint32)r;
   var ug: uint32 = ((uint32)g) & (uint32)255;
@@ -401,11 +472,15 @@ export function game_input_key_held(vkey: int32) -> int32 {
 }
 
 // Returns net wheel notches since the last call (positive = wheel forward),
-// then resets the accumulator.
+// then resets the consumed portion of the accumulator. The accumulator holds
+// raw WM_MOUSEWHEEL deltas (120 = one classic notch); we divide-and-keep so
+// high-resolution / partial-notch events from precision mice & trackpads
+// don't get dropped to zero.
 export function game_mouse_consume_wheel() -> int32 {
   var w: int32 = GAME_WIN32_WHEEL_ACCUM;
-  GAME_WIN32_WHEEL_ACCUM = 0;
-  return w;
+  var notches: int32 = w / 120;
+  GAME_WIN32_WHEEL_ACCUM = w - notches * 120;
+  return notches;
 }
 
 export function game_win32_mouse_x(g: GameWin32*) -> int32 {
@@ -460,7 +535,7 @@ export function game_mouse_is_captured(g: GameWin32*) -> int32 {
   return g->mouse_captured;
 }
 
-function game_win32_set_key(vkey: int32, down: int32);
+export function game_win32_set_key(vkey: int32, down: int32);
 
 // capture_anchor_x/y hold the LAST ABSOLUTE screen cursor position. Deltas are
 // measured against that and the anchor advances every read, so there is no
@@ -549,7 +624,7 @@ export function game_mouse_read_delta(g: GameWin32*, out_dx: int32*, out_dy: int
   return 0;
 }
 
-function game_win32_set_key(vkey: int32, down: int32) {
+export function game_win32_set_key(vkey: int32, down: int32) {
   if (vkey < 0 || vkey >= 256) {
     return;
   }
@@ -610,6 +685,16 @@ export function game_win32_wnd_proc(hwnd: int64, msg: uint32, wparam: int64, lpa
     }
     return Win32_DefWindowProcA(hwnd, msg, wparam, lparam);
   }
+  if (msg == WM_CHAR_VAL()) {
+    // wparam is the translated character code. Keep printable ASCII plus the
+    // editing controls the code editor understands; drop the rest (ESC=27,
+    // bell, etc.) so consumers never see junk.
+    var cc: int32 = (int32)(wparam & (int64)255);
+    if (cc == 8 || cc == 9 || cc == 13 || (cc >= 32 && cc <= 126)) {
+      game_win32_char_push((uint8)cc);
+    }
+    return (int64)0;
+  }
   if (msg == WM_KEYDOWN_VAL() || msg == WM_SYSKEYDOWN_VAL()) {
     game_win32_set_key((int32)wparam, 1);
     return Win32_DefWindowProcA(hwnd, msg, wparam, lparam);
@@ -635,12 +720,14 @@ export function game_win32_wnd_proc(hwnd: int64, msg: uint32, wparam: int64, lpa
     return Win32_DefWindowProcA(hwnd, msg, wparam, lparam);
   }
   if (msg == (uint32)522) {
-    // WM_MOUSEWHEEL: high word of wParam is a signed delta in 120ths.
+    // WM_MOUSEWHEEL: high word of wParam is a signed delta. 120 = one classic
+    // notch; precision wheels send smaller fractions, so accumulate raw and
+    // let game_mouse_consume_wheel quantise (keeping the remainder).
     var hw: int32 = (int32)((wparam >> (int64)16) & (int64)65535);
     if (hw >= 32768) {
       hw = hw - 65536;
     }
-    GAME_WIN32_WHEEL_ACCUM = GAME_WIN32_WHEEL_ACCUM + hw / 120;
+    GAME_WIN32_WHEEL_ACCUM = GAME_WIN32_WHEEL_ACCUM + hw;
     return (int64)0;
   }
   if (msg == WM_SIZE_VAL()) {
@@ -694,12 +781,12 @@ export function game_win32_wnd_proc(hwnd: int64, msg: uint32, wparam: int64, lpa
 }
 
 function game_win32_bytes() -> int64 {
-  // 12 int64 (96) + 13 int32 (52) = 148; round up for backend slack.
-  return (int64)256;
+  // 12 int64 (96) + 15 int32 (60) + char_buf[256] = ~412; round up for slack.
+  return (int64)768;
 }
 
 function game_win32_class_name_c() -> cstring {
-  return gcw_cstr_lit("MethGameWin32Gdi");
+  return gcw_cstr_lit("MettleGameWin32Gdi");
 }
 
 export function game_win32_tick_seconds(g: GameWin32*) -> float64 {
@@ -901,7 +988,7 @@ export function game_win32_is_running(g: GameWin32*) -> int32 {
 
 export function game_win32_create(window_title_c: cstring, client_w: int32, client_h: int32) -> GameWin32* {
   if (window_title_c == 0) {
-    window_title_c = gcw_cstr_lit("Methlang");
+    window_title_c = gcw_cstr_lit("Mettle");
   }
   if (client_w <= 0) {
     client_w = 640;
@@ -1039,6 +1126,23 @@ export function game_win32_move_child(g: GameWin32*, x: int32, y: int32, w: int3
   g->child_w = w;
   g->child_h = h;
   return size_changed;
+}
+
+// Hide the Vulkan child so the GDI DIB underneath (e.g. the modal code editor
+// overlay) shows through. Idempotent. The child is not destroyed; show_child
+// brings it back without recreating the swapchain.
+export function game_win32_hide_child(g: GameWin32*) {
+  if (g == 0 || g->child_hwnd == 0) {
+    return;
+  }
+  Win32_ShowWindow(g->child_hwnd, (int32)0);
+}
+
+export function game_win32_show_child(g: GameWin32*) {
+  if (g == 0 || g->child_hwnd == 0) {
+    return;
+  }
+  Win32_ShowWindow(g->child_hwnd, SW_SHOW_VAL());
 }
 
 export function game_win32_destroy_child(g: GameWin32*) {

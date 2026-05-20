@@ -487,3 +487,13 @@ export function project_resolve_scene_abs(p: ProjectInfo*, out: cstring, out_cap
   out[0] = 0;
   fs_path_join_child(out, out_cap, project_root_ptr(p), project_scene_path_ptr(p));
 }
+
+// Absolute path to the project's asset root. The asset manager indexes this
+// directory, not the entire project tree.
+export function project_resolve_assets_abs(p: ProjectInfo*, out: cstring, out_cap: int32) {
+  if (p == 0 || out == 0 || out_cap <= 0) {
+    return;
+  }
+  out[0] = 0;
+  fs_path_join_child(out, out_cap, project_root_ptr(p), project_assets_subdir_ptr(p));
+}

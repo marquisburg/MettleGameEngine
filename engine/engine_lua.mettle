@@ -1,4 +1,4 @@
-// Lua 5.5 scripting integration for the Methlang game engine.
+// Lua 5.5 scripting integration for the Mettle game engine.
 //
 // Owns a single shared lua_State and a fixed-size table of (entity_id, script
 // path) -> chunk-reference slots. Per tick the runtime sets a context (scene,
@@ -7,7 +7,7 @@
 // defined).
 //
 // Linking: build with --link-arg -llua55. lua55.dll must be on PATH at link
-// time (the Methlang internal linker probes named DLLs by exports) and on
+// time (the Mettle internal linker probes named DLLs by exports) and on
 // PATH at run time.
 //
 // Scripts get one global table `engine`:
@@ -20,6 +20,16 @@
 //   engine.rotate_world([id,] axis, rad)   (axis: 1=X, 2=Y, 3=Z)
 //   engine.get_scale(id?)                  -> number
 //   engine.set_scale([id,] s)
+//   engine.first_collision(id?)            -> id|nil
+//   engine.set_collidable([id,] enabled)
+//   engine.get_color(id?)                  -> r,g,b (0..255)
+//   engine.set_color([id,] r, g, b)        (0..255)
+//   engine.get_transparency(id?)           -> 0..1
+//   engine.set_transparency([id,] t)
+//   engine.get_anchored(id?)               -> bool
+//   engine.set_anchored([id,] enabled)
+//   engine.get_mass(id?)                   -> effective mass (kg)
+//   engine.ground_height(x, z, fallback?)  -> y
 //   engine.input_held(action)              -> bool
 //   engine.input_pressed(action)           -> bool
 //   engine.input_released(action)          -> bool
@@ -38,6 +48,7 @@ import "engine_input";
 import "engine_output_log";
 import "engine_scene";
 import "engine_services";
+import "engine_viewport";
 import "std/io";
 import "std/mem";
 
@@ -87,7 +98,7 @@ extern function lua_tolstring(L: cstring, idx: int32, len: int64*) -> cstring = 
 extern function lua_tointegerx(L: cstring, idx: int32, isnum: int32*) -> int64 = "lua_tointegerx";
 extern function lua_tonumberx(L: cstring, idx: int32, isnum: int32*) -> float64 = "lua_tonumberx";
 
-// Helpers mirroring Lua's lua.h macros (no #define in Methlang). These are
+// Helpers mirroring Lua's lua.h macros (no #define in Mettle). These are
 // engine-prefixed to avoid any collision with C API symbols that the linker
 // might also resolve from lua55.dll.
 export function eng_lua_pcall(L: cstring, nargs: int32, nresults: int32, errfunc: int32) -> int32 {
@@ -116,8 +127,8 @@ export function eng_lua_tonumber(L: cstring, idx: int32) -> float64 {
 
 // ---- Per-tick context (module-level static) --------------------------------
 // The C-callable functions need to reach back into the engine, but a Lua
-// CFunction takes only a lua_State*. Methlang module-level vars give us a
-// safe single-tick scratchpad: one Methlang process == one editor == one
+// CFunction takes only a lua_State*. Mettle module-level vars give us a
+// safe single-tick scratchpad: one Mettle process == one editor == one
 // scripting registry == this slot. lua_pcall is synchronous on this thread,
 // so the slot is filled before each call and read inside the callbacks.
 var lua_ctx_scene: Scene* = 0;
@@ -125,6 +136,8 @@ var lua_ctx_input: InputMap* = 0;
 var lua_ctx_self_id: int32 = 0;
 var lua_ctx_dt: float64 = 0.0;
 var lua_ctx_time: float64 = 0.0;
+// Client-only: the game camera a LocalScript drives via engine.camera_*.
+var lua_ctx_viewport: EngineViewport* = 0;
 
 function lua_ctx_set(scene: Scene*, input: InputMap*, self_id: int32, dt: float64, t: float64) {
   lua_ctx_scene = scene;
@@ -132,6 +145,12 @@ function lua_ctx_set(scene: Scene*, input: InputMap*, self_id: int32, dt: float6
   lua_ctx_self_id = self_id;
   lua_ctx_dt = dt;
   lua_ctx_time = t;
+}
+
+// Bind the script-driven camera. Persistent (not cleared per tick) so the
+// camera API works from any LocalScript regardless of tick ordering.
+export function lua_ctx_set_viewport(vp: EngineViewport*) {
+  lua_ctx_viewport = vp;
 }
 
 function lua_ctx_clear() {
@@ -304,12 +323,311 @@ function lua_api_input_released(L: cstring) -> int32 {
   return 1;
 }
 
+// engine.find(name) -> entity id, or nil if no entity has that name.
+// Returns a stable integer handle; scripts should cache it rather than
+// calling this every tick. This is the engine's flat alternative to
+// Roblox-style game:GetService(...):FindFirstChild(...) string traversal:
+// one call, one integer, no allocation, no object graph.
+function lua_api_find(L: cstring) -> int32 {
+  if (lua_ctx_scene == 0) {
+    lua_pushnil(L);
+    return 1;
+  }
+  var nm: cstring = eng_lua_tostring(L, 1);
+  if (nm == 0) {
+    lua_pushnil(L);
+    return 1;
+  }
+  var e: Entity* = scene_find_by_name(lua_ctx_scene, nm);
+  if (e == 0) {
+    lua_pushnil(L);
+    return 1;
+  }
+  lua_pushinteger(L, (int64)e->id);
+  return 1;
+}
+
+// engine.exists(id) -> bool. Cheap liveness check for a cached handle.
+function lua_api_exists(L: cstring) -> int32 {
+  if (lua_ctx_scene == 0) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  var id: int32 = (int32)eng_lua_tointeger(L, 1);
+  if (scene_find(lua_ctx_scene, id) != 0) {
+    lua_pushboolean(L, 1);
+  } else {
+    lua_pushboolean(L, 0);
+  }
+  return 1;
+}
+
+function lua_api_first_collision(L: cstring) -> int32 {
+  if (lua_ctx_scene == 0) {
+    lua_pushnil(L);
+    return 1;
+  }
+  var e: Entity* = lua_resolve_entity(L, 1);
+  if (e == 0) {
+    lua_pushnil(L);
+    return 1;
+  }
+  var hit: int32 = scene_first_collision(lua_ctx_scene, e->id);
+  if (hit == 0) {
+    lua_pushnil(L);
+  } else {
+    lua_pushinteger(L, (int64)hit);
+  }
+  return 1;
+}
+
+function lua_api_set_collidable(L: cstring) -> int32 {
+  var top: int32 = lua_gettop(L);
+  var e: Entity* = (Entity*)0;
+  var vi: int32 = 1;
+  if (top >= 2) {
+    e = lua_resolve_entity(L, 1);
+    vi = 2;
+  } else {
+    e = lua_resolve_entity(L, 0);
+  }
+  if (e == 0) {
+    return 0;
+  }
+  if ((int32)eng_lua_tointeger(L, vi) != 0) {
+    e->flags = e->flags | SE_FLAG_COLLIDER();
+  } else {
+    e->flags = e->flags & (0 - 1 - SE_FLAG_COLLIDER());
+  }
+  return 0;
+}
+
+// engine.get_color(id?) -> r,g,b   (0..255 each; defaults to 200,200,200
+// when the part has no explicit color so scripts always get usable numbers).
+function lua_api_get_color(L: cstring) -> int32 {
+  var e: Entity* = lua_resolve_entity(L, 1);
+  if (e == 0 || scene_entity_has_color(e) == 0) {
+    lua_pushinteger(L, (int64)200);
+    lua_pushinteger(L, (int64)200);
+    lua_pushinteger(L, (int64)200);
+    return 3;
+  }
+  lua_pushinteger(L, (int64)scene_color_r(e->color_rgba));
+  lua_pushinteger(L, (int64)scene_color_g(e->color_rgba));
+  lua_pushinteger(L, (int64)scene_color_b(e->color_rgba));
+  return 3;
+}
+
+// engine.set_color([id,] r, g, b)   (0..255 each)
+function lua_api_set_color(L: cstring) -> int32 {
+  var top: int32 = lua_gettop(L);
+  var e: Entity* = (Entity*)0;
+  var ci: int32 = 1;
+  if (top >= 4) {
+    e = lua_resolve_entity(L, 1);
+    ci = 2;
+  } else {
+    e = lua_resolve_entity(L, 0);
+  }
+  if (e == 0) {
+    return 0;
+  }
+  scene_prop_set_num(lua_ctx_scene, e, PROP_COLOR_R(), eng_lua_tonumber(L, ci));
+  scene_prop_set_num(lua_ctx_scene, e, PROP_COLOR_G(), eng_lua_tonumber(L, ci + 1));
+  scene_prop_set_num(lua_ctx_scene, e, PROP_COLOR_B(), eng_lua_tonumber(L, ci + 2));
+  return 0;
+}
+
+// engine.get_transparency(id?) -> number 0..1
+function lua_api_get_transparency(L: cstring) -> int32 {
+  var e: Entity* = lua_resolve_entity(L, 1);
+  if (e == 0) {
+    lua_pushnumber(L, 0.0);
+    return 1;
+  }
+  lua_pushnumber(L, e->transparency);
+  return 1;
+}
+
+// engine.set_transparency([id,] t)
+function lua_api_set_transparency(L: cstring) -> int32 {
+  var top: int32 = lua_gettop(L);
+  var e: Entity* = (Entity*)0;
+  var vi: int32 = 1;
+  if (top >= 2) {
+    e = lua_resolve_entity(L, 1);
+    vi = 2;
+  } else {
+    e = lua_resolve_entity(L, 0);
+  }
+  if (e == 0) {
+    return 0;
+  }
+  scene_prop_set_num(lua_ctx_scene, e, PROP_TRANSPARENCY(), eng_lua_tonumber(L, vi));
+  return 0;
+}
+
+// engine.get_anchored(id?) -> bool
+function lua_api_get_anchored(L: cstring) -> int32 {
+  var e: Entity* = lua_resolve_entity(L, 1);
+  if (e == 0) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  lua_pushboolean(L, scene_entity_prop_flag(e, PF_ANCHORED()));
+  return 1;
+}
+
+// engine.set_anchored([id,] enabled)
+function lua_api_set_anchored(L: cstring) -> int32 {
+  var top: int32 = lua_gettop(L);
+  var e: Entity* = (Entity*)0;
+  var vi: int32 = 1;
+  if (top >= 2) {
+    e = lua_resolve_entity(L, 1);
+    vi = 2;
+  } else {
+    e = lua_resolve_entity(L, 0);
+  }
+  if (e == 0) {
+    return 0;
+  }
+  var on: int32 = 0;
+  if ((int32)eng_lua_tointeger(L, vi) != 0) { on = 1; }
+  scene_entity_set_prop_flag(e, PF_ANCHORED(), on);
+  return 0;
+}
+
+// engine.get_mass(id?) -> number  (effective: explicit or volume*density)
+function lua_api_get_mass(L: cstring) -> int32 {
+  var e: Entity* = lua_resolve_entity(L, 1);
+  if (e == 0) {
+    lua_pushnumber(L, 0.0);
+    return 1;
+  }
+  lua_pushnumber(L, scene_entity_effective_mass(lua_ctx_scene, e));
+  return 1;
+}
+
+function lua_api_ground_height(L: cstring) -> int32 {
+  if (lua_ctx_scene == 0) {
+    lua_pushnumber(L, 0.0);
+    return 1;
+  }
+  var x: float64 = eng_lua_tonumber(L, 1);
+  var z: float64 = eng_lua_tonumber(L, 2);
+  var fallback: float64 = 0.0;
+  if (lua_gettop(L) >= 3) {
+    fallback = eng_lua_tonumber(L, 3);
+  }
+  lua_pushnumber(L, scene_ground_height_at(lua_ctx_scene, x, z, fallback));
+  return 1;
+}
+
+// ---- Client camera API (gap 1.1) ------------------------------------------
+// These no-op on the server (lua_ctx_viewport == 0), so a script that runs on
+// both sides is safe to call them unconditionally.
+
+// engine.camera_set_pos(x, y, z)
+function lua_api_camera_set_pos(L: cstring) -> int32 {
+  if (lua_ctx_viewport == 0) {
+    return 0;
+  }
+  var x: float64 = eng_lua_tonumber(L, 1);
+  var y: float64 = eng_lua_tonumber(L, 2);
+  var z: float64 = eng_lua_tonumber(L, 3);
+  engine_viewport_cam_set_pos(lua_ctx_viewport, x, y, z);
+  engine_viewport_mark_script_camera(lua_ctx_viewport);
+  return 0;
+}
+
+// engine.camera_get_pos() -> x, y, z
+function lua_api_camera_get_pos(L: cstring) -> int32 {
+  if (lua_ctx_viewport == 0) {
+    lua_pushnumber(L, 0.0);
+    lua_pushnumber(L, 0.0);
+    lua_pushnumber(L, 0.0);
+    return 3;
+  }
+  lua_pushnumber(L, engine_viewport_cam_get_x(lua_ctx_viewport));
+  lua_pushnumber(L, engine_viewport_cam_get_y(lua_ctx_viewport));
+  lua_pushnumber(L, engine_viewport_cam_get_z(lua_ctx_viewport));
+  return 3;
+}
+
+// engine.camera_set_look(yaw, pitch)  (radians; pitch auto-clamped)
+function lua_api_camera_set_look(L: cstring) -> int32 {
+  if (lua_ctx_viewport == 0) {
+    return 0;
+  }
+  var yaw: float64 = eng_lua_tonumber(L, 1);
+  var pitch: float64 = eng_lua_tonumber(L, 2);
+  engine_viewport_cam_set_look(lua_ctx_viewport, yaw, pitch);
+  engine_viewport_mark_script_camera(lua_ctx_viewport);
+  return 0;
+}
+
+// engine.camera_get_look() -> yaw, pitch
+function lua_api_camera_get_look(L: cstring) -> int32 {
+  if (lua_ctx_viewport == 0) {
+    lua_pushnumber(L, 0.0);
+    lua_pushnumber(L, 0.0);
+    return 2;
+  }
+  lua_pushnumber(L, engine_viewport_cam_get_yaw(lua_ctx_viewport));
+  lua_pushnumber(L, engine_viewport_cam_get_pitch(lua_ctx_viewport));
+  return 2;
+}
+
+// engine.camera_forward() -> x, y, z   (unit forward for current look)
+function lua_api_camera_forward(L: cstring) -> int32 {
+  if (lua_ctx_viewport == 0) {
+    lua_pushnumber(L, 0.0);
+    lua_pushnumber(L, 0.0);
+    lua_pushnumber(L, 1.0);
+    return 3;
+  }
+  lua_pushnumber(L, engine_viewport_cam_forward(lua_ctx_viewport, 0));
+  lua_pushnumber(L, engine_viewport_cam_forward(lua_ctx_viewport, 1));
+  lua_pushnumber(L, engine_viewport_cam_forward(lua_ctx_viewport, 2));
+  return 3;
+}
+
+// engine.camera_right() -> x, y, z   (unit right for current look)
+function lua_api_camera_right(L: cstring) -> int32 {
+  if (lua_ctx_viewport == 0) {
+    lua_pushnumber(L, 1.0);
+    lua_pushnumber(L, 0.0);
+    lua_pushnumber(L, 0.0);
+    return 3;
+  }
+  lua_pushnumber(L, engine_viewport_cam_right(lua_ctx_viewport, 0));
+  lua_pushnumber(L, engine_viewport_cam_right(lua_ctx_viewport, 1));
+  lua_pushnumber(L, engine_viewport_cam_right(lua_ctx_viewport, 2));
+  return 3;
+}
+
+// engine.mouse_delta() -> dx, dy. Sourced from the InputMap (the client
+// writes it there each frame). Reusing lua_ctx_input — an already-working
+// pointer global — sidesteps the module-int-global resolution issue.
+function lua_api_mouse_delta(L: cstring) -> int32 {
+  if (lua_ctx_input == 0) {
+    lua_pushinteger(L, (int64)0);
+    lua_pushinteger(L, (int64)0);
+    return 2;
+  }
+  lua_pushinteger(L, (int64)input_map_mouse_dx(lua_ctx_input));
+  lua_pushinteger(L, (int64)input_map_mouse_dy(lua_ctx_input));
+  return 2;
+}
+
 function lua_api_log(L: cstring) -> int32 {
   var s: cstring = eng_lua_tostring(L, 1);
   if (s != 0) {
     fputs(cstr("[lua] "), get_stdout());
     fputs(s, get_stdout());
     fputs(cstr("\n"), get_stdout());
+    fflush(get_stdout());
     output_log_lua(s);
   }
   return 0;
@@ -352,7 +670,7 @@ function lua_slot_ptr(reg: LuaScriptRegistry*, i: int32) -> LuaScriptSlot* {
 }
 
 function lua_install_api(L: cstring) {
-  lua_createtable(L, 0, 24);
+  lua_createtable(L, 0, 32);
   eng_lua_pushcfunction(L, &lua_api_self_id);         lua_setfield(L, -2, cstr("self_id"));
   eng_lua_pushcfunction(L, &lua_api_dt);              lua_setfield(L, -2, cstr("dt"));
   eng_lua_pushcfunction(L, &lua_api_time);            lua_setfield(L, -2, cstr("time"));
@@ -365,6 +683,25 @@ function lua_install_api(L: cstring) {
   eng_lua_pushcfunction(L, &lua_api_input_held);      lua_setfield(L, -2, cstr("input_held"));
   eng_lua_pushcfunction(L, &lua_api_input_pressed);   lua_setfield(L, -2, cstr("input_pressed"));
   eng_lua_pushcfunction(L, &lua_api_input_released);  lua_setfield(L, -2, cstr("input_released"));
+  eng_lua_pushcfunction(L, &lua_api_find);            lua_setfield(L, -2, cstr("find"));
+  eng_lua_pushcfunction(L, &lua_api_exists);          lua_setfield(L, -2, cstr("exists"));
+  eng_lua_pushcfunction(L, &lua_api_first_collision); lua_setfield(L, -2, cstr("first_collision"));
+  eng_lua_pushcfunction(L, &lua_api_set_collidable);  lua_setfield(L, -2, cstr("set_collidable"));
+  eng_lua_pushcfunction(L, &lua_api_get_color);       lua_setfield(L, -2, cstr("get_color"));
+  eng_lua_pushcfunction(L, &lua_api_set_color);       lua_setfield(L, -2, cstr("set_color"));
+  eng_lua_pushcfunction(L, &lua_api_get_transparency); lua_setfield(L, -2, cstr("get_transparency"));
+  eng_lua_pushcfunction(L, &lua_api_set_transparency); lua_setfield(L, -2, cstr("set_transparency"));
+  eng_lua_pushcfunction(L, &lua_api_get_anchored);    lua_setfield(L, -2, cstr("get_anchored"));
+  eng_lua_pushcfunction(L, &lua_api_set_anchored);    lua_setfield(L, -2, cstr("set_anchored"));
+  eng_lua_pushcfunction(L, &lua_api_get_mass);        lua_setfield(L, -2, cstr("get_mass"));
+  eng_lua_pushcfunction(L, &lua_api_ground_height);   lua_setfield(L, -2, cstr("ground_height"));
+  eng_lua_pushcfunction(L, &lua_api_camera_set_pos);  lua_setfield(L, -2, cstr("camera_set_pos"));
+  eng_lua_pushcfunction(L, &lua_api_camera_get_pos);  lua_setfield(L, -2, cstr("camera_get_pos"));
+  eng_lua_pushcfunction(L, &lua_api_camera_set_look); lua_setfield(L, -2, cstr("camera_set_look"));
+  eng_lua_pushcfunction(L, &lua_api_camera_get_look); lua_setfield(L, -2, cstr("camera_get_look"));
+  eng_lua_pushcfunction(L, &lua_api_camera_forward);  lua_setfield(L, -2, cstr("camera_forward"));
+  eng_lua_pushcfunction(L, &lua_api_camera_right);    lua_setfield(L, -2, cstr("camera_right"));
+  eng_lua_pushcfunction(L, &lua_api_mouse_delta);     lua_setfield(L, -2, cstr("mouse_delta"));
   eng_lua_pushcfunction(L, &lua_api_log);             lua_setfield(L, -2, cstr("log"));
 
   lua_createtable(L, 0, 8);
@@ -769,12 +1106,13 @@ export struct LuaScriptVm {
   scene: Scene*;
   services: ServiceModel*;
   input: InputMap*;
-  side: int32;           // 1=server, 2=client
+  viewport: EngineViewport*;   // client camera target (0 on the server)
+  side: int32;                 // 1=server, 2=client
   last_error: uint8[256];
 }
 
 export function lua_vm_create_server(scene: Scene*, services: ServiceModel*) -> LuaScriptVm* {
-  var raw: cstring = calloc((int64)1, (int64)288);
+  var raw: cstring = calloc((int64)1, (int64)384);
   if (raw == 0) {
     return (LuaScriptVm*)0;
   }
@@ -791,7 +1129,7 @@ export function lua_vm_create_server(scene: Scene*, services: ServiceModel*) -> 
 }
 
 export function lua_vm_create_client(scene: Scene*, services: ServiceModel*) -> LuaScriptVm* {
-  var raw: cstring = calloc((int64)1, (int64)288);
+  var raw: cstring = calloc((int64)1, (int64)384);
   if (raw == 0) {
     return (LuaScriptVm*)0;
   }

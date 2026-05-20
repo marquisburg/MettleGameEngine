@@ -33,7 +33,21 @@ function script_tick_entity(sc: Scene*, e: Entity*, input: InputMap*, fixed_dt: 
     if (input_action_held(input, IA_MOVE_DOWN()) != 0) { dy = dy - 1.0; }
     if (dx != 0.0 || dy != 0.0 || dz != 0.0) {
       var speed: float64 = 4.0 * fixed_dt;
+      var ox: float64 = e->pos_x;
+      var oy: float64 = e->pos_y;
+      var oz: float64 = e->pos_z;
       scene_entity_translate_world(sc, e, dx * speed, dy * speed, dz * speed);
+      var floor_y: float64 = scene_ground_height_at(sc, e->pos_x, e->pos_z, e->pos_y - e->half);
+      var min_y: float64 = floor_y + scene_entity_half_y(e) * scene_entity_world_scale(sc, e);
+      if (e->pos_y < min_y) {
+        e->pos_y = min_y;
+      }
+      var hit: int32 = scene_first_collision(sc, e->id);
+      if (hit != 0) {
+        e->pos_x = ox;
+        e->pos_y = oy;
+        e->pos_z = oz;
+      }
       return 1;
     }
   }

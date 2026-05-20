@@ -36,8 +36,13 @@ import "std/thread";
 
 extern function ioctlsocket(s: int64, cmd: int32, argp: uint32*) -> int32 = "ioctlsocket";
 
+// stdout is fully buffered when redirected (the editor supervisor / a file).
+// Without an explicit flush nothing reaches the Output panel until the buffer
+// fills or the process exits cleanly — and the server can be killed before
+// that. Flush every trace so logs are live (addresses playtest_gaps 2.4).
 function server_log(s: string) {
   fputs(s.chars, get_stdout());
+  fflush(get_stdout());
 }
 
 function server_trace(msg: cstring) {
@@ -47,6 +52,7 @@ function server_trace(msg: cstring) {
   fputs(cstr("[server] "), get_stdout());
   fputs(msg, get_stdout());
   fputs(cstr("\n"), get_stdout());
+  fflush(get_stdout());
 }
 
 function parse_manifest(path: cstring, mani: PlayManifest*) -> int32 {
@@ -188,7 +194,7 @@ export function main() -> int32 {
 
   // To make it self-contained for first build, we will accept a path via
   // a simple convention: if argv[1] exists use it, else exit with usage.
-  // Since Methlang main() signature is ()->int32, we use Win32 GetCommandLine
+  // Since Mettle main() signature is ()->int32, we use Win32 GetCommandLine
   // or a tiny arg parser. For brevity in this revision we require the manifest
   // path to be passed as a literal for smoke tests.
 
@@ -233,7 +239,7 @@ export function main() -> int32 {
 
   // Load snapshots
   var scene_path: cstring = play_manifest_scene_snapshot(mani);
-  if (scene_io_load(scene_path, sc, (MeshStore*)0) == 0) {
+  if (scene_io_load(scene_path, sc, (MeshStore*)0, play_manifest_project_root(mani)) == 0) {
     server_trace(cstr("scene snapshot load failed"));
     service_model_destroy(sm);
     scene_destroy(sc);
@@ -368,7 +374,7 @@ export function main() -> int32 {
   while (si < scene_count(sc)) {
     var se: Entity* = scene_row(sc, si);
     if (se != 0) {
-      nbytes = play_encode_entity((cstring)((int64)(&(buf[0]))), 2048, se->id, se->kind, se->parent_id, (int32)(se->pos_x * 1000.0), (int32)(se->pos_y * 1000.0), (int32)(se->pos_z * 1000.0), (int32)(se->rot_x * 1000000.0), (int32)(se->rot_y * 1000000.0), (int32)(se->rot_z * 1000000.0), (int32)(se->rot_w * 1000000.0), (int32)(se->scale * 1000000.0), scene_entity_mesh_path(se), scene_entity_name(se));
+      nbytes = play_encode_entity((cstring)((int64)(&(buf[0]))), 2048, se->id, se->kind, se->parent_id, (int32)(se->pos_x * 1000.0), (int32)(se->pos_y * 1000.0), (int32)(se->pos_z * 1000.0), (int32)(se->rot_x * 1000000.0), (int32)(se->rot_y * 1000000.0), (int32)(se->rot_z * 1000000.0), (int32)(se->rot_w * 1000000.0), (int32)(se->scale * 1000000.0), (int32)(se->size_x * 1000000.0), (int32)(se->size_y * 1000000.0), (int32)(se->size_z * 1000000.0), se->flags, se->material_id, scene_entity_mesh_path(se), scene_entity_name(se));
       if (nbytes > 0) {
         send(client_sock, (cstring)((int64)(&(buf[0]))), nbytes, 0);
       }

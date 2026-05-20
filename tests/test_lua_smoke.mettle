@@ -1,8 +1,8 @@
-// Regression smoke test for the Lua 5.5 binding in engine_lua.meth.
+// Regression smoke test for the Lua 5.5 binding in engine_lua.mettle.
 //
 // Build:
-//   bin\methlang.exe --build --emit-obj --linker internal --link-arg -llua55 \
-//                    tests\test_lua_smoke.meth -o tests\test_lua_smoke.exe
+//   bin\mettle.exe --build --emit-obj --linker internal --link-arg -llua55 \
+//                    tests\test_lua_smoke.mettle -o tests\test_lua_smoke.exe
 // Run (with lua55.dll on PATH):
 //   tests\test_lua_smoke.exe
 //

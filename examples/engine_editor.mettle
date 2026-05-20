@@ -1,17 +1,18 @@
-// Methlang engine editor shell: explorer (left) + flat asset registry (right) +
+// Mettle engine editor shell: explorer (left) + flat asset registry (right) +
 // viewport placeholder. Windows + internal linker only.
 //
 // From repo root:
 //   .\build_engine_editor.bat
-//   .\bin\methlang.exe --build --emit-obj --linker internal examples\engine_editor.meth -o examples\engine_editor.exe
+//   .\bin\mettle.exe --build --emit-obj --linker internal examples\engine_editor.mettle -o examples\engine_editor.exe
 //
 // From bin:
-//   .\methlang.exe --build --emit-obj --linker internal ..\examples\engine_editor.meth -o ..\examples\engine_editor.exe
+//   .\mettle.exe --build --emit-obj --linker internal ..\examples\engine_editor.mettle -o ..\examples\engine_editor.exe
 
 import "../engine/engine_assets";
 import "../engine/engine_editor_ui";
 import "../engine/engine_explorer";
 import "../engine/engine_fs_win32";
+import "../engine/engine_game_tree";
 import "../engine/engine_input";
 import "../engine/engine_lua";
 import "../engine/engine_materials";
@@ -51,7 +52,7 @@ function ed_vp_h(g: GameWin32*) -> int32 {
   return h;
 }
 
-function editor_start_playtest(sv: PlaytestSupervisor*, proj: ProjectInfo*, sc: Scene*) -> int32 {
+function editor_start_playtest(sv: PlaytestSupervisor*, proj: ProjectInfo*, sc: Scene*, gt: GameTreeState*) -> int32 {
   if (sv == 0 || proj == 0 || sc == 0) {
     return 0;
   }
@@ -62,7 +63,7 @@ function editor_start_playtest(sv: PlaytestSupervisor*, proj: ProjectInfo*, sc: 
   var server_log: uint8[1024];
   var client_log: uint8[1024];
 
-  fs_path_join_child((cstring)((int64)(&(play_dir[0]))), 1024, project_root_ptr(proj), cstr(".methplay"));
+  fs_path_join_child((cstring)((int64)(&(play_dir[0]))), 1024, project_root_ptr(proj), cstr(".mettleplay"));
   Win32_CreateDirectoryA((cstring)((int64)(&(play_dir[0]))), (cstring)0);
   fs_path_join_child((cstring)((int64)(&(manifest_path[0]))), 1024, (cstring)((int64)(&(play_dir[0]))), cstr("playtest.manifest"));
   fs_path_join_child((cstring)((int64)(&(scene_snapshot[0]))), 1024, (cstring)((int64)(&(play_dir[0]))), cstr("scene.mscene"));
@@ -70,18 +71,21 @@ function editor_start_playtest(sv: PlaytestSupervisor*, proj: ProjectInfo*, sc: 
   fs_path_join_child((cstring)((int64)(&(server_log[0]))), 1024, (cstring)((int64)(&(play_dir[0]))), cstr("server.log"));
   fs_path_join_child((cstring)((int64)(&(client_log[0]))), 1024, (cstring)((int64)(&(play_dir[0]))), cstr("client.log"));
 
-  if (scene_io_save((cstring)((int64)(&(scene_snapshot[0]))), sc) == 0) {
+  if (scene_io_save((cstring)((int64)(&(scene_snapshot[0]))), sc, project_root_ptr(proj)) == 0) {
     return 0;
   }
 
-  // Scan the project's convention folders (ServerScriptService /
-  // StarterPlayerScripts / ReplicatedStorage) and write services.msvc next to
-  // the scene snapshot. Without this the on-disk service scripts are never
-  // registered and the playtest server/client tick nothing.
-  var sm: ServiceModel* = service_model_create(1024);
-  if (sm != 0) {
-    service_io_build_from_project(sm, project_root_ptr(proj), (cstring)((int64)(&(services_snapshot[0]))));
-    service_model_destroy(sm);
+  // Write the editor's authoritative services model (the Game tree the user
+  // sees + edited, including newly-added scripts) to the playtest snapshot so
+  // the server/client load exactly what's on screen.
+  if (gt != 0) {
+    service_io_save((cstring)((int64)(&(services_snapshot[0]))), game_tree_model(gt));
+  } else {
+    var sm: ServiceModel* = service_model_create(1024);
+    if (sm != 0) {
+      service_io_build_from_project(sm, project_root_ptr(proj), (cstring)((int64)(&(services_snapshot[0]))));
+      service_model_destroy(sm);
+    }
   }
 
   var mani: PlayManifest* = play_manifest_create();
@@ -135,8 +139,10 @@ function main() -> int32 {
     explorer_destroy(es);
     return 3;
   }
-  asset_manager_set_project_root(am, project_root_ptr(proj));
-  var g: GameWin32* = game_win32_create(cstr("Meth Engine"), (int32)1360, (int32)720);
+  var asset_root_abs: uint8[1024];
+  project_resolve_assets_abs(proj, (cstring)((int64)(&(asset_root_abs[0]))), 1024);
+  asset_manager_set_project_root(am, (cstring)((int64)(&(asset_root_abs[0]))));
+  var g: GameWin32* = game_win32_create(cstr("Mettle Engine"), (int32)1360, (int32)720);
   if (g == 0) {
     asset_manager_destroy(am);
     project_destroy(proj);
@@ -244,7 +250,7 @@ function main() -> int32 {
   var scene_abs: uint8[1024];
   project_resolve_scene_abs(proj, (cstring)((int64)(&(scene_abs[0]))), 1024);
   editor_ui_set_scene_path(ui, (cstring)((int64)(&(scene_abs[0]))));
-  var loaded_scene: int32 = scene_io_load(editor_ui_default_scene_path(ui, es), sc, meshes);
+  var loaded_scene: int32 = scene_io_load(editor_ui_default_scene_path(ui, es), sc, meshes, project_root_ptr(proj));
   if (loaded_scene == 0) {
     scene_seed_default(sc);
   }
@@ -254,6 +260,30 @@ function main() -> int32 {
   if (loaded_scene != 0) {
     engine_viewport_frame_selection(vp, sc);
   }
+
+  // Game / Services tree + overlay code editor. The authoritative services
+  // file lives at <project>/services.msvc; the playtest snapshot
+  // (.mettleplay/services.msvc) is written from this model at F5 time.
+  var gt: GameTreeState* = game_tree_create(project_root_ptr(proj));
+  if (gt == 0) {
+    playtest_supervisor_destroy(play_sv);
+    lua_registry_destroy(lua_reg);
+    runtime_destroy(rt);
+    input_map_destroy(input);
+    scene_destroy(sc);
+    mesh_store_destroy(meshes);
+    asset_manager_destroy(am);
+    editor_ui_destroy(ui);
+    engine_viewport_destroy(vp);
+    explorer_destroy(es);
+    project_destroy(proj);
+    game_win32_destroy(g);
+    return 14;
+  }
+  var svc_abs: uint8[1024];
+  fs_path_join_child((cstring)((int64)(&(svc_abs[0]))), 1024, project_root_ptr(proj), cstr("services.msvc"));
+  game_tree_set_paths(gt, project_root_ptr(proj), (cstring)((int64)(&(svc_abs[0]))));
+  var code_editor_was_open: int32 = 0;
 
   // Vulkan 3D viewport: a child window over the viewport rect, GPU-rendered.
   // If any step fails, vk_on stays 0 and the editor falls back to the CPU
@@ -297,7 +327,7 @@ function main() -> int32 {
       if (playtest_is_active(play_sv) != 0) {
         playtest_stop(play_sv);
       } else {
-        editor_start_playtest(play_sv, proj, sc);
+        editor_start_playtest(play_sv, proj, sc, gt);
       }
       dirty = 1;
     }
@@ -307,16 +337,20 @@ function main() -> int32 {
     if (game_win32_consume_resized(g) != 0) {
       dirty = 1;
     }
+    game_tree_rebuild_rows(gt, sc);
+    var code_editor_open: int32 = game_tree_editor_open(gt);
     if (frame > 2) {
       if (editor_active != 0) {
-        if (editor_ui_input_tick(ui, g, proj, es, am, sc, meshes, vp, lua_reg) != 0) {
+        if (editor_ui_input_tick(ui, g, proj, es, am, sc, meshes, vp, lua_reg, gt) != 0) {
           dirty = 1;
         }
-        if (editor_ui_keyboard_captured(ui) == 0) {
+        // While the modal code editor is open it owns input; the tree nav and
+        // viewport fly-camera must not also run.
+        if (code_editor_open == 0 && editor_ui_keyboard_captured(ui) == 0) {
           if (editor_ui_project_files_focused(ui) != 0) {
-            explorer_input_tick(es);
-          } else {
-            explorer_reset_key_repeat(es);
+            if (game_tree_input(gt) != 0) {
+              dirty = 1;
+            }
           }
           if (engine_viewport_input_tick(vp, sc, meshes, g, ed_vp_x(g), ed_vp_y(g), ed_vp_w(g), ed_vp_h(g)) != 0) {
             dirty = 1;
@@ -324,7 +358,6 @@ function main() -> int32 {
         }
       } else {
         editor_ui_reset_input_edges(ui);
-        explorer_reset_key_repeat(es);
         engine_viewport_reset_input_edges(vp);
       }
     }
@@ -348,13 +381,25 @@ function main() -> int32 {
       dirty = 1;
     }
     if (dirty != 0) {
-      engine_editor_present(g, ui, proj, es, am, vp, sc, frame, vk_on, playtest_is_active(play_sv));
+      engine_editor_present(g, ui, proj, es, am, vp, sc, gt, frame, vk_on, playtest_is_active(play_sv));
       dirty = 0;
     }
     // Vulkan 3D viewport: track the child to the (possibly resized) viewport
     // rect, then build + present the scene on the GPU. The child window covers
     // the CPU viewport region, so the GDI panels/text around it stay visible.
-    if (vk_on != 0 && frame > 2) {
+    // While the modal code editor is open, hide the child so the GDI overlay
+    // (drawn into the DIB) is visible instead of the GPU surface.
+    if (code_editor_open != 0) {
+      game_win32_hide_child(g);
+      code_editor_was_open = 1;
+    } else {
+      if (code_editor_was_open != 0) {
+        game_win32_show_child(g);
+        code_editor_was_open = 0;
+        dirty = 1;
+      }
+    }
+    if (vk_on != 0 && frame > 2 && code_editor_open == 0) {
       var vw: int32 = ed_vp_w(g);
       var vh: int32 = ed_vp_h(g);
       var resized: int32 = game_win32_move_child(g, ed_vp_x(g), ed_vp_y(g), vw, vh);
@@ -379,7 +424,9 @@ function main() -> int32 {
     game_win32_destroy_child(g);
   }
   playtest_supervisor_destroy(play_sv);
-  scene_io_save(editor_ui_default_scene_path(ui, es), sc);
+  scene_io_save(editor_ui_default_scene_path(ui, es), sc, project_root_ptr(proj));
+  game_tree_save(gt);
+  game_tree_destroy(gt);
   lua_registry_destroy(lua_reg);
   output_log_destroy();
   runtime_destroy(rt);

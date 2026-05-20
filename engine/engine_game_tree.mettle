@@ -1,0 +1,2252 @@
+// Game / Services explorer + overlay code editor for the editor.
+//
+// Replaces the raw filesystem "Project Files" panel with a Roblox-style game
+// tree: three service containers (ServerScriptService / ReplicatedStorage /
+// StarterPlayerScripts) whose children are ServiceScriptRecords, plus a
+// Workspace node that lists scene entities (read-only here; the inspector
+// owns entity editing). Selecting a script and pressing Enter (or double-
+// clicking) opens a modal overlay code editor that edits the .lua on disk.
+//
+// The editor's main() owns one GameTreeState*. It wraps a persistent
+// ServiceModel* (so it survives across playtests and is what services.msvc is
+// written from). Persistence reuses engine_services_io.
+import "engine_fs_win32";
+import "engine_scene";
+import "engine_services";
+import "engine_services_io";
+import "game_gdi_win32";
+import "std/conv";
+import "std/io";
+import "std/mem";
+
+extern function Win32_CreateDirectoryA(path: cstring, security_attributes: cstring) -> int32 = "CreateDirectoryA";
+
+// ---- Code editor ----------------------------------------------------------
+
+export function GT_CODE_CAP() -> int32 { return 65536; }
+export function GT_PATH_CAP() -> int32 { return 1024; }
+
+// Compact undo/redo history. Instead of snapshotting the whole 64 KB buffer
+// per keystroke we store inverse-able diffs: each record says "an insert of
+// `len` bytes happened at `pos`" (kind 1) or "a delete of `len` bytes whose
+// content is in the arena at `data_off` happened at `pos`" (kind 2). Both
+// kinds stash the affected bytes in the arena so undo AND redo can replay
+// exactly. `count` records exist; `cursor` is the redo boundary — records
+// [0,cursor) are undoable, [cursor,count) redoable. A new edit truncates the
+// redo tail. Consecutive single-char inserts coalesce so one Ctrl+Z removes a
+// word, not a letter. Declared before CodeEditor because it references it.
+
+export struct UndoRec {
+  kind: int32;       // 1=insert, 2=delete
+  pos: int32;        // buffer offset the op acted at
+  len: int32;        // bytes inserted/deleted
+  data_off: int32;   // offset into arena of the affected bytes
+  caret_before: int32;
+  coalesce: int32;   // 1 if further single inserts may merge into this rec
+}
+
+export struct UndoLog {
+  recs: UndoRec*;
+  arena: uint8*;
+  rec_cap: int32;
+  count: int32;
+  cursor: int32;
+  arena_cap: int32;
+  arena_used: int32;
+}
+
+export struct CodeEditor {
+  buf: uint8[65536];
+  path: uint8[1024];
+  title: uint8[128];
+  length: int32;       // bytes used in buf (not counting NUL)
+  caret: int32;        // byte offset of the caret in buf
+  scroll_line: int32;  // first visible line
+  open: int32;         // 1 = modal overlay active
+  dirty: int32;        // unsaved edits
+  esc_armed: int32;    // first Esc on a dirty buffer warns; second closes
+  blink: int32;        // caret blink counter
+  // Layout cached by game_tree_render_editor each frame so click-to-position
+  // can map a screen pixel back to a buffer offset without recomputing the
+  // overlay geometry (single source of truth: the renderer).
+  view_text_x: int32;  // pixel x of column 0 of the text
+  view_top: int32;     // pixel y of the first visible text row
+  view_line_h: int32;  // row height in px
+  view_char_w: int32;  // monospace glyph width in px
+  view_rows: int32;    // visible text rows
+  // Selection: a byte range [min(sel_anchor,caret), max(...)). sel_active==0
+  // means no selection (anchor ignored). The caret is always the moving end.
+  sel_anchor: int32;
+  sel_active: int32;
+  dragging: int32;     // a left-drag is in progress (mouse still down)
+  undo: UndoLog*;      // separate heap block; see UndoLog
+  // 1 = next render should auto-scroll to keep the caret visible. Set by
+  // caret-moving paths (arrows, typing, click, paste); cleared by the
+  // renderer once it has snapped scroll_line. Mouse-wheel scroll deliberately
+  // does NOT set it, so wheel scrolling holds even when the caret is off
+  // screen — which is what every code editor does.
+  scroll_follow_caret: int32;
+}
+
+// ---- Game tree ------------------------------------------------------------
+//
+// Visible rows are computed each frame into a flat list so navigation and
+// hit-testing are index-based (mirrors the explorer). A row is either a
+// service header (collapsible) or a script leaf or a workspace entity leaf.
+
+export function GT_ROW_HEADER() -> int32 { return 1; }
+export function GT_ROW_SCRIPT() -> int32 { return 2; }
+export function GT_ROW_ENTITY() -> int32 { return 3; }
+
+export struct GtRow {
+  kind: int32;        // GT_ROW_*
+  service_id: int32;  // for headers / scripts
+  ref_id: int32;      // script record id, or entity id, or 0
+  depth: int32;
+  label: uint8[96];
+}
+
+export struct GameTreeState {
+  sm: ServiceModel*;
+  project_root: uint8[1024];
+  svc_path: uint8[1024];   // where services.msvc lives (set by editor)
+  rows: GtRow*;
+  row_cap: int32;
+  row_count: int32;
+  selection: int32;
+  scroll: int32;
+  // collapse flags, indexed by the four service ids 1..5 (Workspace=1 reuses
+  // SVC_WORKSPACE; we only collapse the three script services + workspace).
+  collapse_ws: int32;
+  collapse_sss: int32;
+  collapse_rs: int32;
+  collapse_sps: int32;
+  ed: CodeEditor*;
+  key_nav_rep: int32;
+  last_click_row: int32;
+  last_click_frame: int32;
+  // Right-click context menu. menu_open!=0 makes the tree modal-ish: the menu
+  // is drawn over the panel and the next left click either hits an item or
+  // dismisses it. menu_target_service / menu_target_row capture what was
+  // right-clicked so the chosen action knows where to act.
+  menu_open: int32;
+  menu_x: int32;
+  menu_y: int32;
+  menu_target_service: int32;
+  menu_target_row: int32;
+  menu_target_kind: int32;
+  menu_item_count: int32;
+  key_prev: uint8[256];
+  // Per-vkey hold tick counter for key-repeat in the script editor. 0 = not
+  // held (or just released). Bumped each frame the key is down; the
+  // gt_key_repeat helper fires on edge (count==1) and again past an initial
+  // delay at a steady cadence. uint8 caps at 255 ticks (~4s at 60Hz), which
+  // saturates well past the repeat threshold — we just stop bumping.
+  key_hold: uint8[256];
+}
+
+// Context-menu action ids. Returned by game_tree_menu_item_action so the
+// caller (or the tree itself) can dispatch; kept stable for hit-testing.
+export function GT_MENU_NONE() -> int32 { return 0; }
+export function GT_MENU_INSERT_SCRIPT() -> int32 { return 1; }
+export function GT_MENU_INSERT_MODULE() -> int32 { return 2; }
+export function GT_MENU_INSERT_PART_CUBE() -> int32 { return 3; }
+export function GT_MENU_INSERT_PART_BOX() -> int32 { return 4; }
+export function GT_MENU_INSERT_TERRAIN() -> int32 { return 5; }
+export function GT_MENU_OPEN() -> int32 { return 6; }
+export function GT_MENU_DELETE() -> int32 { return 7; }
+
+export function gt_row_bytes() -> int64 { return (int64)112; }
+
+export function gt_state_bytes() -> int64 { return (int64)8192; }
+
+export function game_tree_create(project_root: cstring) -> GameTreeState* {
+  var raw: cstring = calloc((int64)1, gt_state_bytes());
+  if (raw == 0) {
+    return (GameTreeState*)0;
+  }
+  var gt: GameTreeState* = (GameTreeState*)raw;
+  gt->sm = service_model_create(1024);
+  if (gt->sm == 0) {
+    free(raw);
+    return (GameTreeState*)0;
+  }
+  gt->row_cap = 1024;
+  var blob: cstring = calloc(gt_row_bytes(), (int64)gt->row_cap);
+  if (blob == 0) {
+    service_model_destroy(gt->sm);
+    free(raw);
+    return (GameTreeState*)0;
+  }
+  gt->rows = (GtRow*)blob;
+  var edraw: cstring = calloc((int64)1, (int64)67200);
+  if (edraw == 0) {
+    free(blob);
+    service_model_destroy(gt->sm);
+    free(raw);
+    return (GameTreeState*)0;
+  }
+  gt->ed = (CodeEditor*)edraw;
+  // Undo log: separate heap block (the editor struct has no room). Records +
+  // a byte arena for deleted-text payloads.
+  var ulraw: cstring = calloc((int64)1, (int64)64);
+  if (ulraw == 0) {
+    free(edraw);
+    free(blob);
+    service_model_destroy(gt->sm);
+    free(raw);
+    return (GameTreeState*)0;
+  }
+  var ul: UndoLog* = (UndoLog*)ulraw;
+  ul->rec_cap = 2048;
+  var recblob: cstring = calloc((int64)24, (int64)ul->rec_cap);
+  if (recblob == 0) {
+    free(ulraw);
+    free(edraw);
+    free(blob);
+    service_model_destroy(gt->sm);
+    free(raw);
+    return (GameTreeState*)0;
+  }
+  ul->recs = (UndoRec*)recblob;
+  ul->arena_cap = 262144;
+  var arblob: cstring = calloc((int64)1, (int64)ul->arena_cap);
+  if (arblob == 0) {
+    free(recblob);
+    free(ulraw);
+    free(edraw);
+    free(blob);
+    service_model_destroy(gt->sm);
+    free(raw);
+    return (GameTreeState*)0;
+  }
+  ul->arena = (uint8*)arblob;
+  gt->ed->undo = ul;
+  gt_copy_cstr((cstring)((int64)(&(gt->project_root[0]))), GT_PATH_CAP(), project_root);
+  return gt;
+}
+
+export function game_tree_destroy(gt: GameTreeState*) {
+  if (gt == 0) {
+    return;
+  }
+  if (gt->ed != 0) {
+    if (gt->ed->undo != 0) {
+      if (gt->ed->undo->arena != 0) {
+        free((cstring)gt->ed->undo->arena);
+      }
+      if (gt->ed->undo->recs != 0) {
+        free((cstring)gt->ed->undo->recs);
+      }
+      free((cstring)gt->ed->undo);
+    }
+    free((cstring)gt->ed);
+  }
+  if (gt->rows != 0) {
+    free((cstring)gt->rows);
+  }
+  if (gt->sm != 0) {
+    service_model_destroy(gt->sm);
+  }
+  free((cstring)gt);
+}
+
+export function game_tree_model(gt: GameTreeState*) -> ServiceModel* {
+  if (gt == 0) {
+    return (ServiceModel*)0;
+  }
+  return gt->sm;
+}
+
+export function gt_copy_cstr(dst: cstring, cap: int32, src: cstring) {
+  if (dst == 0 || cap <= 0) {
+    return;
+  }
+  if (src == 0) {
+    dst[0] = 0;
+    return;
+  }
+  var i: int32 = 0;
+  while (i + 1 < cap) {
+    var b: uint8 = (uint8)(src[i]);
+    dst[i] = b;
+    if (b == (uint8)0) {
+      return;
+    }
+    i = i + 1;
+  }
+  dst[cap - 1] = 0;
+}
+
+export function gt_set_label(dst: cstring, cap: int32, src: cstring) {
+  gt_copy_cstr(dst, cap, src);
+}
+
+// Set the services.msvc path and (re)load it. Called by the editor once it
+// knows the project's scene path. Scans the project folders if the file is
+// absent so a fresh project still shows its on-disk scripts.
+export function game_tree_set_paths(gt: GameTreeState*, project_root: cstring, svc_path: cstring) {
+  if (gt == 0) {
+    return;
+  }
+  gt_copy_cstr((cstring)((int64)(&(gt->project_root[0]))), GT_PATH_CAP(), project_root);
+  gt_copy_cstr((cstring)((int64)(&(gt->svc_path[0]))), GT_PATH_CAP(), svc_path);
+  if (svc_path != 0 && (uint8)(svc_path[0]) != (uint8)0) {
+    if (service_io_load(svc_path, gt->sm) == 0 || gt->sm->script_count == 0) {
+      // No saved services yet — derive from the convention folders.
+      service_io_build_from_project(gt->sm, project_root, svc_path);
+    }
+  } else {
+    service_io_build_from_project(gt->sm, project_root, (cstring)0);
+  }
+}
+
+export function game_tree_save(gt: GameTreeState*) -> int32 {
+  if (gt == 0 || gt->sm == 0) {
+    return 0;
+  }
+  if ((uint8)(gt->svc_path[0]) == (uint8)0) {
+    return 0;
+  }
+  return service_io_save((cstring)((int64)(&(gt->svc_path[0]))), gt->sm);
+}
+
+export function gt_row_ptr(gt: GameTreeState*, i: int32) -> GtRow* {
+  if (gt == 0 || i < 0 || i >= gt->row_cap) {
+    return (GtRow*)0;
+  }
+  var off: int64 = (int64)i * gt_row_bytes();
+  return (GtRow*)((cstring)((int64)gt->rows + off));
+}
+
+export function gt_push_row(gt: GameTreeState*, kind: int32, service_id: int32, ref_id: int32, depth: int32, label: cstring) {
+  if (gt->row_count >= gt->row_cap) {
+    return;
+  }
+  var r: GtRow* = gt_row_ptr(gt, gt->row_count);
+  if (r == 0) {
+    return;
+  }
+  r->kind = kind;
+  r->service_id = service_id;
+  r->ref_id = ref_id;
+  r->depth = depth;
+  gt_set_label((cstring)((int64)(&(r->label[0]))), 96, label);
+  gt->row_count = gt->row_count + 1;
+}
+
+export function gt_service_collapsed(gt: GameTreeState*, service_id: int32) -> int32 {
+  if (service_id == SVC_WORKSPACE()) { return gt->collapse_ws; }
+  if (service_id == SVC_SERVER_SCRIPT_SERVICE()) { return gt->collapse_sss; }
+  if (service_id == SVC_REPLICATED_STORAGE()) { return gt->collapse_rs; }
+  if (service_id == SVC_STARTER_PLAYER_SCRIPTS()) { return gt->collapse_sps; }
+  return 0;
+}
+
+export function gt_service_toggle(gt: GameTreeState*, service_id: int32) {
+  if (service_id == SVC_WORKSPACE()) { gt->collapse_ws = 1 - gt->collapse_ws; return; }
+  if (service_id == SVC_SERVER_SCRIPT_SERVICE()) { gt->collapse_sss = 1 - gt->collapse_sss; return; }
+  if (service_id == SVC_REPLICATED_STORAGE()) { gt->collapse_rs = 1 - gt->collapse_rs; return; }
+  if (service_id == SVC_STARTER_PLAYER_SCRIPTS()) { gt->collapse_sps = 1 - gt->collapse_sps; return; }
+}
+
+export function gt_emit_service(gt: GameTreeState*, sc: Scene*, service_id: int32, label: cstring) {
+  gt_push_row(gt, GT_ROW_HEADER(), service_id, 0, 0, label);
+  if (gt_service_collapsed(gt, service_id) != 0) {
+    return;
+  }
+  if (service_id == SVC_WORKSPACE()) {
+    if (sc != 0) {
+      var n: int32 = scene_count(sc);
+      var i: int32 = 0;
+      while (i < n) {
+        var e: Entity* = scene_row(sc, i);
+        if (e != 0) {
+          gt_push_row(gt, GT_ROW_ENTITY(), service_id, e->id, 1, scene_entity_name(e));
+        }
+        i = i + 1;
+      }
+    }
+    return;
+  }
+  if (gt->sm != 0) {
+    var k: int32 = 0;
+    while (k < gt->sm->script_count) {
+      var rec: ServiceScriptRecord* = service_script_record_ptr(gt->sm, k);
+      if (rec != 0 && rec->service_id == service_id) {
+        gt_push_row(gt, GT_ROW_SCRIPT(), service_id, rec->id, 1, (cstring)((int64)(&(rec->name[0]))));
+      }
+      k = k + 1;
+    }
+  }
+}
+
+// Rebuild the flat visible-row list. Called every frame before render/input.
+export function game_tree_rebuild_rows(gt: GameTreeState*, sc: Scene*) {
+  if (gt == 0) {
+    return;
+  }
+  if (gt->last_click_frame > 0) {
+    gt->last_click_frame = gt->last_click_frame - 1;
+  }
+  gt->row_count = 0;
+  gt_emit_service(gt, sc, SVC_WORKSPACE(), cstr("Workspace"));
+  gt_emit_service(gt, sc, SVC_SERVER_SCRIPT_SERVICE(), cstr("ServerScriptService"));
+  gt_emit_service(gt, sc, SVC_REPLICATED_STORAGE(), cstr("ReplicatedStorage"));
+  gt_emit_service(gt, sc, SVC_STARTER_PLAYER_SCRIPTS(), cstr("StarterPlayerScripts"));
+  if (gt->selection >= gt->row_count) {
+    gt->selection = gt->row_count - 1;
+  }
+  if (gt->selection < 0) {
+    gt->selection = 0;
+  }
+}
+
+export function game_tree_row_count(gt: GameTreeState*) -> int32 {
+  if (gt == 0) { return 0; }
+  return gt->row_count;
+}
+
+export function game_tree_editor_open(gt: GameTreeState*) -> int32 {
+  if (gt == 0 || gt->ed == 0) { return 0; }
+  return gt->ed->open;
+}
+
+// ---- Undo / redo ----------------------------------------------------------
+
+export function gt_undo_reset(ed: CodeEditor*) {
+  if (ed == 0 || ed->undo == 0) {
+    return;
+  }
+  ed->undo->count = 0;
+  ed->undo->cursor = 0;
+  ed->undo->arena_used = 0;
+}
+
+function gt_undo_rec(ed: CodeEditor*, i: int32) -> UndoRec* {
+  var base: UndoRec* = ed->undo->recs;
+  return (UndoRec*)((cstring)((int64)base + (int64)i * (int64)24));
+}
+
+// Drop the redo tail (records at/after cursor) and any arena bytes they owned.
+function gt_undo_truncate(ed: CodeEditor*) {
+  var ul: UndoLog* = ed->undo;
+  if (ul->cursor < ul->count) {
+    // Recompute arena_used as the high-water of surviving delete records.
+    var au: int32 = 0;
+    var i: int32 = 0;
+    while (i < ul->cursor) {
+      var r: UndoRec* = gt_undo_rec(ed, i);
+      if (r->kind == 2) {
+        var end: int32 = r->data_off + r->len;
+        if (end > au) {
+          au = end;
+        }
+      }
+      i = i + 1;
+    }
+    ul->arena_used = au;
+  }
+  ul->count = ul->cursor;
+}
+
+// Stash `len` bytes from buf[pos..) into the arena, returning the offset, or
+// -1 if it won't fit. Used so both insert and delete records can be replayed
+// (redo of an insert needs the original text).
+function gt_undo_stash(ed: CodeEditor*, pos: int32, len: int32) -> int32 {
+  var ul: UndoLog* = ed->undo;
+  if (ul->arena_used + len > ul->arena_cap) {
+    return -1;
+  }
+  var off: int32 = ul->arena_used;
+  var i: int32 = 0;
+  while (i < len) {
+    ul->arena[off + i] = (uint8)(ed->buf[pos + i]);
+    i = i + 1;
+  }
+  ul->arena_used = ul->arena_used + len;
+  return off;
+}
+
+// Record that `len` bytes were just inserted at `pos` (call AFTER the insert,
+// so buf[pos..pos+len) holds the new text). Consecutive single inserts that
+// are contiguous coalesce into the previous record so typing a word is one
+// undo step.
+function gt_undo_push_insert(ed: CodeEditor*, pos: int32, len: int32, caret_before: int32) {
+  if (ed == 0 || ed->undo == 0 || len <= 0) {
+    return;
+  }
+  var ul: UndoLog* = ed->undo;
+  gt_undo_truncate(ed);
+  if (len == 1 && ul->count > 0) {
+    var prev: UndoRec* = gt_undo_rec(ed, ul->count - 1);
+    if (prev->kind == 1 && prev->coalesce != 0 && prev->pos + prev->len == pos) {
+      // Extend the previous insert record + append the byte to its stash so
+      // redo still has the exact text.
+      if (ul->arena_used + 1 <= ul->arena_cap) {
+        ul->arena[prev->data_off + prev->len] = (uint8)(ed->buf[pos]);
+        ul->arena_used = ul->arena_used + 1;
+        prev->len = prev->len + 1;
+        ul->cursor = ul->count;
+        return;
+      }
+    }
+  }
+  if (ul->count >= ul->rec_cap) {
+    gt_undo_reset(ed);
+  }
+  var off: int32 = gt_undo_stash(ed, pos, len);
+  if (off < 0) {
+    gt_undo_reset(ed);
+    return;
+  }
+  var rec: UndoRec* = gt_undo_rec(ed, ul->count);
+  rec->kind = 1;
+  rec->pos = pos;
+  rec->len = len;
+  rec->data_off = off;
+  rec->caret_before = caret_before;
+  rec->coalesce = 0;
+  if (len == 1) {
+    rec->coalesce = 1;
+  }
+  ul->count = ul->count + 1;
+  ul->cursor = ul->count;
+}
+
+// Record that `len` bytes (copied from src) were just deleted at `pos`.
+function gt_undo_push_delete(ed: CodeEditor*, pos: int32, src: cstring, len: int32, caret_before: int32) {
+  if (ed == 0 || ed->undo == 0 || len <= 0) {
+    return;
+  }
+  var ul: UndoLog* = ed->undo;
+  gt_undo_truncate(ed);
+  if (ul->arena_used + len > ul->arena_cap) {
+    // Out of arena room: reset history rather than corrupt it. Acceptable —
+    // very large delete histories are not the common case.
+    gt_undo_reset(ed);
+  }
+  if (ul->count >= ul->rec_cap) {
+    return;
+  }
+  var off: int32 = ul->arena_used;
+  var i: int32 = 0;
+  while (i < len) {
+    ul->arena[off + i] = (uint8)(src[i]);
+    i = i + 1;
+  }
+  ul->arena_used = ul->arena_used + len;
+  var rec: UndoRec* = gt_undo_rec(ed, ul->count);
+  rec->kind = 2;
+  rec->pos = pos;
+  rec->len = len;
+  rec->data_off = off;
+  rec->caret_before = caret_before;
+  rec->coalesce = 0;
+  ul->count = ul->count + 1;
+  ul->cursor = ul->count;
+}
+
+// Raw buffer splice helpers used by undo/redo apply (no history recording, no
+// selection side effects).
+function gt_buf_delete_raw(ed: CodeEditor*, pos: int32, len: int32) {
+  var i: int32 = pos;
+  while (i + len < ed->length) {
+    ed->buf[i] = ed->buf[i + len];
+    i = i + 1;
+  }
+  ed->length = ed->length - len;
+  ed->buf[ed->length] = 0;
+}
+
+function gt_buf_insert_raw(ed: CodeEditor*, pos: int32, src: uint8*, len: int32) {
+  if (ed->length + len >= GT_CODE_CAP() - 1) {
+    return;
+  }
+  var i: int32 = ed->length - 1;
+  while (i >= pos) {
+    ed->buf[i + len] = ed->buf[i];
+    i = i - 1;
+  }
+  var k: int32 = 0;
+  while (k < len) {
+    ed->buf[pos + k] = src[k];
+    k = k + 1;
+  }
+  ed->length = ed->length + len;
+  ed->buf[ed->length] = 0;
+}
+
+export function gt_editor_undo(ed: CodeEditor*) -> int32 {
+  if (ed == 0 || ed->undo == 0 || ed->undo->cursor <= 0) {
+    return 0;
+  }
+  var ul: UndoLog* = ed->undo;
+  ul->cursor = ul->cursor - 1;
+  var rec: UndoRec* = gt_undo_rec(ed, ul->cursor);
+  if (rec->kind == 1) {
+    // It was an insert -> undo by deleting those bytes.
+    gt_buf_delete_raw(ed, rec->pos, rec->len);
+    ed->caret = rec->pos;
+  } else {
+    // It was a delete -> undo by reinserting the saved bytes.
+    gt_buf_insert_raw(ed, rec->pos, (uint8*)((int64)ul->arena + (int64)rec->data_off), rec->len);
+    ed->caret = rec->pos + rec->len;
+  }
+  ed->sel_active = 0;
+  ed->dirty = 1;
+  ed->blink = 0;
+  return 1;
+}
+
+export function gt_editor_redo(ed: CodeEditor*) -> int32 {
+  if (ed == 0 || ed->undo == 0 || ed->undo->cursor >= ed->undo->count) {
+    return 0;
+  }
+  var ul: UndoLog* = ed->undo;
+  var rec: UndoRec* = gt_undo_rec(ed, ul->cursor);
+  ul->cursor = ul->cursor + 1;
+  if (rec->kind == 1) {
+    // Redo an insert: reinsert the stashed text.
+    gt_buf_insert_raw(ed, rec->pos, (uint8*)((int64)ul->arena + (int64)rec->data_off), rec->len);
+    ed->caret = rec->pos + rec->len;
+  } else {
+    // Redo a delete: remove the bytes again.
+    gt_buf_delete_raw(ed, rec->pos, rec->len);
+    ed->caret = rec->pos;
+  }
+  ed->sel_active = 0;
+  ed->dirty = 1;
+  ed->blink = 0;
+  return 1;
+}
+
+// ---- Code editor: file I/O ------------------------------------------------
+
+export function gt_editor_load_file(ed: CodeEditor*, path: cstring, title: cstring) -> int32 {
+  if (ed == 0 || path == 0) {
+    return 0;
+  }
+  ed->length = 0;
+  ed->caret = 0;
+  ed->scroll_line = 0;
+  ed->dirty = 0;
+  ed->esc_armed = 0;
+  ed->sel_active = 0;
+  ed->scroll_follow_caret = 1;
+  gt_undo_reset(ed);
+  // Drop any keystrokes typed before the editor opened (tree-nav keys, the
+  // Enter that triggered the open, etc.) so they don't replay into the buffer.
+  game_win32_flush_chars();
+  gt_copy_cstr((cstring)((int64)(&(ed->path[0]))), GT_PATH_CAP(), path);
+  gt_copy_cstr((cstring)((int64)(&(ed->title[0]))), 128, title);
+  var fp: cstring = fopen(path, cstr("rb"));
+  if (fp == 0) {
+    // New / unreadable file: start empty but still open the editor.
+    ed->buf[0] = 0;
+    ed->open = 1;
+    return 1;
+  }
+  var cap: int32 = GT_CODE_CAP() - 1;
+  var n: int64 = fread((cstring)((int64)(&(ed->buf[0]))), (int64)1, (int64)cap, fp);
+  fclose(fp);
+  if (n < 0) {
+    n = 0;
+  }
+  ed->length = (int32)n;
+  ed->buf[ed->length] = 0;
+  ed->open = 1;
+  return 1;
+}
+
+export function gt_editor_save(ed: CodeEditor*) -> int32 {
+  if (ed == 0) {
+    return 0;
+  }
+  if ((uint8)(ed->path[0]) == (uint8)0) {
+    return 0;
+  }
+  var fp: cstring = fopen((cstring)((int64)(&(ed->path[0]))), cstr("wb"));
+  if (fp == 0) {
+    return 0;
+  }
+  if (ed->length > 0) {
+    fwrite((cstring)((int64)(&(ed->buf[0]))), (int64)1, (int64)ed->length, fp);
+  }
+  fclose(fp);
+  ed->dirty = 0;
+  ed->esc_armed = 0;
+  return 1;
+}
+
+// ---- Code editor: buffer edits --------------------------------------------
+
+// Selection range accessors. Valid only when sel_active != 0; the range is
+// [lo, hi) with the caret at one end and sel_anchor at the other.
+export function gt_sel_has(ed: CodeEditor*) -> int32 {
+  if (ed == 0 || ed->sel_active == 0) {
+    return 0;
+  }
+  if (ed->sel_anchor == ed->caret) {
+    return 0;
+  }
+  return 1;
+}
+
+export function gt_sel_lo(ed: CodeEditor*) -> int32 {
+  if (ed->sel_anchor < ed->caret) {
+    return ed->sel_anchor;
+  }
+  return ed->caret;
+}
+
+export function gt_sel_hi(ed: CodeEditor*) -> int32 {
+  if (ed->sel_anchor > ed->caret) {
+    return ed->sel_anchor;
+  }
+  return ed->caret;
+}
+
+export function gt_sel_clear(ed: CodeEditor*) {
+  if (ed != 0) {
+    ed->sel_active = 0;
+  }
+}
+
+// Delete the selected range, leaving the caret at its start. No-op if no
+// selection. Returns 1 if anything was removed.
+export function gt_editor_delete_selection(ed: CodeEditor*) -> int32 {
+  if (gt_sel_has(ed) == 0) {
+    ed->sel_active = 0;
+    return 0;
+  }
+  var lo: int32 = gt_sel_lo(ed);
+  var hi: int32 = gt_sel_hi(ed);
+  var n: int32 = hi - lo;
+  gt_undo_push_delete(ed, lo, (cstring)((int64)(&(ed->buf[lo]))), n, ed->caret);
+  var i: int32 = lo;
+  while (i + n < ed->length) {
+    ed->buf[i] = ed->buf[i + n];
+    i = i + 1;
+  }
+  ed->length = ed->length - n;
+  ed->caret = lo;
+  ed->buf[ed->length] = 0;
+  ed->sel_active = 0;
+  ed->dirty = 1;
+  ed->esc_armed = 0;
+  return 1;
+}
+
+// Copy the current selection to the Win32 clipboard as CF_TEXT. No-op
+// (returns 0) if nothing is selected. Caller is responsible for follow-up
+// behavior (Ctrl+X deletes the selection on success).
+export function gt_editor_clipboard_copy(ed: CodeEditor*) -> int32 {
+  if (ed == 0 || gt_sel_has(ed) == 0) {
+    return 0;
+  }
+  var lo: int32 = gt_sel_lo(ed);
+  var hi: int32 = gt_sel_hi(ed);
+  var n: int32 = hi - lo;
+  if (n <= 0) {
+    return 0;
+  }
+  // GHND = GMEM_MOVEABLE | GMEM_ZEROINIT = 0x42. Clipboard wants moveable
+  // memory it can own; +1 byte for the trailing NUL.
+  var mem: int64 = Win32_GlobalAlloc((uint32)66, (int64)(n + 1));
+  if (mem == 0) {
+    return 0;
+  }
+  var dst: cstring = Win32_GlobalLock(mem);
+  if (dst == 0) {
+    Win32_GlobalFree(mem);
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < n) {
+    dst[i] = ed->buf[lo + i];
+    i = i + 1;
+  }
+  dst[n] = 0;
+  Win32_GlobalUnlock(mem);
+  if (Win32_OpenClipboard((int64)0) == 0) {
+    Win32_GlobalFree(mem);
+    return 0;
+  }
+  Win32_EmptyClipboard();
+  // CF_TEXT = 1. On success the clipboard owns mem; do NOT free it.
+  if (Win32_SetClipboardData((uint32)1, mem) == 0) {
+    Win32_GlobalFree(mem);
+    Win32_CloseClipboard();
+    return 0;
+  }
+  Win32_CloseClipboard();
+  return 1;
+}
+
+// Insert clipboard text at the caret (replacing any selection). Strips CRs so
+// pasted Windows line endings normalise to LF, matching the editor's buffer.
+// Returns 1 on success.
+export function gt_editor_clipboard_paste(ed: CodeEditor*) -> int32 {
+  if (ed == 0) {
+    return 0;
+  }
+  if (Win32_IsClipboardFormatAvailable((uint32)1) == 0) {
+    return 0;
+  }
+  if (Win32_OpenClipboard((int64)0) == 0) {
+    return 0;
+  }
+  var mem: int64 = Win32_GetClipboardData((uint32)1);
+  if (mem == 0) {
+    Win32_CloseClipboard();
+    return 0;
+  }
+  var src: cstring = Win32_GlobalLock(mem);
+  if (src == 0) {
+    Win32_CloseClipboard();
+    return 0;
+  }
+  if (gt_sel_has(ed) != 0) {
+    gt_editor_delete_selection(ed);
+  }
+  var i: int32 = 0;
+  while ((uint8)(src[i]) != (uint8)0) {
+    var b: uint8 = (uint8)(src[i]);
+    if (b != (uint8)13) {
+      gt_editor_insert(ed, b);
+    }
+    i = i + 1;
+  }
+  Win32_GlobalUnlock(mem);
+  Win32_CloseClipboard();
+  return 1;
+}
+
+export function gt_editor_insert(ed: CodeEditor*, ch: uint8) {
+  if (ed == 0) {
+    return;
+  }
+  // Typing over a selection replaces it.
+  if (gt_sel_has(ed) != 0) {
+    gt_editor_delete_selection(ed);
+  }
+  ed->sel_active = 0;
+  if (ed->length + 1 >= GT_CODE_CAP() - 1) {
+    return;
+  }
+  var caret_before: int32 = ed->caret;
+  var i: int32 = ed->length;
+  while (i > ed->caret) {
+    ed->buf[i] = ed->buf[i - 1];
+    i = i - 1;
+  }
+  ed->buf[ed->caret] = ch;
+  ed->length = ed->length + 1;
+  var ins_pos: int32 = ed->caret;
+  ed->caret = ed->caret + 1;
+  ed->buf[ed->length] = 0;
+  ed->dirty = 1;
+  ed->esc_armed = 0;
+  ed->scroll_follow_caret = 1;
+  gt_undo_push_insert(ed, ins_pos, 1, caret_before);
+}
+
+export function gt_editor_backspace(ed: CodeEditor*) {
+  if (ed == 0) {
+    return;
+  }
+  // Backspace with a selection deletes the selection (not one extra char).
+  if (gt_sel_has(ed) != 0) {
+    gt_editor_delete_selection(ed);
+    return;
+  }
+  ed->sel_active = 0;
+  if (ed->caret <= 0) {
+    return;
+  }
+  var del_pos: int32 = ed->caret - 1;
+  gt_undo_push_delete(ed, del_pos, (cstring)((int64)(&(ed->buf[del_pos]))), 1, ed->caret);
+  var i: int32 = ed->caret - 1;
+  while (i + 1 < ed->length) {
+    ed->buf[i] = ed->buf[i + 1];
+    i = i + 1;
+  }
+  ed->length = ed->length - 1;
+  ed->caret = ed->caret - 1;
+  ed->buf[ed->length] = 0;
+  ed->dirty = 1;
+  ed->esc_armed = 0;
+  ed->scroll_follow_caret = 1;
+}
+
+export function gt_is_nl(b: uint8) -> int32 {
+  if (b == (uint8)10) {
+    return 1;
+  }
+  return 0;
+}
+
+export function gt_editor_line_start(ed: CodeEditor*, off: int32) -> int32 {
+  var p: int32 = off;
+  while (p > 0 && gt_is_nl((uint8)(ed->buf[p - 1])) == 0) {
+    p = p - 1;
+  }
+  return p;
+}
+
+export function gt_editor_line_end(ed: CodeEditor*, off: int32) -> int32 {
+  var p: int32 = off;
+  while (p < ed->length && gt_is_nl((uint8)(ed->buf[p])) == 0) {
+    p = p + 1;
+  }
+  return p;
+}
+
+export function gt_editor_caret_col(ed: CodeEditor*) -> int32 {
+  return ed->caret - gt_editor_line_start(ed, ed->caret);
+}
+
+export function gt_editor_move_up(ed: CodeEditor*) {
+  var ls: int32 = gt_editor_line_start(ed, ed->caret);
+  if (ls == 0) {
+    ed->caret = 0;
+    return;
+  }
+  var col: int32 = ed->caret - ls;
+  var prev_end: int32 = ls - 1;
+  var prev_start: int32 = gt_editor_line_start(ed, prev_end);
+  var prev_len: int32 = prev_end - prev_start;
+  if (col > prev_len) {
+    col = prev_len;
+  }
+  ed->caret = prev_start + col;
+}
+
+export function gt_editor_move_down(ed: CodeEditor*) {
+  var le: int32 = gt_editor_line_end(ed, ed->caret);
+  if (le >= ed->length) {
+    ed->caret = ed->length;
+    return;
+  }
+  var ls: int32 = gt_editor_line_start(ed, ed->caret);
+  var col: int32 = ed->caret - ls;
+  var next_start: int32 = le + 1;
+  var next_end: int32 = gt_editor_line_end(ed, next_start);
+  var next_len: int32 = next_end - next_start;
+  if (col > next_len) {
+    col = next_len;
+  }
+  ed->caret = next_start + col;
+}
+
+export function gt_editor_total_lines(ed: CodeEditor*) -> int32 {
+  var n: int32 = 1;
+  var i: int32 = 0;
+  while (i < ed->length) {
+    if (gt_is_nl((uint8)(ed->buf[i])) != 0) {
+      n = n + 1;
+    }
+    i = i + 1;
+  }
+  return n;
+}
+
+export function gt_editor_caret_line(ed: CodeEditor*) -> int32 {
+  var n: int32 = 0;
+  var i: int32 = 0;
+  while (i < ed->caret) {
+    if (gt_is_nl((uint8)(ed->buf[i])) != 0) {
+      n = n + 1;
+    }
+    i = i + 1;
+  }
+  return n;
+}
+
+// ---- Drawing helpers ------------------------------------------------------
+
+export function gt_fill(px: uint32*, fw: int32, fh: int32, x0: int32, y0: int32, x1: int32, y1: int32, c: uint32) {
+  if (x0 < 0) { x0 = 0; }
+  if (y0 < 0) { y0 = 0; }
+  if (x1 > fw) { x1 = fw; }
+  if (y1 > fh) { y1 = fh; }
+  if (x1 <= x0 || y1 <= y0) {
+    return;
+  }
+  var yy: int32 = y0;
+  while (yy < y1) {
+    var xx: int32 = x0;
+    while (xx < x1) {
+      px[yy * fw + xx] = c;
+      xx = xx + 1;
+    }
+    yy = yy + 1;
+  }
+}
+
+export function gt_text(dc: int64, x: int32, y: int32, s: cstring) {
+  if (s == 0) {
+    return;
+  }
+  Win32_TextOutA(dc, x, y, s, (int32)strlen(s));
+}
+
+export function gt_dec(buf: cstring, v: int32) {
+  // small unsigned int -> decimal, right-nothing, NUL-terminated
+  if (v < 0) {
+    v = 0;
+  }
+  var tmp: uint8[12];
+  var n: int32 = 0;
+  if (v == 0) {
+    tmp[0] = 48;
+    n = 1;
+  } else {
+    while (v > 0 && n < 11) {
+      tmp[n] = (uint8)(48 + (v % 10));
+      v = v / 10;
+      n = n + 1;
+    }
+  }
+  var i: int32 = 0;
+  while (i < n) {
+    buf[i] = tmp[n - 1 - i];
+    i = i + 1;
+  }
+  buf[n] = 0;
+}
+
+// ---- Tree render ----------------------------------------------------------
+//
+// Draws into the left panel rect [0 .. panel_w] x [body_top .. h]. Caller
+// supplies geometry so this stays decoupled from editor_ui constants.
+export function game_tree_render(gt: GameTreeState*, px: uint32*, dc: int64, fw: int32, fh: int32, panel_w: int32, body_top: int32, line_h: int32, focused: int32) {
+  if (gt == 0 || px == 0) {
+    return;
+  }
+  var hi: uint32 = swizzle_bgra8(70, 80, 120, 255);
+  var hdrc: uint32 = swizzle_bgra8(58, 60, 74, 255);
+  var vis: int32 = (fh - body_top) / line_h;
+  if (vis < 1) {
+    vis = 1;
+  }
+  if (gt->selection < gt->scroll) {
+    gt->scroll = gt->selection;
+  }
+  if (gt->selection >= gt->scroll + vis) {
+    gt->scroll = gt->selection - vis + 1;
+  }
+  if (gt->scroll < 0) {
+    gt->scroll = 0;
+  }
+  Win32_SetTextColor(dc, COLORREF_WHITE());
+  var hdr: string = "Game";
+  gt_text(dc, (int32)14, body_top - line_h - (int32)18, hdr.chars);
+  var k: int32 = 0;
+  while (k < vis && k + gt->scroll < gt->row_count) {
+    var idx: int32 = gt->scroll + k;
+    var r: GtRow* = gt_row_ptr(gt, idx);
+    if (r != 0) {
+      var y: int32 = body_top + k * line_h;
+      if (r->kind == GT_ROW_HEADER()) {
+        gt_fill(px, fw, fh, (int32)6, y - (int32)2, panel_w - (int32)8, y + line_h, hdrc);
+      }
+      if (idx == gt->selection) {
+        gt_fill(px, fw, fh, (int32)6, y - (int32)2, panel_w - (int32)8, y + line_h, hi);
+      }
+      var tx: int32 = (int32)12 + r->depth * (int32)16;
+      if (r->kind == GT_ROW_HEADER()) {
+        var caret: string = "[-] ";
+        if (gt_service_collapsed(gt, r->service_id) != 0) {
+          caret = "[+] ";
+        }
+        Win32_SetTextColor(dc, COLORREF_WHITE());
+        gt_text(dc, tx, y, caret.chars);
+        gt_text(dc, tx + (int32)32, y, (cstring)((int64)(&(r->label[0]))));
+      } else {
+        Win32_SetTextColor(dc, COLORREF_DIM_TEXT());
+        if (r->kind == GT_ROW_SCRIPT()) {
+          Win32_SetTextColor(dc, COLORREF_WHITE());
+        }
+        gt_text(dc, tx + (int32)18, y, (cstring)((int64)(&(r->label[0]))));
+      }
+    }
+    k = k + 1;
+  }
+  Win32_SetTextColor(dc, COLORREF_DIM_TEXT());
+  var help: string = "Enter open  Space fold  Ins add  Del remove";
+  gt_text(dc, (int32)10, fh - (int32)20, help.chars);
+}
+
+// ---- Lua syntax highlighting ----------------------------------------------
+//
+// Per-character class array, one entry per byte of a rendered line. The
+// renderer then emits runs of the same class with one TextOut + color each.
+// Classes: 0 default, 1 keyword, 2 string, 3 comment, 4 number.
+// Block state carried across lines: 0 normal, 1 inside --[[ ]] comment,
+// 2 inside [[ ]] long string.
+
+export function GT_HL_DEFAULT() -> int32 { return 0; }
+export function GT_HL_KEYWORD() -> int32 { return 1; }
+export function GT_HL_STRING() -> int32 { return 2; }
+export function GT_HL_COMMENT() -> int32 { return 3; }
+export function GT_HL_NUMBER() -> int32 { return 4; }
+
+// GDI COLORREF is 0x00BBGGRR, NOT the BGRA pixel layout swizzle_bgra8 makes.
+// Using swizzle_bgra8 here was the highlighting bug: it set the alpha byte and
+// swapped R/B, so SetTextColor rendered wrong/near-default colours. White and
+// grey looked fine only because they're symmetric across the byte order.
+function gt_colorref(r: int32, gg: int32, b: int32) -> uint32 {
+  var ur: uint32 = (uint32)(r & 255);
+  var ug: uint32 = (uint32)(gg & 255);
+  var ub: uint32 = (uint32)(b & 255);
+  return ur + ug * (uint32)256 + ub * (uint32)65536;
+}
+
+export function gt_hl_color(cls: int32) -> uint32 {
+  if (cls == GT_HL_KEYWORD()) { return gt_colorref(110, 170, 255); }
+  if (cls == GT_HL_STRING()) { return gt_colorref(220, 160, 110); }
+  if (cls == GT_HL_COMMENT()) { return gt_colorref(110, 170, 120); }
+  if (cls == GT_HL_NUMBER()) { return gt_colorref(210, 165, 245); }
+  return gt_colorref(220, 222, 230);
+}
+
+function gt_is_ident_start(b: uint8) -> int32 {
+  if (b >= (uint8)65 && b <= (uint8)90) { return 1; }
+  if (b >= (uint8)97 && b <= (uint8)122) { return 1; }
+  if (b == (uint8)95) { return 1; }
+  return 0;
+}
+
+function gt_is_ident(b: uint8) -> int32 {
+  if (gt_is_ident_start(b) != 0) { return 1; }
+  if (b >= (uint8)48 && b <= (uint8)57) { return 1; }
+  return 0;
+}
+
+function gt_is_digit(b: uint8) -> int32 {
+  if (b >= (uint8)48 && b <= (uint8)57) { return 1; }
+  return 0;
+}
+
+// True if line[s..e) (e exclusive) equals kw.
+function gt_word_eq(line: cstring, s: int32, e: int32, kw: string) -> int32 {
+  if (e - s != kw.length) {
+    return 0;
+  }
+  var i: int32 = 0;
+  while (i < kw.length) {
+    if ((uint8)(line[s + i]) != (uint8)(kw.chars[i])) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+function gt_is_lua_keyword(line: cstring, s: int32, e: int32) -> int32 {
+  if (gt_word_eq(line, s, e, "and") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "break") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "do") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "else") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "elseif") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "end") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "false") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "for") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "function") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "goto") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "if") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "in") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "local") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "nil") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "not") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "or") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "repeat") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "return") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "then") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "true") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "until") != 0) { return 1; }
+  if (gt_word_eq(line, s, e, "while") != 0) { return 1; }
+  return 0;
+}
+
+// Classify one line (len bytes) into cls[0..len). `state` is the block state
+// entering this line; the returned value is the state leaving it (feeds the
+// next line). Long-bracket levels beyond [[ ]] are treated as [[ ]].
+export function gt_lua_classify_line(line: cstring, len: int32, cls: uint8*, state: int32) -> int32 {
+  var i: int32 = 0;
+  // Continue an open block comment / long string from a previous line.
+  if (state == 1 || state == 2) {
+    var fill: int32 = GT_HL_COMMENT();
+    if (state == 2) {
+      fill = GT_HL_STRING();
+    }
+    while (i < len) {
+      cls[i] = (uint8)fill;
+      if ((uint8)(line[i]) == (uint8)93 && i + 1 < len && (uint8)(line[i + 1]) == (uint8)93) {
+        cls[i] = (uint8)fill;
+        cls[i + 1] = (uint8)fill;
+        i = i + 2;
+        state = 0;
+        break;
+      }
+      i = i + 1;
+    }
+    if (state != 0) {
+      return state;
+    }
+  }
+  while (i < len) {
+    var b: uint8 = (uint8)(line[i]);
+    // Line / block comment.
+    if (b == (uint8)45 && i + 1 < len && (uint8)(line[i + 1]) == (uint8)45) {
+      if (i + 3 < len && (uint8)(line[i + 2]) == (uint8)91 && (uint8)(line[i + 3]) == (uint8)91) {
+        // --[[ block comment
+        var j: int32 = i;
+        while (j < len) {
+          cls[j] = (uint8)GT_HL_COMMENT();
+          if ((uint8)(line[j]) == (uint8)93 && j + 1 < len && (uint8)(line[j + 1]) == (uint8)93) {
+            cls[j + 1] = (uint8)GT_HL_COMMENT();
+            j = j + 2;
+            i = j;
+            break;
+          }
+          j = j + 1;
+        }
+        if (j >= len) {
+          return 1;
+        }
+      } else {
+        // -- line comment: rest of line
+        while (i < len) {
+          cls[i] = (uint8)GT_HL_COMMENT();
+          i = i + 1;
+        }
+      }
+    } else {
+      if (b == (uint8)34 || b == (uint8)39) {
+        // "..." or '...' string with \ escapes
+        var q: uint8 = b;
+        cls[i] = (uint8)GT_HL_STRING();
+        i = i + 1;
+        while (i < len) {
+          cls[i] = (uint8)GT_HL_STRING();
+          if ((uint8)(line[i]) == (uint8)92 && i + 1 < len) {
+            cls[i + 1] = (uint8)GT_HL_STRING();
+            i = i + 2;
+          } else {
+            if ((uint8)(line[i]) == q) {
+              i = i + 1;
+              break;
+            } else {
+              i = i + 1;
+            }
+          }
+        }
+      } else {
+        if (b == (uint8)91 && i + 1 < len && (uint8)(line[i + 1]) == (uint8)91) {
+          // [[ long string
+          var k: int32 = i;
+          cls[k] = (uint8)GT_HL_STRING();
+          cls[k + 1] = (uint8)GT_HL_STRING();
+          k = k + 2;
+          while (k < len) {
+            cls[k] = (uint8)GT_HL_STRING();
+            if ((uint8)(line[k]) == (uint8)93 && k + 1 < len && (uint8)(line[k + 1]) == (uint8)93) {
+              cls[k + 1] = (uint8)GT_HL_STRING();
+              k = k + 2;
+              i = k;
+              break;
+            }
+            k = k + 1;
+          }
+          if (k >= len) {
+            return 2;
+          }
+        } else {
+          if (gt_is_digit(b) != 0) {
+            while (i < len) {
+              var d: uint8 = (uint8)(line[i]);
+              if (gt_is_digit(d) == 0 && d != (uint8)46 && d != (uint8)120 && d != (uint8)88 && (d < (uint8)97 || d > (uint8)102) && (d < (uint8)65 || d > (uint8)70)) {
+                break;
+              }
+              cls[i] = (uint8)GT_HL_NUMBER();
+              i = i + 1;
+            }
+          } else {
+            if (gt_is_ident_start(b) != 0) {
+              var s: int32 = i;
+              while (i < len && gt_is_ident((uint8)(line[i])) != 0) {
+                i = i + 1;
+              }
+              var kw: int32 = gt_is_lua_keyword(line, s, i);
+              var ci: int32 = s;
+              while (ci < i) {
+                if (kw != 0) {
+                  cls[ci] = (uint8)GT_HL_KEYWORD();
+                } else {
+                  cls[ci] = (uint8)GT_HL_DEFAULT();
+                }
+                ci = ci + 1;
+              }
+            } else {
+              cls[i] = (uint8)GT_HL_DEFAULT();
+              i = i + 1;
+            }
+          }
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+// ---- Overlay code editor render -------------------------------------------
+
+export function game_tree_render_editor(gt: GameTreeState*, px: uint32*, dc: int64, fw: int32, fh: int32, x0: int32, y0: int32, w: int32, h: int32) {
+  if (gt == 0 || gt->ed == 0 || gt->ed->open == 0 || px == 0) {
+    return;
+  }
+  var ed: CodeEditor* = gt->ed;
+  var bg: uint32 = swizzle_bgra8(24, 25, 31, 255);
+  var bar: uint32 = swizzle_bgra8(48, 50, 64, 255);
+  var gut: uint32 = swizzle_bgra8(34, 35, 44, 255);
+  var carc: uint32 = swizzle_bgra8(220, 220, 120, 255);
+  gt_fill(px, fw, fh, x0, y0, x0 + w, y0 + h, bg);
+  gt_fill(px, fw, fh, x0, y0, x0 + w, y0 + (int32)22, bar);
+  var line_h: int32 = 16;
+  var gutter_w: int32 = 52;
+  gt_fill(px, fw, fh, x0, y0 + (int32)22, x0 + gutter_w, y0 + h, gut);
+  Win32_SetTextColor(dc, COLORREF_WHITE());
+  var tbuf: uint8[200];
+  var tp: cstring = (cstring)((int64)(&(tbuf[0])));
+  gt_copy_cstr(tp, 200, (cstring)((int64)(&(ed->title[0]))));
+  gt_text(dc, x0 + (int32)10, y0 + (int32)3, tp);
+  if (ed->dirty != 0) {
+    Win32_SetTextColor(dc, swizzle_bgra8(240, 200, 90, 255));
+    var us: string = "  *unsaved";
+    gt_text(dc, x0 + (int32)10 + (int32)8 * (int32)strlen(tp), y0 + (int32)3, us.chars);
+  }
+  Win32_SetTextColor(dc, COLORREF_DIM_TEXT());
+  var hk: string = "Ctrl+S save   Esc close";
+  gt_text(dc, x0 + w - (int32)200, y0 + (int32)3, hk.chars);
+
+  var text_x: int32 = x0 + gutter_w + (int32)6;
+  var top: int32 = y0 + (int32)26;
+  var rows: int32 = (h - (int32)30) / line_h;
+  if (rows < 1) {
+    rows = 1;
+  }
+  // Cache layout for click-to-position (game_tree_editor_click).
+  ed->view_text_x = text_x;
+  ed->view_top = top;
+  ed->view_line_h = line_h;
+  ed->view_char_w = 8;
+  ed->view_rows = rows;
+  // Keep caret line visible — but only when something caret-driven asked for
+  // it. Otherwise wheel scrolling would be snapped back every frame.
+  var cl: int32 = gt_editor_caret_line(ed);
+  if (ed->scroll_follow_caret != 0) {
+    if (cl < ed->scroll_line) {
+      ed->scroll_line = cl;
+    }
+    if (cl >= ed->scroll_line + rows) {
+      ed->scroll_line = cl - rows + 1;
+    }
+    ed->scroll_follow_caret = 0;
+  }
+  if (ed->scroll_line < 0) {
+    ed->scroll_line = 0;
+  }
+  var caret_ls: int32 = gt_editor_line_start(ed, ed->caret);
+  var caret_col: int32 = ed->caret - caret_ls;
+
+  var line_no: int32 = 0;
+  var p: int32 = 0;
+  // advance p to first byte of scroll_line, classifying skipped lines so the
+  // block-comment / long-string state entering the viewport is correct even
+  // when the opening --[[ is scrolled off the top.
+  var hl_state: int32 = 0;
+  var skip_cls: uint8[256];
+  var skip_lb: uint8[256];
+  while (line_no < ed->scroll_line && p < ed->length) {
+    var sj: int32 = 0;
+    while (sj < 255 && p < ed->length && gt_is_nl((uint8)(ed->buf[p])) == 0) {
+      skip_lb[sj] = ed->buf[p];
+      sj = sj + 1;
+      p = p + 1;
+    }
+    hl_state = gt_lua_classify_line((cstring)((int64)(&(skip_lb[0]))), sj, (uint8*)((int64)(&(skip_cls[0]))), hl_state);
+    if (p < ed->length && gt_is_nl((uint8)(ed->buf[p])) != 0) {
+      line_no = line_no + 1;
+      p = p + 1;
+    } else {
+      if (p >= ed->length) {
+        line_no = line_no + 1;
+      }
+    }
+  }
+  var screen_row: int32 = 0;
+  var lbuf: uint8[256];
+  var lcls: uint8[256];
+  var nbuf: uint8[16];
+  while (screen_row < rows && p <= ed->length) {
+    var y: int32 = top + screen_row * line_h;
+    var cur_line: int32 = ed->scroll_line + screen_row;
+    if (cur_line == cl) {
+      gt_fill(px, fw, fh, x0 + gutter_w, y - (int32)1, x0 + w, y + line_h - (int32)1, swizzle_bgra8(40, 42, 54, 255));
+    }
+    gt_dec((cstring)((int64)(&(nbuf[0]))), cur_line + 1);
+    Win32_SetTextColor(dc, COLORREF_DIM_TEXT());
+    gt_text(dc, x0 + (int32)8, y, (cstring)((int64)(&(nbuf[0]))));
+    var line_start: int32 = p;
+    var j: int32 = 0;
+    while (j < 255 && p < ed->length && gt_is_nl((uint8)(ed->buf[p])) == 0) {
+      lbuf[j] = ed->buf[p];
+      j = j + 1;
+      p = p + 1;
+    }
+    lbuf[j] = 0;
+    hl_state = gt_lua_classify_line((cstring)((int64)(&(lbuf[0]))), j, (uint8*)((int64)(&(lcls[0]))), hl_state);
+    // Selection highlight behind the text. Clip the global selection range to
+    // this line; a selection that spans the trailing newline extends one
+    // glyph past the last char so multi-line selections read continuously.
+    if (gt_sel_has(ed) != 0) {
+      var slo: int32 = gt_sel_lo(ed);
+      var shi: int32 = gt_sel_hi(ed);
+      var line_end: int32 = line_start + j;
+      var a: int32 = slo;
+      if (a < line_start) { a = line_start; }
+      var bsel: int32 = shi;
+      if (bsel > line_end + 1) { bsel = line_end + 1; }
+      if (a < bsel && a <= line_end && bsel > line_start) {
+        var c_a: int32 = a - line_start;
+        var c_b: int32 = bsel - line_start;
+        if (c_a < 0) { c_a = 0; }
+        var sx0: int32 = text_x + c_a * (int32)8;
+        var sx1: int32 = text_x + c_b * (int32)8;
+        gt_fill(px, fw, fh, sx0, y - (int32)1, sx1, y + line_h - (int32)1, swizzle_bgra8(58, 78, 130, 255));
+      }
+    }
+    // Draw the line as runs of equal class, one colored TextOut per run.
+    var seg: int32 = 0;
+    while (seg < j) {
+      var c0: uint8 = lcls[seg];
+      var seg_end: int32 = seg;
+      while (seg_end < j && lcls[seg_end] == c0) {
+        seg_end = seg_end + 1;
+      }
+      Win32_SetTextColor(dc, gt_hl_color((int32)c0));
+      Win32_TextOutA(dc, text_x + seg * (int32)8, y, (cstring)((int64)(&(lbuf[seg]))), seg_end - seg);
+      seg = seg_end;
+    }
+    // caret
+    if (cur_line == cl) {
+      var cx: int32 = text_x + caret_col * (int32)8;
+      if ((ed->blink / 18) % 2 == 0) {
+        gt_fill(px, fw, fh, cx, y, cx + (int32)2, y + line_h - (int32)2, carc);
+      }
+    }
+    if (p < ed->length && gt_is_nl((uint8)(ed->buf[p])) != 0) {
+      p = p + 1;
+    } else {
+      if (p >= ed->length) {
+        // draw final (possibly empty) line then stop
+        screen_row = screen_row + 1;
+        if (cl == cur_line + 1 && ed->caret == ed->length && gt_is_nl((uint8)(ed->buf[ed->length - 1])) != 0) {
+          // caret on a trailing empty line handled next iteration via p==length
+        }
+        break;
+      }
+    }
+    screen_row = screen_row + 1;
+  }
+  ed->blink = ed->blink + 1;
+}
+
+// ---- Input ----------------------------------------------------------------
+
+export function gt_key_edge(gt: GameTreeState*, vk: int32) -> int32 {
+  if (gt == 0 || vk < 0 || vk >= 256) {
+    return 0;
+  }
+  var now: int32 = game_input_key_held(vk);
+  var was: int32 = (int32)gt->key_prev[vk];
+  gt->key_prev[vk] = (uint8)now;
+  if (now != 0 && was == 0) {
+    return 1;
+  }
+  return 0;
+}
+
+// Edge + auto-repeat. Returns 1 on the initial press and again on a steady
+// cadence while the key is held — used in the script editor so arrows /
+// Backspace / Delete / PageUp / PageDown can be held down. Maintains a
+// per-vkey hold tick counter in gt->key_hold. Must be called every frame for
+// the keys you care about so the counter advances/resets correctly.
+export function gt_key_repeat(gt: GameTreeState*, vk: int32) -> int32 {
+  if (gt == 0 || vk < 0 || vk >= 256) {
+    return 0;
+  }
+  var now: int32 = game_input_key_held(vk);
+  if (now == 0) {
+    gt->key_hold[vk] = (uint8)0;
+    return 0;
+  }
+  var h: int32 = (int32)gt->key_hold[vk];
+  if (h < 255) {
+    h = h + 1;
+  }
+  gt->key_hold[vk] = (uint8)h;
+  // Initial press fires immediately; then a delay before repeat kicks in;
+  // then every few ticks. At 60 fps: ~0.4s delay, ~12 reps/sec.
+  var delay: int32 = 24;
+  var rate: int32 = 4;
+  if (h == 1) {
+    return 1;
+  }
+  if (h > delay && ((h - delay) % rate) == 0) {
+    return 1;
+  }
+  return 0;
+}
+
+// Editor's modal input. Returns 1 if it consumed input (caller must skip its
+// own handling), 0 if the editor is not open. Drains the WM_CHAR queue.
+export function game_tree_editor_input(gt: GameTreeState*) -> int32 {
+  if (gt == 0 || gt->ed == 0 || gt->ed->open == 0) {
+    return 0;
+  }
+  var ed: CodeEditor* = gt->ed;
+  var ctrl: int32 = game_input_key_held(17);
+  if (ctrl != 0 && gt_key_edge(gt, 83) != 0) {
+    gt_editor_save(ed);
+  }
+  // Ctrl+A: select the whole buffer.
+  if (ctrl != 0 && gt_key_edge(gt, 65) != 0) {
+    ed->sel_anchor = 0;
+    ed->caret = ed->length;
+    ed->sel_active = 1;
+  }
+  // Ctrl+Z undo, Ctrl+Y or Ctrl+Shift+Z redo.
+  var shift_held: int32 = game_input_key_held(16);
+  if (ctrl != 0 && gt_key_edge(gt, 90) != 0) {
+    if (shift_held != 0) {
+      gt_editor_redo(ed);
+    } else {
+      gt_editor_undo(ed);
+    }
+    ed->scroll_follow_caret = 1;
+  }
+  if (ctrl != 0 && gt_key_edge(gt, 89) != 0) {
+    gt_editor_redo(ed);
+    ed->scroll_follow_caret = 1;
+  }
+  if (gt_key_edge(gt, 27) != 0) {
+    if (ed->dirty != 0 && ed->esc_armed == 0) {
+      ed->esc_armed = 1;
+    } else {
+      ed->open = 0;
+      ed->esc_armed = 0;
+      // Discard the queued Esc-char and anything typed this frame so the
+      // closed editor's buffer is clean for the next open.
+      game_win32_flush_chars();
+      return 1;
+    }
+  }
+  // Clipboard. Ctrl+C copies the selection, Ctrl+X cuts, Ctrl+V pastes.
+  // No-op when there's no selection (copy/cut) or no text on the clipboard
+  // (paste). Bound before nav so the edge-keys consumed here don't double-fire
+  // through the auto-repeat path below.
+  if (ctrl != 0 && gt_key_edge(gt, 67) != 0) {
+    gt_editor_clipboard_copy(ed);
+  }
+  if (ctrl != 0 && gt_key_edge(gt, 88) != 0) {
+    if (gt_editor_clipboard_copy(ed) != 0) {
+      gt_editor_delete_selection(ed);
+    }
+  }
+  if (ctrl != 0 && gt_key_edge(gt, 86) != 0) {
+    gt_editor_clipboard_paste(ed);
+  }
+  // Mouse wheel: scroll the viewport without moving the caret. One notch =
+  // 3 lines. The renderer's "keep caret visible" auto-scroll is gated on
+  // ed->scroll_follow_caret, which we leave OFF here so wheel scrolls hold.
+  // The caret motion paths above set scroll_follow_caret=1 so typing/arrowing
+  // off-screen still scrolls back to the caret.
+  var wheel: int32 = game_mouse_consume_wheel();
+  if (wheel != 0) {
+    ed->scroll_line = ed->scroll_line - wheel * 3;
+    var max_scroll: int32 = gt_editor_total_lines(ed) - 1;
+    if (max_scroll < 0) {
+      max_scroll = 0;
+    }
+    if (ed->scroll_line > max_scroll) {
+      ed->scroll_line = max_scroll;
+    }
+    if (ed->scroll_line < 0) {
+      ed->scroll_line = 0;
+    }
+    ed->scroll_follow_caret = 0;
+  }
+  // Caret motion. With Shift the motion extends a selection: drop the anchor
+  // at the caret on the first shifted move from a collapsed state, then keep
+  // the anchor fixed while the caret moves. Without Shift the motion collapses
+  // any selection. All nav keys use gt_key_repeat so they auto-repeat on hold.
+  var nav_left: int32 = gt_key_repeat(gt, 37);
+  var nav_right: int32 = gt_key_repeat(gt, 39);
+  var nav_up: int32 = gt_key_repeat(gt, 38);
+  var nav_down: int32 = gt_key_repeat(gt, 40);
+  var nav_home: int32 = gt_key_repeat(gt, 36);
+  var nav_end: int32 = gt_key_repeat(gt, 35);
+  var nav_pgup: int32 = gt_key_repeat(gt, 33);
+  var nav_pgdn: int32 = gt_key_repeat(gt, 34);
+  var nav_del: int32 = gt_key_repeat(gt, 46);
+  var page_step: int32 = ed->view_rows - 1;
+  if (page_step < 1) {
+    page_step = 1;
+  }
+  var moved: int32 = 0;
+  if (nav_left != 0 || nav_right != 0 || nav_up != 0 || nav_down != 0 || nav_home != 0 || nav_end != 0 || nav_pgup != 0 || nav_pgdn != 0) {
+    moved = 1;
+  }
+  if (moved != 0) {
+    if (shift_held != 0) {
+      if (ed->sel_active == 0) {
+        ed->sel_anchor = ed->caret;
+        ed->sel_active = 1;
+      }
+    }
+  }
+  if (nav_left != 0 && ed->caret > 0) {
+    ed->caret = ed->caret - 1;
+  }
+  if (nav_right != 0 && ed->caret < ed->length) {
+    ed->caret = ed->caret + 1;
+  }
+  if (nav_up != 0) {
+    gt_editor_move_up(ed);
+  }
+  if (nav_down != 0) {
+    gt_editor_move_down(ed);
+  }
+  if (nav_home != 0) {
+    ed->caret = gt_editor_line_start(ed, ed->caret);
+  }
+  if (nav_end != 0) {
+    ed->caret = gt_editor_line_end(ed, ed->caret);
+  }
+  if (nav_pgup != 0) {
+    var pu: int32 = 0;
+    while (pu < page_step) {
+      gt_editor_move_up(ed);
+      pu = pu + 1;
+    }
+  }
+  if (nav_pgdn != 0) {
+    var pd: int32 = 0;
+    while (pd < page_step) {
+      gt_editor_move_down(ed);
+      pd = pd + 1;
+    }
+  }
+  if (moved != 0) {
+    if (shift_held == 0) {
+      ed->sel_active = 0;
+    } else {
+      // Shift held: keep selection live; collapse only if caret met anchor.
+      if (ed->caret == ed->sel_anchor) {
+        ed->sel_active = 0;
+      }
+    }
+    ed->blink = 0;
+    ed->scroll_follow_caret = 1;
+  }
+  // Forward-delete (Delete key, VK 46). Win32 doesn't emit a WM_CHAR for
+  // this, so we drive it ourselves and let gt_key_repeat handle held-down
+  // auto-repeat.
+  if (nav_del != 0) {
+    if (gt_sel_has(ed) != 0) {
+      gt_editor_delete_selection(ed);
+    } else {
+      if (ed->caret < ed->length) {
+        ed->caret = ed->caret + 1;
+        gt_editor_backspace(ed);
+      }
+    }
+    ed->blink = 0;
+    ed->scroll_follow_caret = 1;
+  }
+  // Drain typed characters (post layout/shift). 13=Enter -> newline,
+  // 8=Backspace, 9=Tab -> two spaces.
+  var c: int32 = game_win32_poll_char();
+  while (c != 0) {
+    if (c == 8) {
+      gt_editor_backspace(ed);
+    } else {
+      if (c == 13) {
+        gt_editor_insert(ed, (uint8)10);
+      } else {
+        if (c == 9) {
+          gt_editor_insert(ed, (uint8)32);
+          gt_editor_insert(ed, (uint8)32);
+        } else {
+          if (c >= 32 && c <= 126) {
+            gt_editor_insert(ed, (uint8)c);
+          }
+        }
+      }
+    }
+    c = game_win32_poll_char();
+  }
+  return 1;
+}
+
+// Map a screen pixel to a buffer offset using the layout cached by
+// game_tree_render_editor. Clamps to line ends (clicking past a short line
+// lands at its newline) and to the visible rows. Returns -1 if unmappable
+// (editor closed / not yet rendered / above the text body).
+export function gt_editor_offset_at(ed: CodeEditor*, mx: int32, my: int32) -> int32 {
+  if (ed == 0 || ed->open == 0) {
+    return -1;
+  }
+  if (ed->view_line_h <= 0 || ed->view_char_w <= 0) {
+    return -1;
+  }
+  var rel_y: int32 = my - ed->view_top;
+  if (rel_y < 0) {
+    rel_y = 0;
+  }
+  var row: int32 = rel_y / ed->view_line_h;
+  if (row < 0) {
+    row = 0;
+  }
+  if (row >= ed->view_rows) {
+    row = ed->view_rows - 1;
+  }
+  var col: int32 = 0;
+  if (mx > ed->view_text_x) {
+    // +half a glyph so clicking the right half of a char snaps past it.
+    col = (mx - ed->view_text_x + ed->view_char_w / 2) / ed->view_char_w;
+  }
+  var target_line: int32 = ed->scroll_line + row;
+  if (target_line < 0) {
+    target_line = 0;
+  }
+  var p: int32 = 0;
+  var ln: int32 = 0;
+  while (ln < target_line && p < ed->length) {
+    if (gt_is_nl((uint8)(ed->buf[p])) != 0) {
+      ln = ln + 1;
+    }
+    p = p + 1;
+  }
+  var adv: int32 = 0;
+  while (adv < col && p < ed->length && gt_is_nl((uint8)(ed->buf[p])) == 0) {
+    p = p + 1;
+    adv = adv + 1;
+  }
+  return p;
+}
+
+// Mouse → caret. mode 0 = press (place caret, drop a selection anchor here);
+// mode 1 = drag (move caret, keep anchor → grows the selection). Caller drives
+// mode from the left-button edge vs. held state.
+export function game_tree_editor_click(gt: GameTreeState*, mx: int32, my: int32, mode: int32) -> int32 {
+  if (gt == 0 || gt->ed == 0 || gt->ed->open == 0) {
+    return 0;
+  }
+  var ed: CodeEditor* = gt->ed;
+  var off: int32 = gt_editor_offset_at(ed, mx, my);
+  if (off < 0) {
+    return 0;
+  }
+  if (mode == 0) {
+    ed->caret = off;
+    ed->sel_anchor = off;
+    ed->sel_active = 1;
+    ed->dragging = 1;
+  } else {
+    ed->caret = off;
+    ed->sel_active = 1;
+  }
+  ed->blink = 0;
+  ed->scroll_follow_caret = 1;
+  return 1;
+}
+
+// Left button released: end the drag. The selection (if any) stays so the
+// user can type over it / copy later; a zero-length drag collapses it.
+export function game_tree_editor_drag_end(gt: GameTreeState*) {
+  if (gt == 0 || gt->ed == 0) {
+    return;
+  }
+  var ed: CodeEditor* = gt->ed;
+  ed->dragging = 0;
+  if (ed->sel_anchor == ed->caret) {
+    ed->sel_active = 0;
+  }
+}
+
+export function gt_default_template(svc: int32) -> cstring {
+  if (svc == SVC_REPLICATED_STORAGE()) {
+    return cstr("local M = {}\n\nfunction M.hello()\n  return \"hi\"\nend\n\nreturn M\n");
+  }
+  return cstr("local t = 0\n\nfunction on_tick(dt)\n  t = t + dt\nend\n");
+}
+
+export function gt_ext_for_service(svc: int32) -> cstring {
+  if (svc == SVC_SERVER_SCRIPT_SERVICE()) { return cstr(".server.lua"); }
+  if (svc == SVC_STARTER_PLAYER_SCRIPTS()) { return cstr(".client.lua"); }
+  if (svc == SVC_REPLICATED_STORAGE()) { return cstr(".module.lua"); }
+  return cstr(".lua");
+}
+
+export function gt_folder_for_service(svc: int32) -> cstring {
+  if (svc == SVC_SERVER_SCRIPT_SERVICE()) { return cstr("ServerScriptService"); }
+  if (svc == SVC_STARTER_PLAYER_SCRIPTS()) { return cstr("StarterPlayerScripts"); }
+  if (svc == SVC_REPLICATED_STORAGE()) { return cstr("ReplicatedStorage"); }
+  return cstr("");
+}
+
+export function gt_role_for_service(svc: int32) -> int32 {
+  if (svc == SVC_SERVER_SCRIPT_SERVICE()) { return SCRIPT_ROLE_SERVER(); }
+  if (svc == SVC_STARTER_PLAYER_SCRIPTS()) { return SCRIPT_ROLE_LOCAL(); }
+  if (svc == SVC_REPLICATED_STORAGE()) { return SCRIPT_ROLE_MODULE(); }
+  return SCRIPT_ROLE_SERVER();
+}
+
+// Create a new script file under the selected service's folder, register it,
+// open it in the editor. Name is auto-generated (Script1, Script2, ...).
+export function gt_add_script(gt: GameTreeState*, svc: int32) -> int32 {
+  if (svc == SVC_WORKSPACE()) {
+    return 0;
+  }
+  var folder: cstring = gt_folder_for_service(svc);
+  var dir: uint8[1024];
+  if (fs_path_join_child((cstring)((int64)(&(dir[0]))), 1024, (cstring)((int64)(&(gt->project_root[0]))), folder) != 0) {
+    return 0;
+  }
+  Win32_CreateDirectoryA((cstring)((int64)(&(dir[0]))), (cstring)0);
+  var ext: cstring = gt_ext_for_service(svc);
+  var idx: int32 = 1;
+  var name: uint8[96];
+  var full: uint8[1024];
+  while (idx < 1000) {
+    var nb: uint8[16];
+    gt_dec((cstring)((int64)(&(nb[0]))), idx);
+    var np: int32 = 0;
+    var pre: cstring = cstr("Script");
+    while ((uint8)(pre[np]) != (uint8)0 && np < 32) {
+      name[np] = (uint8)(pre[np]);
+      np = np + 1;
+    }
+    var qi: int32 = 0;
+    while ((uint8)(nb[qi]) != (uint8)0 && np < 60) {
+      name[np] = nb[qi];
+      np = np + 1;
+      qi = qi + 1;
+    }
+    var ei: int32 = 0;
+    while ((uint8)(ext[ei]) != (uint8)0 && np < 90) {
+      name[np] = (uint8)(ext[ei]);
+      np = np + 1;
+      ei = ei + 1;
+    }
+    name[np] = 0;
+    if (fs_path_join_child((cstring)((int64)(&(full[0]))), 1024, (cstring)((int64)(&(dir[0]))), (cstring)((int64)(&(name[0])))) != 0) {
+      return 0;
+    }
+    var test: cstring = fopen((cstring)((int64)(&(full[0]))), cstr("rb"));
+    if (test == 0) {
+      break;
+    }
+    fclose(test);
+    idx = idx + 1;
+  }
+  // write template
+  var fp: cstring = fopen((cstring)((int64)(&(full[0]))), cstr("wb"));
+  if (fp == 0) {
+    return 0;
+  }
+  var tpl: cstring = gt_default_template(svc);
+  fwrite(tpl, (int64)1, (int64)strlen(tpl), fp);
+  fclose(fp);
+  service_model_add_script(gt->sm, svc, gt_role_for_service(svc), 0, (cstring)((int64)(&(full[0]))), (cstring)((int64)(&(name[0]))));
+  game_tree_save(gt);
+  gt_editor_load_file(gt->ed, (cstring)((int64)(&(full[0]))), (cstring)((int64)(&(name[0]))));
+  return 1;
+}
+
+export function gt_open_selected(gt: GameTreeState*) -> int32 {
+  var r: GtRow* = gt_row_ptr(gt, gt->selection);
+  if (r == 0) {
+    return 0;
+  }
+  if (r->kind == GT_ROW_HEADER()) {
+    gt_service_toggle(gt, r->service_id);
+    return 1;
+  }
+  if (r->kind == GT_ROW_SCRIPT()) {
+    var rec: ServiceScriptRecord* = service_model_find_script(gt->sm, r->ref_id);
+    if (rec == 0) {
+      return 0;
+    }
+    gt_editor_load_file(gt->ed, (cstring)((int64)(&(rec->path[0]))), (cstring)((int64)(&(rec->name[0]))));
+    return 1;
+  }
+  return 0;
+}
+
+// Tree navigation/input. Only runs when the editor overlay is closed and the
+// game panel is focused. Returns 1 if anything changed (caller marks dirty).
+export function game_tree_input(gt: GameTreeState*) -> int32 {
+  if (gt == 0) {
+    return 0;
+  }
+  var changed: int32 = 0;
+  if (gt_key_edge(gt, 38) != 0) {
+    gt->selection = gt->selection - 1;
+    if (gt->selection < 0) { gt->selection = 0; }
+    changed = 1;
+  }
+  if (gt_key_edge(gt, 40) != 0) {
+    gt->selection = gt->selection + 1;
+    if (gt->selection >= gt->row_count) { gt->selection = gt->row_count - 1; }
+    changed = 1;
+  }
+  if (gt_key_edge(gt, 13) != 0) {
+    if (gt_open_selected(gt) != 0) {
+      changed = 1;
+    }
+  }
+  if (gt_key_edge(gt, 32) != 0) {
+    var r: GtRow* = gt_row_ptr(gt, gt->selection);
+    if (r != 0 && r->kind == GT_ROW_HEADER()) {
+      gt_service_toggle(gt, r->service_id);
+      changed = 1;
+    }
+  }
+  // Insert: add a script under the selected service (or the service of the
+  // selected script).
+  if (gt_key_edge(gt, 45) != 0) {
+    var r2: GtRow* = gt_row_ptr(gt, gt->selection);
+    if (r2 != 0 && r2->service_id != SVC_WORKSPACE() && r2->service_id != 0) {
+      if (gt_add_script(gt, r2->service_id) != 0) {
+        changed = 1;
+      }
+    }
+  }
+  // Delete: remove the selected script record (does not delete the file).
+  if (gt_key_edge(gt, 46) != 0) {
+    var r3: GtRow* = gt_row_ptr(gt, gt->selection);
+    if (r3 != 0 && r3->kind == GT_ROW_SCRIPT()) {
+      service_model_remove_script(gt->sm, r3->ref_id);
+      game_tree_save(gt);
+      changed = 1;
+    }
+  }
+  return changed;
+}
+
+// Mouse click on the tree at panel-local row (already hit-tested by caller).
+// Handles fold toggle on header click and double-click-to-open.
+// Click handling. Double-click (same row clicked again before last_click_frame
+// decays to 0 — the decay is ticked down each game_tree_rebuild_rows) opens a
+// script / toggles a header. Single click just selects. A header single-click
+// also toggles fold (matches the explorer's directory-row feel).
+export function game_tree_click_row(gt: GameTreeState*, row_rel: int32, unused: int32) -> int32 {
+  if (gt == 0) {
+    return 0;
+  }
+  var idx: int32 = gt->scroll + row_rel;
+  if (idx < 0 || idx >= gt->row_count) {
+    return 0;
+  }
+  gt->selection = idx;
+  var dbl: int32 = 0;
+  if (gt->last_click_row == idx && gt->last_click_frame > 0) {
+    dbl = 1;
+  }
+  gt->last_click_row = idx;
+  gt->last_click_frame = 20;
+  var r: GtRow* = gt_row_ptr(gt, idx);
+  if (r == 0) {
+    return 1;
+  }
+  if (r->kind == GT_ROW_HEADER()) {
+    gt_service_toggle(gt, r->service_id);
+    return 1;
+  }
+  if (dbl != 0) {
+    gt_open_selected(gt);
+  }
+  return 1;
+}
+
+// ---- Right-click context menu ---------------------------------------------
+//
+// The menu's items are computed on the fly from whatever row was right-
+// clicked (its service + kind). Items are addressed by index 0..count-1; the
+// same index->label/action mapping is used for both render and hit-test so
+// they can't drift.
+
+function GT_MENU_ROW_H() -> int32 { return 18; }
+function GT_MENU_W() -> int32 { return 188; }
+
+// Resolve the service this menu acts on. Headers/scripts carry service_id;
+// Workspace entities map to SVC_WORKSPACE.
+export function gt_menu_target_is_scripts(gt: GameTreeState*) -> int32 {
+  var s: int32 = gt->menu_target_service;
+  if (s == SVC_SERVER_SCRIPT_SERVICE() || s == SVC_STARTER_PLAYER_SCRIPTS() || s == SVC_REPLICATED_STORAGE()) {
+    return 1;
+  }
+  return 0;
+}
+
+// Fill `out` (cap 64) with item i's label and return its action id, or
+// GT_MENU_NONE() when i is past the end. Item order is stable per context.
+export function gt_menu_item(gt: GameTreeState*, i: int32, out: cstring) -> int32 {
+  out[0] = 0;
+  if (gt_menu_target_is_scripts(gt) != 0) {
+    // Script services: insert a script (+ ModuleScript for ReplicatedStorage),
+    // and Open/Delete when the right-click landed on a script row.
+    var on_script: int32 = 0;
+    if (gt->menu_target_kind == GT_ROW_SCRIPT()) {
+      on_script = 1;
+    }
+    if (i == 0) {
+      gt_copy_cstr(out, 64, cstr("Insert Script"));
+      return GT_MENU_INSERT_SCRIPT();
+    }
+    if (gt->menu_target_service == SVC_REPLICATED_STORAGE()) {
+      if (i == 1) {
+        gt_copy_cstr(out, 64, cstr("Insert ModuleScript"));
+        return GT_MENU_INSERT_MODULE();
+      }
+      if (on_script != 0 && i == 2) {
+        gt_copy_cstr(out, 64, cstr("Open"));
+        return GT_MENU_OPEN();
+      }
+      if (on_script != 0 && i == 3) {
+        gt_copy_cstr(out, 64, cstr("Delete"));
+        return GT_MENU_DELETE();
+      }
+      return GT_MENU_NONE();
+    }
+    if (on_script != 0 && i == 1) {
+      gt_copy_cstr(out, 64, cstr("Open"));
+      return GT_MENU_OPEN();
+    }
+    if (on_script != 0 && i == 2) {
+      gt_copy_cstr(out, 64, cstr("Delete"));
+      return GT_MENU_DELETE();
+    }
+    return GT_MENU_NONE();
+  }
+  // Workspace: insert scene primitives; delete when on an entity row.
+  if (i == 0) {
+    gt_copy_cstr(out, 64, cstr("Insert Part (Cube)"));
+    return GT_MENU_INSERT_PART_CUBE();
+  }
+  if (i == 1) {
+    gt_copy_cstr(out, 64, cstr("Insert Part (Box)"));
+    return GT_MENU_INSERT_PART_BOX();
+  }
+  if (i == 2) {
+    gt_copy_cstr(out, 64, cstr("Insert Terrain"));
+    return GT_MENU_INSERT_TERRAIN();
+  }
+  if (gt->menu_target_kind == GT_ROW_ENTITY() && i == 3) {
+    gt_copy_cstr(out, 64, cstr("Delete"));
+    return GT_MENU_DELETE();
+  }
+  return GT_MENU_NONE();
+}
+
+function gt_menu_count(gt: GameTreeState*) -> int32 {
+  var n: int32 = 0;
+  var probe: uint8[64];
+  while (n < 16) {
+    if (gt_menu_item(gt, n, (cstring)((int64)(&(probe[0])))) == GT_MENU_NONE()) {
+      return n;
+    }
+    n = n + 1;
+  }
+  return n;
+}
+
+// Open the menu from a right-click. row_rel is the panel-local row; mx/my are
+// where to anchor the popup. Selects the row so the menu and selection agree.
+export function game_tree_open_menu(gt: GameTreeState*, row_rel: int32, mx: int32, my: int32) -> int32 {
+  if (gt == 0) {
+    return 0;
+  }
+  var idx: int32 = gt->scroll + row_rel;
+  if (idx < 0 || idx >= gt->row_count) {
+    return 0;
+  }
+  gt->selection = idx;
+  var r: GtRow* = gt_row_ptr(gt, idx);
+  if (r == 0) {
+    return 0;
+  }
+  gt->menu_target_service = r->service_id;
+  gt->menu_target_row = idx;
+  gt->menu_target_kind = r->kind;
+  gt->menu_x = mx;
+  gt->menu_y = my;
+  gt->menu_item_count = gt_menu_count(gt);
+  gt->menu_open = 1;
+  return 1;
+}
+
+export function game_tree_menu_open(gt: GameTreeState*) -> int32 {
+  if (gt == 0) {
+    return 0;
+  }
+  return gt->menu_open;
+}
+
+export function game_tree_close_menu(gt: GameTreeState*) {
+  if (gt != 0) {
+    gt->menu_open = 0;
+  }
+}
+
+function gt_menu_do_action(gt: GameTreeState*, sc: Scene*, action: int32) -> int32 {
+  if (action == GT_MENU_INSERT_SCRIPT()) {
+    return gt_add_script(gt, gt->menu_target_service);
+  }
+  if (action == GT_MENU_INSERT_MODULE()) {
+    // ModuleScript: same flow as a script under ReplicatedStorage; the .module
+    // extension + MODULE role come from gt_add_script's per-service mapping.
+    return gt_add_script(gt, SVC_REPLICATED_STORAGE());
+  }
+  if (action == GT_MENU_OPEN()) {
+    return gt_open_selected(gt);
+  }
+  if (action == GT_MENU_DELETE()) {
+    var r: GtRow* = gt_row_ptr(gt, gt->menu_target_row);
+    if (r == 0) {
+      return 0;
+    }
+    if (r->kind == GT_ROW_SCRIPT()) {
+      service_model_remove_script(gt->sm, r->ref_id);
+      game_tree_save(gt);
+      return 1;
+    }
+    if (r->kind == GT_ROW_ENTITY() && sc != 0) {
+      scene_remove(sc, r->ref_id);
+      return 1;
+    }
+    return 0;
+  }
+  if (action == GT_MENU_INSERT_PART_CUBE() && sc != 0) {
+    var c: int32 = scene_add(sc, SK_CUBE(), 0.0, 1.0, 0.0, 1.0);
+    if (c != 0) {
+      scene_set_name(sc, c, cstr("Part"));
+      scene_set_selected(sc, c);
+      return 1;
+    }
+    return 0;
+  }
+  if (action == GT_MENU_INSERT_PART_BOX() && sc != 0) {
+    var b: int32 = scene_add(sc, SK_BOX(), 0.0, 1.0, 0.0, 1.0);
+    if (b != 0) {
+      scene_set_name(sc, b, cstr("Part"));
+      scene_set_selected(sc, b);
+      return 1;
+    }
+    return 0;
+  }
+  if (action == GT_MENU_INSERT_TERRAIN() && sc != 0) {
+    var t: int32 = scene_add_terrain(sc, 0.0, 0.0, 0.0, 22.0, 22.0, 1.8);
+    if (t != 0) {
+      scene_set_name(sc, t, cstr("Terrain"));
+      scene_set_selected(sc, t);
+      return 1;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+// Handle a left click while the menu is open. Returns 1 if the click was
+// consumed (hit an item or dismissed the menu). The caller passes the click
+// position and whether a left click happened this frame.
+export function game_tree_menu_click(gt: GameTreeState*, mx: int32, my: int32, clicked: int32, sc: Scene*) -> int32 {
+  if (gt == 0 || gt->menu_open == 0) {
+    return 0;
+  }
+  if (clicked == 0) {
+    return 1;
+  }
+  var x0: int32 = gt->menu_x;
+  var y0: int32 = gt->menu_y;
+  var w: int32 = GT_MENU_W();
+  var n: int32 = gt->menu_item_count;
+  var h: int32 = n * GT_MENU_ROW_H() + (int32)4;
+  if (mx >= x0 && mx < x0 + w && my >= y0 && my < y0 + h) {
+    var item: int32 = (my - y0 - (int32)2) / GT_MENU_ROW_H();
+    if (item >= 0 && item < n) {
+      var lbl: uint8[64];
+      var action: int32 = gt_menu_item(gt, item, (cstring)((int64)(&(lbl[0]))));
+      gt_menu_do_action(gt, sc, action);
+    }
+  }
+  gt->menu_open = 0;
+  return 1;
+}
+
+// Esc closes the menu. Call from the tree input path. Returns 1 if it ate Esc.
+export function game_tree_menu_key(gt: GameTreeState*) -> int32 {
+  if (gt == 0 || gt->menu_open == 0) {
+    return 0;
+  }
+  if (gt_key_edge(gt, 27) != 0) {
+    gt->menu_open = 0;
+    return 1;
+  }
+  return 0;
+}
+
+export function game_tree_render_menu(gt: GameTreeState*, px: uint32*, dc: int64, fw: int32, fh: int32) {
+  if (gt == 0 || px == 0 || gt->menu_open == 0) {
+    return;
+  }
+  var x0: int32 = gt->menu_x;
+  var y0: int32 = gt->menu_y;
+  var w: int32 = GT_MENU_W();
+  var n: int32 = gt->menu_item_count;
+  if (n <= 0) {
+    gt->menu_open = 0;
+    return;
+  }
+  var h: int32 = n * GT_MENU_ROW_H() + (int32)4;
+  // Keep it on-screen.
+  if (x0 + w > fw) {
+    x0 = fw - w;
+  }
+  if (y0 + h > fh) {
+    y0 = fh - h;
+  }
+  if (x0 < 0) { x0 = 0; }
+  if (y0 < 0) { y0 = 0; }
+  gt->menu_x = x0;
+  gt->menu_y = y0;
+  var border: uint32 = swizzle_bgra8(20, 21, 26, 255);
+  var fillc: uint32 = swizzle_bgra8(52, 54, 68, 255);
+  gt_fill(px, fw, fh, x0 - (int32)1, y0 - (int32)1, x0 + w + (int32)1, y0 + h + (int32)1, border);
+  gt_fill(px, fw, fh, x0, y0, x0 + w, y0 + h, fillc);
+  var i: int32 = 0;
+  var lbl: uint8[64];
+  while (i < n) {
+    var ry: int32 = y0 + (int32)2 + i * GT_MENU_ROW_H();
+    gt_menu_item(gt, i, (cstring)((int64)(&(lbl[0]))));
+    Win32_SetTextColor(dc, COLORREF_WHITE());
+    gt_text(dc, x0 + (int32)10, ry + (int32)2, (cstring)((int64)(&(lbl[0]))));
+    i = i + 1;
+  }
+}

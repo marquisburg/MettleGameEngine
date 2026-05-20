@@ -1,0 +1,7 @@
+// Middle module: imports the broken leaf. The error should be reported
+// against probe_bad_leaf.mettle, not this file or the root.
+import "probe_bad_leaf";
+
+function mid_fn(x: int32) -> int32 {
+  return leaf_broken(x) + 1;
+}

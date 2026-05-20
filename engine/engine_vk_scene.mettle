@@ -1,0 +1,1289 @@
+// Bridge: turn the editor Scene + camera pose into Vulkan line geometry and an
+// MVP matrix, then drive engine_vulkan's frame. engine_vulkan stays scene-
+// agnostic; this module is the only place that knows about both.
+//
+// Geometry matches the CPU wireframe (floor grid on y=0, origin axes, one wire
+// cube per entity). Vertices are interleaved float32: px,py,pz, r,g,b. Lines
+// are pairs of vertices (LINE_LIST). MVP is column-major (GLSL mat4), built to
+// match the CPU camera basis:
+//   forward = (sin yaw cos pitch, sin pitch, cos yaw cos pitch)
+//   right   = (cos yaw, 0, -sin yaw)
+import "engine_mesh";
+import "engine_scene";
+import "engine_terrain_store";
+import "engine_viewport";
+import "engine_vulkan";
+import "std/io";
+import "std/mem";
+
+extern function sinf64(x: float64) -> float64 = "sin";
+extern function cosf64(x: float64) -> float64 = "cos";
+extern function tanf64(x: float64) -> float64 = "tan";
+extern function sqrtf64(x: float64) -> float64 = "sqrt";
+
+// Max vertices we will emit. engine_vulkan's persistent buffer is 4MB
+// (about 174k vertices at 24 bytes each); keep headroom for projected shadows,
+// terrain, imported meshes, and editor chrome without reallocating per frame.
+function VK_SCENE_MAX_VERTS() -> int32 { return 120000; }
+
+export struct VkSceneBuf {
+  verts: float32*;
+  capacity: int32;
+  count: int32;
+  solid_count: int32;
+  line_count: int32;
+  mvp: float32[16];
+}
+
+export struct VkScenePoint {
+  x: float64;
+  y: float64;
+  z: float64;
+}
+
+function vksc_bytes() -> int64 { return (int64)160; }
+
+export function vk_scene_create() -> VkSceneBuf* {
+  var raw: cstring = calloc((int64)1, vksc_bytes());
+  if (raw == 0) {
+    return 0;
+  }
+  var s: VkSceneBuf* = (VkSceneBuf*)raw;
+  var cap: int32 = VK_SCENE_MAX_VERTS();
+  var blob: cstring = malloc((int64)cap * (int64)24);
+  if (blob == 0) {
+    free(raw);
+    return 0;
+  }
+  s->verts = (float32*)blob;
+  s->capacity = cap;
+  s->count = 0;
+  return s;
+}
+
+export function vk_scene_destroy(s: VkSceneBuf*) {
+  if (s == 0) {
+    return;
+  }
+  if (s->verts != 0) {
+    free((cstring)s->verts);
+    s->verts = 0;
+  }
+  free((cstring)s);
+}
+
+// Append one vertex (position + color) to the buffer.
+function vksc_vtx(s: VkSceneBuf*, x: float64, y: float64, z: float64, r: float64, g: float64, b: float64) {
+  if (s->count >= s->capacity) {
+    return;
+  }
+  var base: int64 = (int64)s->verts + (int64)s->count * (int64)24;
+  var p: float32* = (float32*)base;
+  p[0] = (float32)x;
+  p[1] = (float32)y;
+  p[2] = (float32)z;
+  p[3] = (float32)r;
+  p[4] = (float32)g;
+  p[5] = (float32)b;
+  s->count = s->count + 1;
+}
+
+function vksc_line(s: VkSceneBuf*, ax: float64, ay: float64, az: float64, bx: float64, by: float64, bz: float64, r: float64, g: float64, b: float64) {
+  vksc_vtx(s, ax, ay, az, r, g, b);
+  vksc_vtx(s, bx, by, bz, r, g, b);
+}
+
+function vksc_tri(s: VkSceneBuf*, ax: float64, ay: float64, az: float64, bx: float64, by: float64, bz: float64, cx: float64, cy: float64, cz: float64, r: float64, g: float64, b: float64) {
+  vksc_vtx(s, ax, ay, az, r, g, b);
+  vksc_vtx(s, bx, by, bz, r, g, b);
+  vksc_vtx(s, cx, cy, cz, r, g, b);
+}
+
+// Sun direction (pointing FROM surface TOWARD the light). The previous values
+// had the sun nearly overhead which crushed contrast on flat ground — terrain
+// surfaces all had ~the same N·L. Lowering the y component and biasing along
+// +x rakes the light across the world, so slopes facing the sun pop and
+// shadow-side faces darken cleanly.
+function vksc_light_x() -> float64 { return 0.42; }
+function vksc_light_y() -> float64 { return 0.68; }
+function vksc_light_z() -> float64 { return -0.40; }
+
+// Warm sun, cool sky, faint warm ground bounce. These three colours form a
+// proper hemisphere shading model — the old single-scalar shader had every
+// surface tinted identically regardless of orientation, which is exactly the
+// "flat" look the engine had. Tuned so a midday-lit white surface reads as
+// ~(1.0, 0.97, 0.90), a sky-lit surface as ~(0.55, 0.62, 0.75), and a
+// ground-lit underside as ~(0.18, 0.16, 0.13). Multiply by base albedo at
+// the end.
+function vksc_sun_r() -> float64 { return 1.08; }
+function vksc_sun_g() -> float64 { return 0.96; }
+function vksc_sun_b() -> float64 { return 0.82; }
+function vksc_sky_r() -> float64 { return 0.42; }
+function vksc_sky_g() -> float64 { return 0.55; }
+function vksc_sky_b() -> float64 { return 0.78; }
+function vksc_gnd_r() -> float64 { return 0.22; }
+function vksc_gnd_g() -> float64 { return 0.19; }
+function vksc_gnd_b() -> float64 { return 0.15; }
+
+function vksc_clamp(v: float64, lo: float64, hi: float64) -> float64 {
+  if (v < lo) { return lo; }
+  if (v > hi) { return hi; }
+  return v;
+}
+
+function vksc_face_normal(ax: float64, ay: float64, az: float64, bx: float64, by: float64, bz: float64, cx: float64, cy: float64, cz: float64, out_n: VkScenePoint*) {
+  if (out_n == 0) {
+    return;
+  }
+  var ux: float64 = bx - ax;
+  var uy: float64 = by - ay;
+  var uz: float64 = bz - az;
+  var vx: float64 = cx - ax;
+  var vy: float64 = cy - ay;
+  var vz: float64 = cz - az;
+  var nx: float64 = uy * vz - uz * vy;
+  var ny: float64 = uz * vx - ux * vz;
+  var nz: float64 = ux * vy - uy * vx;
+  var nl: float64 = sqrtf64(nx * nx + ny * ny + nz * nz);
+  if (nl < 0.000001) { nl = 0.000001; }
+  out_n->x = nx / nl;
+  out_n->y = ny / nl;
+  out_n->z = nz / nl;
+}
+
+// Hemisphere-shaded RGB for a surface with normal (nx,ny,nz) and base albedo
+// (br,bg,bb). The result is the final per-channel emit color.
+//
+// Model (cheap but expressive):
+//   sun     = sat(N·L) — directional, warm-tinted
+//   sky     = sat(N.y) — upward-facing surfaces pick up the cool sky
+//   ground  = sat(-N.y) — downward-facing surfaces pick up warm ground bounce
+//   ambient = a flat floor so deep shadow areas don't crush to black
+//   back    = a tiny wrap-around term for back-wound geometry (imported meshes)
+//
+// Each light source is multiplied by its own RGB and the albedo, then summed.
+// A subtle Lambert wrap on the sun (k=0.18) softens the terminator so the
+// shadow→light transition reads as smooth, organic shading instead of a hard
+// edge — the old shader's sharp falloff is what gave terrain that "shaded
+// brick" feel even on rolling ground.
+function vksc_shade_rgb(nx: float64, ny: float64, nz: float64, br: float64, bg: float64, bb: float64, out_r: float64*, out_g: float64*, out_b: float64*) {
+  if (out_r == 0 || out_g == 0 || out_b == 0) {
+    return;
+  }
+  var ndl: float64 = nx * vksc_light_x() + ny * vksc_light_y() + nz * vksc_light_z();
+  var wrap: float64 = 0.18;
+  var sun: float64 = (ndl + wrap) / (1.0 + wrap);
+  if (sun < 0.0) { sun = 0.0; }
+  var back: float64 = 0.0 - ndl;
+  if (back < 0.0) { back = 0.0; }
+  back = back * 0.12;
+  var sky: float64 = ny * 0.5 + 0.5;
+  if (sky < 0.0) { sky = 0.0; }
+  if (sky > 1.0) { sky = 1.0; }
+  var ground: float64 = 1.0 - sky;
+  // Hemisphere irradiance: cool sky above, warm bounce below.
+  var hr: float64 = vksc_sky_r() * sky + vksc_gnd_r() * ground;
+  var hg: float64 = vksc_sky_g() * sky + vksc_gnd_g() * ground;
+  var hb: float64 = vksc_sky_b() * sky + vksc_gnd_b() * ground;
+  // Sun contribution (warm tint).
+  var sr: float64 = vksc_sun_r() * sun * 1.05;
+  var sg: float64 = vksc_sun_g() * sun * 1.05;
+  var sb: float64 = vksc_sun_b() * sun * 1.05;
+  // Flat ambient — small, just enough to keep pitch-black shadows readable.
+  var amb: float64 = 0.06;
+  var r: float64 = br * (sr + hr * 0.70 + back + amb);
+  var g: float64 = bg * (sg + hg * 0.70 + back + amb);
+  var b: float64 = bb * (sb + hb * 0.70 + back + amb);
+  // Soft "fake fresnel": surfaces whose normal is nearly horizontal (|N.y|
+  // small) get a tiny cool-lift, biasing silhouettes to read against the
+  // background instead of merging into it. Pure cheap, normal-based — there's
+  // no view vector available here, so this is an approximation that holds up
+  // for the typical bird's-eye editor camera.
+  var horiz: float64 = 1.0 - ny * ny;
+  if (horiz < 0.0) { horiz = 0.0; }
+  if (horiz > 1.0) { horiz = 1.0; }
+  var rim: float64 = horiz * horiz * 0.08;
+  r = r + rim * 0.32;
+  g = g + rim * 0.40;
+  b = b + rim * 0.52;
+  if (r < 0.0) { r = 0.0; }
+  if (g < 0.0) { g = 0.0; }
+  if (b < 0.0) { b = 0.0; }
+  if (r > 1.20) { r = 1.20; }
+  if (g > 1.20) { g = 1.20; }
+  if (b > 1.20) { b = 1.20; }
+  *out_r = r;
+  *out_g = g;
+  *out_b = b;
+}
+
+function vksc_shaded_tri(s: VkSceneBuf*, ax: float64, ay: float64, az: float64, bx: float64, by: float64, bz: float64, cx: float64, cy: float64, cz: float64, br: float64, bg: float64, bb: float64, selected: int32) {
+  var n: VkScenePoint;
+  vksc_face_normal(ax, ay, az, bx, by, bz, cx, cy, cz, &n);
+  if (selected != 0) {
+    // Selected entities pre-mix toward warm gold before lighting so the
+    // hemisphere shader still gets to colour them naturally — the old branch
+    // just slammed the albedo to gold without re-lighting, which is why
+    // selected items always looked overlit and washed out.
+    br = br * 0.55 + 0.55;
+    bg = bg * 0.55 + 0.40;
+    bb = bb * 0.45 + 0.16;
+  }
+  var fr: float64 = 0.0;
+  var fg: float64 = 0.0;
+  var fb: float64 = 0.0;
+  vksc_shade_rgb(n.x, n.y, n.z, br, bg, bb, &fr, &fg, &fb);
+  vksc_tri(s, ax, ay, az, bx, by, bz, cx, cy, cz, fr, fg, fb);
+}
+
+// Variant for terrain that perturbs the face normal slightly with a
+// position-derived hash, then shades. Without this, a perfectly-flat
+// heightmap shades every triangle with the same (0,1,0) normal — N·L is
+// identical everywhere → uniform colour → "green sticker" look. The
+// perturbation is small enough (≤8°) that it never looks like the surface
+// is jittering, but big enough to break the dead-flat shading and give the
+// terrain that "real ground" feel.
+function vksc_shaded_tri_terrain(s: VkSceneBuf*, ax: float64, ay: float64, az: float64, bx: float64, by: float64, bz: float64, cx: float64, cy: float64, cz: float64, br: float64, bg: float64, bb: float64, selected: int32, noise_seed: float64) {
+  var n: VkScenePoint;
+  vksc_face_normal(ax, ay, az, bx, by, bz, cx, cy, cz, &n);
+  if (selected != 0) {
+    br = br * 0.55 + 0.55;
+    bg = bg * 0.55 + 0.40;
+    bb = bb * 0.45 + 0.16;
+  }
+  // Tilt the normal by a small amount derived from the triangle centroid.
+  // The tilt axis is the world-XZ plane so a tilted normal still reads
+  // mostly-upward (just facing the sun a little differently).
+  var cx_w: float64 = (ax + bx + cx) * (1.0 / 3.0);
+  var cz_w: float64 = (az + bz + cz) * (1.0 / 3.0);
+  // Cheap deterministic dither from world XZ coords. Strength tuned so the
+  // tilt stays well under 5° — enough to break uniform N·L on a flat slab,
+  // not enough to make the surface look like it's vibrating.
+  var ix: int32 = (int32)(cx_w * 2.0);
+  var iz: int32 = (int32)(cz_w * 2.0);
+  var nx_jit: float64 = vksc_quad_noise(ix, iz) * 0.05;
+  var nz_jit: float64 = vksc_quad_noise(ix + 11, iz - 7) * 0.05;
+  // noise_seed param kept for API compat but no longer applied — different
+  // tilts on the two triangles of a quad produced a hard diagonal seam.
+  if (noise_seed > 999.0) { nx_jit = nx_jit + 1.0; }
+  var pnx: float64 = n.x + nx_jit;
+  var pny: float64 = n.y;
+  var pnz: float64 = n.z + nz_jit;
+  var pnl: float64 = sqrtf64(pnx * pnx + pny * pny + pnz * pnz);
+  if (pnl < 0.000001) { pnl = 1.0; }
+  pnx = pnx / pnl;
+  pny = pny / pnl;
+  pnz = pnz / pnl;
+  var fr: float64 = 0.0;
+  var fg: float64 = 0.0;
+  var fb: float64 = 0.0;
+  vksc_shade_rgb(pnx, pny, pnz, br, bg, bb, &fr, &fg, &fb);
+  vksc_tri(s, ax, ay, az, bx, by, bz, cx, cy, cz, fr, fg, fb);
+}
+
+function vksc_shadow_patch_point(sc: Scene*, cx: float64, cz: float64, dx: float64, dz: float64, px: float64, pz: float64, along: float64, side: float64, out_p: VkScenePoint*) {
+  if (out_p == 0) {
+    return;
+  }
+  out_p->x = cx + dx * along + px * side;
+  out_p->z = cz + dz * along + pz * side;
+  out_p->y = scene_ground_height_at(sc, out_p->x, out_p->z, 0.0) + 0.018;
+}
+
+function vksc_shadow_patch_tri(s: VkSceneBuf*, c: VkScenePoint*, a: VkScenePoint*, b: VkScenePoint*) {
+  if (s == 0 || c == 0 || a == 0 || b == 0) {
+    return;
+  }
+  // Shadows pick up a faint cool sky tint instead of being neutral grey, so
+  // they look like they belong in the hemisphere-lit world. Darker overall
+  // than the old shadow colour so the sun pop is more pronounced.
+  vksc_tri(s, c->x, c->y, c->z, a->x, a->y, a->z, b->x, b->y, b->z, 0.030, 0.038, 0.052);
+}
+
+// One transformed cube corner (idx bits select +/- on each axis), applying the
+// entity's scale*half then rotation (roll Z -> pitch X -> yaw Y, the engine's
+// documented order, matching vksc_rot / vp_e_rot_vec_comp) then translation.
+// Roll was previously omitted, so the Z (roll) rotation ring did nothing.
+function vksc_corner(sc: Scene*, e: Entity*, idx: int32, axis: int32) -> float64 {
+  return scene_entity_corner(sc, e, idx, axis);
+}
+
+function vksc_cube_edge(s: VkSceneBuf*, sc: Scene*, e: Entity*, a: int32, b: int32, r: float64, g: float64, bl: float64) {
+  var ax: float64 = vksc_corner(sc, e, a, 0);
+  var ay: float64 = vksc_corner(sc, e, a, 1);
+  var az: float64 = vksc_corner(sc, e, a, 2);
+  var bx: float64 = vksc_corner(sc, e, b, 0);
+  var by: float64 = vksc_corner(sc, e, b, 1);
+  var bz: float64 = vksc_corner(sc, e, b, 2);
+  vksc_line(s, ax, ay, az, bx, by, bz, r, g, bl);
+}
+
+function vksc_box_tri(s: VkSceneBuf*, sc: Scene*, e: Entity*, a: int32, b: int32, c: int32, r: float64, g: float64, bl: float64, selected: int32) {
+  var ax: float64 = vksc_corner(sc, e, a, 0);
+  var ay: float64 = vksc_corner(sc, e, a, 1);
+  var az: float64 = vksc_corner(sc, e, a, 2);
+  var bx: float64 = vksc_corner(sc, e, b, 0);
+  var by: float64 = vksc_corner(sc, e, b, 1);
+  var bz: float64 = vksc_corner(sc, e, b, 2);
+  var cx: float64 = vksc_corner(sc, e, c, 0);
+  var cy: float64 = vksc_corner(sc, e, c, 1);
+  var cz: float64 = vksc_corner(sc, e, c, 2);
+  vksc_shaded_tri(s, ax, ay, az, bx, by, bz, cx, cy, cz, r, g, bl, selected);
+}
+
+function vksc_emit_box_triangles(s: VkSceneBuf*, sc: Scene*, e: Entity*, selected: int32) {
+  // Base albedos (pre-lighting). Saturated enough that the hemisphere shader
+  // has something to push into the sunlit hemisphere; the old colours were
+  // already lit-looking, which is why adding shading on top made everything
+  // monochrome and flat.
+  var r: float64 = 0.62;
+  var g: float64 = 0.70;
+  var b: float64 = 0.84;
+  if (e != 0 && e->kind == SK_BOX()) {
+    r = 0.78; g = 0.62; b = 0.46;
+  }
+  // Explicit per-entity color from the typed property system overrides the
+  // kind palette. The shader still relights it, so store the raw albedo.
+  if (e != 0 && scene_entity_has_color(e) != 0) {
+    r = scene_entity_color_comp_f(e, 0);
+    g = scene_entity_color_comp_f(e, 1);
+    b = scene_entity_color_comp_f(e, 2);
+  }
+  vksc_box_tri(s, sc, e, 0, 4, 1, r, g, b, selected);
+  vksc_box_tri(s, sc, e, 1, 4, 5, r, g, b, selected);
+  vksc_box_tri(s, sc, e, 2, 3, 6, r, g, b, selected);
+  vksc_box_tri(s, sc, e, 3, 7, 6, r, g, b, selected);
+  vksc_box_tri(s, sc, e, 0, 2, 4, r, g, b, selected);
+  vksc_box_tri(s, sc, e, 2, 6, 4, r, g, b, selected);
+  vksc_box_tri(s, sc, e, 1, 5, 3, r, g, b, selected);
+  vksc_box_tri(s, sc, e, 3, 5, 7, r, g, b, selected);
+  vksc_box_tri(s, sc, e, 0, 1, 2, r, g, b, selected);
+  vksc_box_tri(s, sc, e, 1, 3, 2, r, g, b, selected);
+  vksc_box_tri(s, sc, e, 4, 6, 5, r, g, b, selected);
+  vksc_box_tri(s, sc, e, 5, 6, 7, r, g, b, selected);
+}
+
+function vksc_emit_entity_shadow(s: VkSceneBuf*, sc: Scene*, e: Entity*) {
+  if (s == 0 || sc == 0 || e == 0) {
+    return;
+  }
+  if (e->kind == SK_TERRAIN()) {
+    return;
+  }
+  var cx: float64 = scene_entity_world_pos(sc, e, 0);
+  var cz: float64 = scene_entity_world_pos(sc, e, 2);
+  var gy: float64 = scene_ground_height_at(sc, cx, cz, 0.0) + 0.018;
+  var radius: float64 = scene_entity_radius(sc, e);
+  var h: float64 = scene_entity_half_y(e) * scene_entity_world_scale(sc, e) * 2.0;
+  if (radius < 0.35) { radius = 0.35; }
+  if (h < 0.35) { h = 0.35; }
+  var dx: float64 = 0.0 - vksc_light_x();
+  var dz: float64 = 0.0 - vksc_light_z();
+  var dl: float64 = sqrtf64(dx * dx + dz * dz);
+  if (dl < 0.000001) { dl = 1.0; }
+  dx = dx / dl;
+  dz = dz / dl;
+  var px: float64 = 0.0 - dz;
+  var pz: float64 = dx;
+  var len: float64 = radius * 1.20 + h * 0.42;
+  var wid: float64 = radius * 0.72;
+  if (len > 9.0) { len = 9.0; }
+  if (wid > 4.0) { wid = 4.0; }
+
+  var cc: VkScenePoint;
+  cc.x = cx + dx * (len * 0.26);
+  cc.z = cz + dz * (len * 0.26);
+  cc.y = scene_ground_height_at(sc, cc.x, cc.z, gy) + 0.018;
+  var p0: VkScenePoint;
+  var p1: VkScenePoint;
+  var p2: VkScenePoint;
+  var p3: VkScenePoint;
+  var p4: VkScenePoint;
+  var p5: VkScenePoint;
+  var p6: VkScenePoint;
+  var p7: VkScenePoint;
+  vksc_shadow_patch_point(sc, cx, cz, dx, dz, px, pz, len, 0.0, &p0);
+  vksc_shadow_patch_point(sc, cx, cz, dx, dz, px, pz, len * 0.62, wid * 0.70, &p1);
+  vksc_shadow_patch_point(sc, cx, cz, dx, dz, px, pz, len * 0.12, wid, &p2);
+  vksc_shadow_patch_point(sc, cx, cz, dx, dz, px, pz, 0.0 - len * 0.18, wid * 0.52, &p3);
+  vksc_shadow_patch_point(sc, cx, cz, dx, dz, px, pz, 0.0 - len * 0.28, 0.0, &p4);
+  vksc_shadow_patch_point(sc, cx, cz, dx, dz, px, pz, 0.0 - len * 0.18, 0.0 - wid * 0.52, &p5);
+  vksc_shadow_patch_point(sc, cx, cz, dx, dz, px, pz, len * 0.12, 0.0 - wid, &p6);
+  vksc_shadow_patch_point(sc, cx, cz, dx, dz, px, pz, len * 0.62, 0.0 - wid * 0.70, &p7);
+  vksc_shadow_patch_tri(s, &cc, &p0, &p1);
+  vksc_shadow_patch_tri(s, &cc, &p1, &p2);
+  vksc_shadow_patch_tri(s, &cc, &p2, &p3);
+  vksc_shadow_patch_tri(s, &cc, &p3, &p4);
+  vksc_shadow_patch_tri(s, &cc, &p4, &p5);
+  vksc_shadow_patch_tri(s, &cc, &p5, &p6);
+  vksc_shadow_patch_tri(s, &cc, &p6, &p7);
+  vksc_shadow_patch_tri(s, &cc, &p7, &p0);
+}
+
+// Entity local->world rotated vector (roll Z, pitch X, yaw Y) -- mirrors the
+// CPU vp_e_rot_vec_comp so gizmo axes align with the picking/manip math.
+function vksc_rot(sc: Scene*, e: Entity*, sx: float64, sy: float64, sz: float64, comp: int32) -> float64 {
+  return scene_entity_world_rot_vec(sc, e, sx, sy, sz, comp);
+}
+
+function vksc_mesh_world_scaled_into(sc: Scene*, e: Entity*, x: float64, y: float64, z: float64, ws: float64, ex: float64, ey: float64, ez: float64, out_p: VkScenePoint*) {
+  if (out_p == 0) {
+    return;
+  }
+  var sx: float64 = x * ws;
+  var sy: float64 = y * ws;
+  var sz: float64 = z * ws;
+  out_p->x = ex + scene_entity_world_rot_vec(sc, e, sx, sy, sz, 0);
+  out_p->y = ey + scene_entity_world_rot_vec(sc, e, sx, sy, sz, 1);
+  out_p->z = ez + scene_entity_world_rot_vec(sc, e, sx, sy, sz, 2);
+}
+
+function vksc_terrain_world(sc: Scene*, e: Entity*, lx: float64, lz: float64, comp: int32) -> float64 {
+  var ly: float64 = scene_terrain_height_local(sc, e, lx, lz);
+  return scene_entity_mesh_world(sc, e, lx, ly, lz, comp);
+}
+
+// Deterministic noise in [-1,1] from integer cell coords. Tiny hash, used to
+// dither terrain albedo so neighbouring quads of "grass" don't share the
+// exact same RGB — this is what stops a flat heightmap reading as a solid
+// green sticker. No allocations, no trig.
+function vksc_quad_noise(ix: int32, iz: int32) -> float64 {
+  // Standard integer hash mash. The exact constants don't matter; what
+  // matters is that adjacent (ix, iz) cells get visually-uncorrelated values.
+  var n: int32 = ix * 374761393 + iz * 668265263;
+  n = (n ^ (n >> 13)) * 1274126177;
+  n = n ^ (n >> 16);
+  // Map low bits to [-1, 1].
+  var m: int32 = n & 65535;
+  return (float64)m / 32768.0 - 1.0;
+}
+
+// Pick a terrain base albedo from local face slope + average height. Flat
+// near-ground patches read as grass, steep faces fade toward rock-grey, and
+// the highest peaks pick up a snow/dust tint. The blend is cheap (per-quad,
+// not per-pixel) but goes a long way toward "this is a landscape" instead
+// of "this is a green tablecloth".
+function vksc_terrain_albedo(slope: float64, avg_y: float64, comp: int32) -> float64 {
+  // grass: deep saturated green; rock: warm grey; snow: cool off-white.
+  var gr: float64 = 0.28;
+  var gg: float64 = 0.58;
+  var gb: float64 = 0.24;
+  var rr: float64 = 0.46;
+  var rg: float64 = 0.40;
+  var rb: float64 = 0.34;
+  var sr: float64 = 0.86;
+  var sg: float64 = 0.88;
+  var sb: float64 = 0.92;
+  // Slope in [0,1] where 0 = perfectly flat ground, 1 = vertical wall.
+  if (slope < 0.0) { slope = 0.0; }
+  if (slope > 1.0) { slope = 1.0; }
+  // Smoothstep-ish curve so flat ground stays grass until the slope actually
+  // tips, then rolls into rock over the middle range.
+  var rock_t: float64 = slope * slope * (3.0 - 2.0 * slope);
+  var br: float64 = gr * (1.0 - rock_t) + rr * rock_t;
+  var bg: float64 = gg * (1.0 - rock_t) + rg * rock_t;
+  var bb: float64 = gb * (1.0 - rock_t) + rb * rock_t;
+  // Snow blend on the highest patches. Threshold/scale is generous — the
+  // user's terrain Y is in metres and most editor stamps stay under ~6, so
+  // peaks at +3m+ start picking up snow.
+  var snow_t: float64 = (avg_y - 2.5) / 3.5;
+  if (snow_t < 0.0) { snow_t = 0.0; }
+  if (snow_t > 1.0) { snow_t = 1.0; }
+  // Only flat-ish snow accumulates; cliffs stay rocky even when high.
+  snow_t = snow_t * (1.0 - rock_t * 0.7);
+  br = br * (1.0 - snow_t) + sr * snow_t;
+  bg = bg * (1.0 - snow_t) + sg * snow_t;
+  bb = bb * (1.0 - snow_t) + sb * snow_t;
+  if (comp == 0) { return br; }
+  if (comp == 1) { return bg; }
+  return bb;
+}
+
+function vksc_emit_terrain_triangles(s: VkSceneBuf*, sc: Scene*, e: Entity*, selected: int32) {
+  if (s == 0 || sc == 0 || e == 0) {
+    return;
+  }
+  // Bump tessellation up: the old grid of 24 made hemisphere shading look
+  // facetted, because the per-face normal changes in big chunks. 40 is still
+  // well within the 120k-vertex budget for a single terrain entity and gives
+  // a noticeably smoother lit surface.
+  var grid: int32 = 40;
+  var hx: float64 = scene_entity_half_x(e);
+  var hz: float64 = scene_entity_half_z(e);
+  var dx: float64 = (hx * 2.0) / (float64)grid;
+  var dz: float64 = (hz * 2.0) / (float64)grid;
+  var ix: int32 = 0;
+  while (ix < grid) {
+    var iz: int32 = 0;
+    while (iz < grid) {
+      var x0: float64 = 0.0 - hx + (float64)ix * dx;
+      var x1: float64 = x0 + dx;
+      var z0: float64 = 0.0 - hz + (float64)iz * dz;
+      var z1: float64 = z0 + dz;
+      var ax: float64 = vksc_terrain_world(sc, e, x0, z0, 0);
+      var ay: float64 = vksc_terrain_world(sc, e, x0, z0, 1);
+      var az: float64 = vksc_terrain_world(sc, e, x0, z0, 2);
+      var bx: float64 = vksc_terrain_world(sc, e, x1, z0, 0);
+      var by: float64 = vksc_terrain_world(sc, e, x1, z0, 1);
+      var bz: float64 = vksc_terrain_world(sc, e, x1, z0, 2);
+      var cx: float64 = vksc_terrain_world(sc, e, x0, z1, 0);
+      var cy: float64 = vksc_terrain_world(sc, e, x0, z1, 1);
+      var cz: float64 = vksc_terrain_world(sc, e, x0, z1, 2);
+      var dxw: float64 = vksc_terrain_world(sc, e, x1, z1, 0);
+      var dyw: float64 = vksc_terrain_world(sc, e, x1, z1, 1);
+      var dzw: float64 = vksc_terrain_world(sc, e, x1, z1, 2);
+      // Slope ~ how much the quad's diagonal climbs over its planar width.
+      var quad_w: float64 = sqrtf64(dx * dx + dz * dz);
+      if (quad_w < 0.001) { quad_w = 0.001; }
+      var dy_ac: float64 = cy - ay;
+      var dy_bd: float64 = dyw - by;
+      var rise: float64 = dy_ac;
+      if (dy_bd > rise) { rise = dy_bd; }
+      if (rise < 0.0) { rise = 0.0 - rise; }
+      var slope: float64 = rise / quad_w;
+      if (slope > 1.0) { slope = 1.0; }
+      var avg_y: float64 = (ay + by + cy + dyw) * 0.25;
+      var ar: float64 = vksc_terrain_albedo(slope, avg_y, 0);
+      var ag: float64 = vksc_terrain_albedo(slope, avg_y, 1);
+      var ab: float64 = vksc_terrain_albedo(slope, avg_y, 2);
+      // Per-quad dither. Kept SUBTLE — the previous strength (12% combined)
+      // was loud enough that the tessellation pattern read as a "tin foil"
+      // shimmer instead of a natural surface. 4% feels like grass variation
+      // without making the geometry look broken.
+      var n_big: float64 = vksc_quad_noise(ix >> 1, iz >> 1) * 0.025;
+      var n_mid: float64 = vksc_quad_noise(ix, iz) * 0.015;
+      var ar_q: float64 = ar * (1.0 + n_big + n_mid);
+      var ag_q: float64 = ag * (1.0 + n_big + n_mid * 0.7);
+      var ab_q: float64 = ab * (1.0 + n_big + n_mid * 0.5);
+      // Same albedo on both triangles of the quad — varying it per-tri made
+      // the diagonal split visible as a hard seam, which looked worse than
+      // any flatness it was fighting.
+      vksc_shaded_tri_terrain(s, ax, ay, az, cx, cy, cz, bx, by, bz, ar_q, ag_q, ab_q, selected, 0.0);
+      vksc_shaded_tri_terrain(s, bx, by, bz, cx, cy, cz, dxw, dyw, dzw, ar_q, ag_q, ab_q, selected, 0.0);
+      iz = iz + 1;
+    }
+    ix = ix + 1;
+  }
+}
+
+function vksc_emit_terrain_lines(s: VkSceneBuf*, sc: Scene*, e: Entity*, r: float64, g: float64, b: float64) {
+  if (s == 0 || sc == 0 || e == 0) {
+    return;
+  }
+  var grid: int32 = 12;
+  var hx: float64 = scene_entity_half_x(e);
+  var hz: float64 = scene_entity_half_z(e);
+  var dx: float64 = (hx * 2.0) / (float64)grid;
+  var dz: float64 = (hz * 2.0) / (float64)grid;
+  var i: int32 = 0;
+  while (i <= grid) {
+    var lx: float64 = 0.0 - hx + (float64)i * dx;
+    var ax: float64 = vksc_terrain_world(sc, e, lx, 0.0 - hz, 0);
+    var ay: float64 = vksc_terrain_world(sc, e, lx, 0.0 - hz, 1);
+    var az: float64 = vksc_terrain_world(sc, e, lx, 0.0 - hz, 2);
+    var bx: float64 = vksc_terrain_world(sc, e, lx, hz, 0);
+    var by: float64 = vksc_terrain_world(sc, e, lx, hz, 1);
+    var bz: float64 = vksc_terrain_world(sc, e, lx, hz, 2);
+    vksc_line(s, ax, ay, az, bx, by, bz, r, g, b);
+    i = i + 1;
+  }
+  i = 0;
+  while (i <= grid) {
+    var lz: float64 = 0.0 - hz + (float64)i * dz;
+    var cx: float64 = vksc_terrain_world(sc, e, 0.0 - hx, lz, 0);
+    var cy: float64 = vksc_terrain_world(sc, e, 0.0 - hx, lz, 1);
+    var cz: float64 = vksc_terrain_world(sc, e, 0.0 - hx, lz, 2);
+    var dxw: float64 = vksc_terrain_world(sc, e, hx, lz, 0);
+    var dyw: float64 = vksc_terrain_world(sc, e, hx, lz, 1);
+    var dzw: float64 = vksc_terrain_world(sc, e, hx, lz, 2);
+    vksc_line(s, cx, cy, cz, dxw, dyw, dzw, r, g, b);
+    i = i + 1;
+  }
+}
+
+function vksc_emit_mesh_triangles(s: VkSceneBuf*, sc: Scene*, e: Entity*, m: MeshRecord*, selected: int32) {
+  if (s == 0 || e == 0 || m == 0) {
+    return;
+  }
+  var ws: float64 = scene_entity_world_scale(sc, e);
+  var ex: float64 = scene_entity_world_pos(sc, e, 0);
+  var ey: float64 = scene_entity_world_pos(sc, e, 1);
+  var ez: float64 = scene_entity_world_pos(sc, e, 2);
+  var tri_n: int32 = mesh_record_tri_count(m);
+  var t: int32 = 0;
+  while (t < tri_n) {
+    var ia: int32 = mesh_tri_index(m, t, 0);
+    var ib: int32 = mesh_tri_index(m, t, 1);
+    var ic: int32 = mesh_tri_index(m, t, 2);
+    var alx: float64 = mesh_vx(m, ia);
+    var aly: float64 = mesh_vy(m, ia);
+    var alz: float64 = mesh_vz(m, ia);
+    var blx: float64 = mesh_vx(m, ib);
+    var bly: float64 = mesh_vy(m, ib);
+    var blz: float64 = mesh_vz(m, ib);
+    var clx: float64 = mesh_vx(m, ic);
+    var cly: float64 = mesh_vy(m, ic);
+    var clz: float64 = mesh_vz(m, ic);
+    var a: VkScenePoint;
+    var bpt: VkScenePoint;
+    var cpt: VkScenePoint;
+    vksc_mesh_world_scaled_into(sc, e, alx, aly, alz, ws, ex, ey, ez, &a);
+    vksc_mesh_world_scaled_into(sc, e, blx, bly, blz, ws, ex, ey, ez, &bpt);
+    vksc_mesh_world_scaled_into(sc, e, clx, cly, clz, ws, ex, ey, ez, &cpt);
+    vksc_shaded_tri(s, a.x, a.y, a.z, bpt.x, bpt.y, bpt.z, cpt.x, cpt.y, cpt.z, 0.50, 0.67, 0.86, selected);
+    t = t + 1;
+  }
+}
+
+// World-space unit vector for local axis (1=X,2=Y,3=Z).
+function vksc_axis(sc: Scene*, e: Entity*, which: int32, comp: int32) -> float64 {
+  if (which == 1) { return vksc_rot(sc, e, 1.0, 0.0, 0.0, comp); }
+  if (which == 2) { return vksc_rot(sc, e, 0.0, 1.0, 0.0, comp); }
+  return vksc_rot(sc, e, 0.0, 0.0, 1.0, comp);
+}
+
+// Ring-plane basis U for rotation gizmo around local `ring_axis` (mirrors CPU).
+function vksc_ring_u(sc: Scene*, e: Entity*, ring_axis: int32, comp: int32) -> float64 {
+  var ax: float64 = vksc_axis(sc, e, ring_axis, 0);
+  var ay: float64 = vksc_axis(sc, e, ring_axis, 1);
+  var az: float64 = vksc_axis(sc, e, ring_axis, 2);
+  var wx: float64 = 0.0;
+  var wy: float64 = 1.0;
+  var wz: float64 = 0.0;
+  var adot: float64 = ax * wx + ay * wy + az * wz;
+  if (adot * adot > 0.81) {
+    wy = 0.0;
+    wz = 1.0;
+  }
+  var tx: float64 = wy * az - wz * ay;
+  var ty: float64 = wz * ax - wx * az;
+  var tz: float64 = wx * ay - wy * ax;
+  var tlen: float64 = sqrtf64(tx * tx + ty * ty + tz * tz);
+  if (tlen < 0.000001) { tlen = 0.000001; }
+  if (comp == 0) { return tx / tlen; }
+  if (comp == 1) { return ty / tlen; }
+  return tz / tlen;
+}
+
+function vksc_ring_v(sc: Scene*, e: Entity*, ring_axis: int32, comp: int32) -> float64 {
+  // V = axis x U (axis and U are unit & orthogonal).
+  var ax: float64 = vksc_axis(sc, e, ring_axis, 0);
+  var ay: float64 = vksc_axis(sc, e, ring_axis, 1);
+  var az: float64 = vksc_axis(sc, e, ring_axis, 2);
+  var ux: float64 = vksc_ring_u(sc, e, ring_axis, 0);
+  var uy: float64 = vksc_ring_u(sc, e, ring_axis, 1);
+  var uz: float64 = vksc_ring_u(sc, e, ring_axis, 2);
+  if (comp == 0) { return ay * uz - az * uy; }
+  if (comp == 1) { return az * ux - ax * uz; }
+  return ax * uy - ay * ux;
+}
+
+// World-aligned ring basis (must match vp_gizmo_ring_*_world in the viewport).
+// The rotate gizmo uses world axes so every ring responds regardless of the
+// entity's current rotation.
+function vksc_wring_axis(which: int32, comp: int32) -> float64 {
+  if (which == 1) {
+    if (comp == 0) { return 1.0; }
+    return 0.0;
+  }
+  if (which == 2) {
+    if (comp == 1) { return 1.0; }
+    return 0.0;
+  }
+  if (comp == 2) { return 1.0; }
+  return 0.0;
+}
+
+function vksc_wring_u(which: int32, comp: int32) -> float64 {
+  var ax: float64 = vksc_wring_axis(which, 0);
+  var ay: float64 = vksc_wring_axis(which, 1);
+  var az: float64 = vksc_wring_axis(which, 2);
+  var wx: float64 = 0.0;
+  var wy: float64 = 1.0;
+  var wz: float64 = 0.0;
+  var adot: float64 = ax * wx + ay * wy + az * wz;
+  if (adot * adot > 0.81) {
+    wy = 0.0;
+    wz = 1.0;
+  }
+  var tx: float64 = wy * az - wz * ay;
+  var ty: float64 = wz * ax - wx * az;
+  var tz: float64 = wx * ay - wy * ax;
+  var tlen: float64 = sqrtf64(tx * tx + ty * ty + tz * tz);
+  if (tlen < 0.000001) { tlen = 0.000001; }
+  if (comp == 0) { return tx / tlen; }
+  if (comp == 1) { return ty / tlen; }
+  return tz / tlen;
+}
+
+function vksc_wring_v(which: int32, comp: int32) -> float64 {
+  var ax: float64 = vksc_wring_axis(which, 0);
+  var ay: float64 = vksc_wring_axis(which, 1);
+  var az: float64 = vksc_wring_axis(which, 2);
+  var ux: float64 = vksc_wring_u(which, 0);
+  var uy: float64 = vksc_wring_u(which, 1);
+  var uz: float64 = vksc_wring_u(which, 2);
+  if (comp == 0) { return ay * uz - az * uy; }
+  if (comp == 1) { return az * ux - ax * uz; }
+  return ax * uy - ay * ux;
+}
+
+function vksc_gizmo_radius(sc: Scene*, e: Entity*, vp: EngineViewport*) -> float64 {
+  if (e == 0) {
+    return 1.0;
+  }
+  var d: float64 = 6.0;
+  if (vp != 0) {
+    var yaw: float64 = vp->cam_yaw;
+    var pitch: float64 = vp->cam_pitch;
+    var cy: float64 = cosf64(yaw);
+    var sy: float64 = sinf64(yaw);
+    var cp: float64 = cosf64(pitch);
+    var sp: float64 = sinf64(pitch);
+    var rx: float64 = scene_entity_world_pos(sc, e, 0) - vp->cam_x;
+    var ry: float64 = scene_entity_world_pos(sc, e, 1) - vp->cam_y;
+    var rz: float64 = scene_entity_world_pos(sc, e, 2) - vp->cam_z;
+    var z1: float64 = rx * sy + rz * cy;
+    d = ry * sp + z1 * cp;
+  }
+  if (d < 2.0) { d = 2.0; }
+  var r: float64 = d * 0.16;
+  var base: float64 = scene_entity_radius(sc, e);
+  var min_r: float64 = base * 0.75;
+  if (min_r < 0.55) { min_r = 0.55; }
+  if (r < min_r) { r = min_r; }
+  if (r > 8.0) { r = 8.0; }
+  return r;
+}
+
+function vksc_axis_color_comp(which: int32, hot: int32, comp: int32) -> float64 {
+  var r: float64 = 0.31;
+  var g: float64 = 0.31;
+  var b: float64 = 0.82;
+  if (which == 2) { r = 0.35; g = 0.78; b = 0.35; }
+  if (which == 3) { r = 0.31; g = 0.51; b = 0.86; }
+  if (hot != 0) {
+    r = r + 0.4; g = g + 0.4; b = b + 0.4;
+    if (r > 1.0) { r = 1.0; }
+    if (g > 1.0) { g = 1.0; }
+    if (b > 1.0) { b = 1.0; }
+  }
+  if (comp == 0) { return r; }
+  if (comp == 1) { return g; }
+  return b;
+}
+
+function vksc_handle_box(s: VkSceneBuf*, cx: float64, cy: float64, cz: float64, h: float64, r: float64, g: float64, b: float64) {
+  var x0: float64 = cx - h;
+  var x1: float64 = cx + h;
+  var y0: float64 = cy - h;
+  var y1: float64 = cy + h;
+  var z0: float64 = cz - h;
+  var z1: float64 = cz + h;
+  vksc_line(s, x0, y0, z0, x1, y0, z0, r, g, b);
+  vksc_line(s, x1, y0, z0, x1, y0, z1, r, g, b);
+  vksc_line(s, x1, y0, z1, x0, y0, z1, r, g, b);
+  vksc_line(s, x0, y0, z1, x0, y0, z0, r, g, b);
+  vksc_line(s, x0, y1, z0, x1, y1, z0, r, g, b);
+  vksc_line(s, x1, y1, z0, x1, y1, z1, r, g, b);
+  vksc_line(s, x1, y1, z1, x0, y1, z1, r, g, b);
+  vksc_line(s, x0, y1, z1, x0, y1, z0, r, g, b);
+  vksc_line(s, x0, y0, z0, x0, y1, z0, r, g, b);
+  vksc_line(s, x1, y0, z0, x1, y1, z0, r, g, b);
+  vksc_line(s, x1, y0, z1, x1, y1, z1, r, g, b);
+  vksc_line(s, x0, y0, z1, x0, y1, z1, r, g, b);
+}
+
+// Axis color (matches vp_gizmo_axis_col): X blue-ish, Y green, Z light-blue;
+// hot (active drag axis) brightens.
+function vksc_axis_rgb(s: VkSceneBuf*, ax: float64, ay: float64, az: float64, bx: float64, by: float64, bz: float64, which: int32, hot: int32) {
+  var r: float64 = 0.31;
+  var g: float64 = 0.31;
+  var b: float64 = 0.82;
+  if (which == 2) { r = 0.35; g = 0.78; b = 0.35; }
+  if (which == 3) { r = 0.31; g = 0.51; b = 0.86; }
+  if (hot != 0) {
+    r = r + 0.4; g = g + 0.4; b = b + 0.4;
+    if (r > 1.0) { r = 1.0; }
+    if (g > 1.0) { g = 1.0; }
+    if (b > 1.0) { b = 1.0; }
+  }
+  vksc_line(s, ax, ay, az, bx, by, bz, r, g, b);
+}
+
+// Emit the transform gizmo for the selected entity, matching the CPU drawer:
+// tool 1 = move (axis arrows), 3 = scale (axis bars), 2 = rotate (3 rings).
+function vksc_gizmo(s: VkSceneBuf*, sc: Scene*, e: Entity*, vp: EngineViewport*, tool: int32, manip_axis: int32, manip_drag: int32, hover_axis: int32) {
+  if (e == 0) {
+    return;
+  }
+  if (tool != 1 && tool != 2 && tool != 3) {
+    return;
+  }
+  var rad: float64 = vksc_gizmo_radius(sc, e, vp);
+  var ox: float64 = scene_entity_world_pos(sc, e, 0);
+  var oy: float64 = scene_entity_world_pos(sc, e, 1);
+  var oz: float64 = scene_entity_world_pos(sc, e, 2);
+  if (tool == 1) {
+    var a: int32 = 1;
+    while (a <= 3) {
+      var hot: int32 = 0;
+      if ((manip_drag != 0 && manip_axis == a) || hover_axis == a) { hot = 1; }
+      var dx: float64 = vksc_axis(sc, e, a, 0);
+      var dy: float64 = vksc_axis(sc, e, a, 1);
+      var dz: float64 = vksc_axis(sc, e, a, 2);
+      var ex: float64 = ox + dx * rad;
+      var ey: float64 = oy + dy * rad;
+      var ez: float64 = oz + dz * rad;
+      vksc_axis_rgb(s, ox, oy, oz, ex, ey, ez, a, hot);
+      // Arrowhead: two short back-swept segments along ring-U.
+      var rux: float64 = vksc_ring_u(sc, e, a, 0);
+      var ruy: float64 = vksc_ring_u(sc, e, a, 1);
+      var ruz: float64 = vksc_ring_u(sc, e, a, 2);
+      var ah: float64 = rad * 0.16;
+      var bk: float64 = rad * 0.2;
+      vksc_axis_rgb(s, ex, ey, ez, ex - dx * bk + rux * ah, ey - dy * bk + ruy * ah, ez - dz * bk + ruz * ah, a, hot);
+      vksc_axis_rgb(s, ex, ey, ez, ex - dx * bk - rux * ah, ey - dy * bk - ruy * ah, ez - dz * bk - ruz * ah, a, hot);
+      var hr: float64 = vksc_axis_color_comp(a, hot, 0);
+      var hg: float64 = vksc_axis_color_comp(a, hot, 1);
+      var hb: float64 = vksc_axis_color_comp(a, hot, 2);
+      var hs: float64 = rad * 0.045;
+      if (hot != 0) { hs = rad * 0.065; }
+      if (hs < 0.06) { hs = 0.06; }
+      vksc_handle_box(s, ex, ey, ez, hs, hr, hg, hb);
+      a = a + 1;
+    }
+    return;
+  }
+  if (tool == 3) {
+    var rs: float64 = rad * 0.78;
+    var a2: int32 = 1;
+    while (a2 <= 3) {
+      var hot2: int32 = 0;
+      if ((manip_drag != 0 && manip_axis == a2) || hover_axis == a2) { hot2 = 1; }
+      var dx2: float64 = vksc_axis(sc, e, a2, 0);
+      var dy2: float64 = vksc_axis(sc, e, a2, 1);
+      var dz2: float64 = vksc_axis(sc, e, a2, 2);
+      var sx: float64 = ox + dx2 * rs;
+      var sy: float64 = oy + dy2 * rs;
+      var sz: float64 = oz + dz2 * rs;
+      vksc_axis_rgb(s, ox, oy, oz, sx, sy, sz, a2, hot2);
+      var sr: float64 = vksc_axis_color_comp(a2, hot2, 0);
+      var sg: float64 = vksc_axis_color_comp(a2, hot2, 1);
+      var sb: float64 = vksc_axis_color_comp(a2, hot2, 2);
+      var sh: float64 = rad * 0.055;
+      if (hot2 != 0) { sh = rad * 0.075; }
+      if (sh < 0.07) { sh = 0.07; }
+      vksc_handle_box(s, sx, sy, sz, sh, sr, sg, sb);
+      a2 = a2 + 1;
+    }
+    return;
+  }
+  // tool == 2: three rotation rings.
+  var rr: float64 = rad * 0.92;
+  // 36 segments to match vp_gizmo_hit_rotate's seg_n (so the visible ring and
+  // the hit-test polyline coincide).
+  var seg: int32 = 36;
+  var a3: int32 = 1;
+  while (a3 <= 3) {
+    var hot3: int32 = 0;
+    if ((manip_drag != 0 && manip_axis == a3) || hover_axis == a3) { hot3 = 1; }
+    var ux: float64 = vksc_wring_u(a3, 0);
+    var uy: float64 = vksc_wring_u(a3, 1);
+    var uz: float64 = vksc_wring_u(a3, 2);
+    var vx: float64 = vksc_wring_v(a3, 0);
+    var vy: float64 = vksc_wring_v(a3, 1);
+    var vz: float64 = vksc_wring_v(a3, 2);
+    var px: float64 = ox + rr * ux;
+    var py: float64 = oy + rr * uy;
+    var pz: float64 = oz + rr * uz;
+    var k: int32 = 1;
+    while (k <= seg) {
+      var ang: float64 = (float64)k * 6.28318530717958647692 / (float64)seg;
+      var ca: float64 = cosf64(ang);
+      var sa: float64 = sinf64(ang);
+      var nx: float64 = ox + rr * (ca * ux + sa * vx);
+      var ny: float64 = oy + rr * (ca * uy + sa * vy);
+      var nz: float64 = oz + rr * (ca * uz + sa * vz);
+      vksc_axis_rgb(s, px, py, pz, nx, ny, nz, a3, hot3);
+      px = nx;
+      py = ny;
+      pz = nz;
+      k = k + 1;
+    }
+    a3 = a3 + 1;
+  }
+}
+
+// RGB color for the terrain brush ring, keyed by op. Op 0=raise (amber),
+// 1=lower (sky-blue), 2=smooth (mint), 3=flatten (gold). When the sculpt
+// mode is OFF we draw a dimmer "preview" version so the user can see what
+// they'd be painting before pressing T.
+function vksc_brush_color_comp(op: int32, active: int32, comp: int32) -> float64 {
+  var r: float64 = 1.00;
+  var g: float64 = 0.72;
+  var b: float64 = 0.28;
+  if (op == 1) {
+    r = 0.36; g = 0.74; b = 1.00;
+  }
+  if (op == 2) {
+    r = 0.46; g = 1.00; b = 0.78;
+  }
+  if (op == 3) {
+    r = 1.00; g = 0.92; b = 0.42;
+  }
+  if (active == 0) {
+    // Preview tint when sculpt mode is off — desaturated and dimmer so it
+    // reads as "you're hovering" rather than "you're painting".
+    r = r * 0.55 + 0.10;
+    g = g * 0.55 + 0.10;
+    b = b * 0.55 + 0.10;
+  }
+  if (comp == 0) { return r; }
+  if (comp == 1) { return g; }
+  return b;
+}
+
+// Walk a circle around (hit_x, hit_z) in world space, sampling the terrain
+// height at every step so the ring drapes onto the surface (no z-fighting,
+// no floating-above-terrain). dy is a small lift to keep the line from
+// punching through the heightmap when the surface is bumpy.
+function vksc_brush_ring_point(sc: Scene*, e: Entity*, hx_world: float64, hz_world: float64, radius: float64, lift: float64, ang: float64, out_p: VkScenePoint*) {
+  if (out_p == 0) {
+    return;
+  }
+  // The ring's center is the world-space terrain ray-hit. Each sample is a
+  // world-space XZ offset around that center; the Y is sampled directly from
+  // the terrain so the ring drapes. We deliberately do NOT clamp the world
+  // XZ to terrain bounds — clamping made every out-of-bounds sample collapse
+  // to the same corner, which produced the line-spray artifact (visible as
+  // long lines stretching from a terrain corner to wherever the cursor was).
+  //
+  // The terrain in this engine is axis-aligned and unrotated, so converting
+  // world->local is just `(world - origin) / scale`. We don't need
+  // scene_terrain_world_to_local_xz_simple's clamp behavior here.
+  var wx: float64 = hx_world + cosf64(ang) * radius;
+  var wz: float64 = hz_world + sinf64(ang) * radius;
+  var s: float64 = scene_entity_world_scale(sc, e);
+  if (s < 0.000001) { s = 0.000001; }
+  var px: float64 = scene_entity_world_pos(sc, e, 0);
+  var pz: float64 = scene_entity_world_pos(sc, e, 2);
+  var lx: float64 = (wx - px) / s;
+  var lz: float64 = (wz - pz) / s;
+  // scene_terrain_height_local already clamps to its grid bounds when
+  // sampling — out-of-bounds (lx, lz) returns the edge height. That gives
+  // the ring a smooth fall-off at the terrain edge instead of jumping.
+  var ly_local: float64 = scene_terrain_height_local(sc, e, lx, lz);
+  var py: float64 = scene_entity_world_pos(sc, e, 1);
+  // World Y = entity_y + local_y * scale. No rotation needed (terrain is
+  // always axis-aligned in this engine).
+  out_p->x = wx;
+  out_p->y = py + ly_local * s + lift;
+  out_p->z = wz;
+}
+
+function vksc_emit_terrain_brush(s: VkSceneBuf*, sc: Scene*, vp: EngineViewport*) {
+  if (s == 0 || sc == 0 || vp == 0) {
+    return;
+  }
+  if (vp->brush_hit_valid == 0 || vp->brush_hit_id == 0) {
+    return;
+  }
+  // Brush attaches to whichever terrain entity the cursor actually hit —
+  // selected or merely hovered. This decouples the brush from selection so
+  // the user can preview a stamp without remembering to click "Terrain" in
+  // the scene tree first.
+  var be: Entity* = scene_find(sc, vp->brush_hit_id);
+  if (be == 0 || be->kind != SK_TERRAIN()) {
+    return;
+  }
+  var active: int32 = vp->terrain_sculpt_mode;
+  // Only show the brush when:
+  //   - sculpt mode is ON (you're actively painting), OR
+  //   - the terrain you're hovering is the selected one (preview).
+  // Hovering some other terrain you haven't selected shouldn't pop a brush
+  // out of nowhere — too noisy.
+  if (active == 0) {
+    var sel: Entity* = scene_selected_row(sc);
+    if (sel == 0 || sel->id != be->id) {
+      return;
+    }
+  }
+  var r: float64 = vksc_brush_color_comp(vp->terrain_brush_op, active, 0);
+  var g: float64 = vksc_brush_color_comp(vp->terrain_brush_op, active, 1);
+  var b: float64 = vksc_brush_color_comp(vp->terrain_brush_op, active, 2);
+  var radius: float64 = vp->terrain_brush_radius;
+  if (radius < 0.05) { radius = 0.05; }
+  var inner: float64 = radius * 0.55;
+  var hx_world: float64 = vp->brush_hit_x;
+  var hz_world: float64 = vp->brush_hit_z;
+  // Lift the ring a clear chunk above the surface — small lifts (4 cm) get
+  // eaten by depth precision on flatter terrains and the user reports the
+  // brush rendering "underneath the terrain". 20 cm is generous enough to
+  // always show on top across the whole 22x22 m default terrain, without
+  // looking like it's floating when you're up close.
+  var lift_out: float64 = 0.20;
+  var lift_in: float64 = 0.22;
+  var seg: int32 = 72;
+  var prev_o: VkScenePoint;
+  var prev_i: VkScenePoint;
+  vksc_brush_ring_point(sc, be, hx_world, hz_world, radius, lift_out, 0.0, &prev_o);
+  vksc_brush_ring_point(sc, be, hx_world, hz_world, inner, lift_in, 0.0, &prev_i);
+  // Double-pass rendering for line thickness: emit each ring segment twice
+  // with a sub-pixel vertical offset. With 1-pixel-wide lines this reads as
+  // a chunky "highlighted" stroke instead of a hair-thin thread that easily
+  // disappears against the terrain texture.
+  var k: int32 = 1;
+  while (k <= seg) {
+    var ang: float64 = (float64)k * 6.28318530717958647692 / (float64)seg;
+    var no: VkScenePoint;
+    var ni: VkScenePoint;
+    vksc_brush_ring_point(sc, be, hx_world, hz_world, radius, lift_out, ang, &no);
+    vksc_brush_ring_point(sc, be, hx_world, hz_world, inner, lift_in, ang, &ni);
+    vksc_line(s, prev_o.x, prev_o.y, prev_o.z, no.x, no.y, no.z, r, g, b);
+    vksc_line(s, prev_o.x, prev_o.y + 0.025, prev_o.z, no.x, no.y + 0.025, no.z, r, g, b);
+    vksc_line(s, prev_i.x, prev_i.y, prev_i.z, ni.x, ni.y, ni.z, r * 0.82, g * 0.82, b * 0.82);
+    prev_o = no;
+    prev_i = ni;
+    k = k + 1;
+  }
+  // Crosshair at the brush center, draped on the surface.
+  var ch_r: float64 = radius * 0.20;
+  if (ch_r < 0.25) { ch_r = 0.25; }
+  if (ch_r > 1.40) { ch_r = 1.40; }
+  var c0: VkScenePoint;
+  var cxp: VkScenePoint;
+  var cxn: VkScenePoint;
+  var czp: VkScenePoint;
+  var czn: VkScenePoint;
+  vksc_brush_ring_point(sc, be, hx_world, hz_world, 0.0, lift_in, 0.0, &c0);
+  vksc_brush_ring_point(sc, be, hx_world + ch_r, hz_world, 0.0, lift_in, 0.0, &cxp);
+  vksc_brush_ring_point(sc, be, hx_world - ch_r, hz_world, 0.0, lift_in, 0.0, &cxn);
+  vksc_brush_ring_point(sc, be, hx_world, hz_world + ch_r, 0.0, lift_in, 0.0, &czp);
+  vksc_brush_ring_point(sc, be, hx_world, hz_world - ch_r, 0.0, lift_in, 0.0, &czn);
+  vksc_line(s, cxn.x, cxn.y, cxn.z, cxp.x, cxp.y, cxp.z, r, g, b);
+  vksc_line(s, czn.x, czn.y, czn.z, czp.x, czp.y, czp.z, r, g, b);
+  // Tall vertical post at the brush center so it's unmistakeable from any
+  // angle, even when looking straight down (where the ring goes flat). Base
+  // height scales with strength (so the user can see the strength change),
+  // floor of 1.0 m so it's always a clear visual landmark.
+  var post_h: float64 = 1.0 + vp->terrain_brush_strength * 8.0;
+  if (post_h > 3.5) { post_h = 3.5; }
+  vksc_line(s, c0.x, c0.y, c0.z, c0.x, c0.y + post_h, c0.z, r, g, b);
+  // A small flag at the top of the post — two perpendicular cross-bars so
+  // the post tip reads as a distinct cap and not just "another line".
+  var ftop_x: float64 = c0.x;
+  var ftop_y: float64 = c0.y + post_h;
+  var ftop_z: float64 = c0.z;
+  var flag_r: float64 = 0.35;
+  vksc_line(s, ftop_x - flag_r, ftop_y, ftop_z, ftop_x + flag_r, ftop_y, ftop_z, r, g, b);
+  vksc_line(s, ftop_x, ftop_y, ftop_z - flag_r, ftop_x, ftop_y, ftop_z + flag_r, r, g, b);
+}
+
+// Rebuild the whole viewport scene: projected receiver shadows, lit solid
+// geometry, floor/axis editor lines, per-entity wire chrome, and the transform
+// gizmo on the selected entity for the active tool.
+export function vk_scene_build(s: VkSceneBuf*, sc: Scene*, vp: EngineViewport*, meshes: MeshStore*) {
+  if (s == 0) {
+    return;
+  }
+  s->count = 0;
+  s->solid_count = 0;
+  s->line_count = 0;
+
+  if (sc != 0) {
+    // Shadows are emitted before lit solids so the receiver surface can paint
+    // over only where the projected dark geometry is nearest.
+    var shn: int32 = scene_count(sc);
+    var shi: int32 = 0;
+    while (shi < shn) {
+      var she: Entity* = scene_row(sc, shi);
+      shi = shi + 1;
+      if (she == 0) { continue; }
+      if ((she->flags & SE_FLAG_HIDDEN()) != 0) { continue; }
+      if (she->transparency >= 0.95) { continue; }
+      if (scene_entity_prop_flag(she, PF_CAST_SHADOW()) == 0) { continue; }
+      vksc_emit_entity_shadow(s, sc, she);
+    }
+
+    var sel_solid: int32 = scene_selected_id(sc);
+    var sn: int32 = scene_count(sc);
+    var si: int32 = 0;
+    while (si < sn) {
+      var se: Entity* = scene_row(sc, si);
+      si = si + 1;
+      if (se == 0) { continue; }
+      if ((se->flags & SE_FLAG_HIDDEN()) != 0) { continue; }
+      // Fully (or near-fully) transparent parts are not emitted. The renderer
+      // is a single opaque pass, so partial transparency can't blend yet;
+      // treat >= 0.95 as invisible and keep < 0.95 fully opaque.
+      if (se->transparency >= 0.95 && se->id != sel_solid) { continue; }
+      var is_sel: int32 = 0;
+      if (sel_solid != 0 && se->id == sel_solid) { is_sel = 1; }
+      if (se->kind == SK_CUBE() || se->kind == SK_BOX()) {
+        vksc_emit_box_triangles(s, sc, se, is_sel);
+      } else {
+        if (se->kind == SK_TERRAIN()) {
+          vksc_emit_terrain_triangles(s, sc, se, is_sel);
+        } else {
+          if (meshes != 0 && se->kind == SK_MESH() && se->mesh_id != 0) {
+            var sm: MeshRecord* = mesh_store_find(meshes, se->mesh_id);
+            vksc_emit_mesh_triangles(s, sc, se, sm, is_sel);
+          }
+        }
+      }
+    }
+  }
+  s->solid_count = s->count;
+
+  // Floor grid is a helper only. Once terrain exists, terrain is the ground;
+  // drawing both produces z-fighting/noise where the surfaces meet.
+  if (scene_has_visible_terrain(sc) == 0) {
+    var span: int32 = 20;
+    var i: int32 = 0 - span;
+    while (i <= span) {
+      var f: float64 = (float64)i;
+      var sp: float64 = (float64)span;
+      vksc_line(s, f, 0.0, 0.0 - sp, f, 0.0, sp, 0.30, 0.34, 0.40);
+      vksc_line(s, 0.0 - sp, 0.0, f, sp, 0.0, f, 0.30, 0.34, 0.40);
+      i = i + 2;
+    }
+  }
+  // Origin axes (X red, Z blue).
+  vksc_line(s, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.82, 0.31, 0.31);
+  vksc_line(s, 0.0, 0.0, 0.0, 0.0, 0.0, 6.0, 0.31, 0.51, 0.86);
+
+  if (sc == 0) {
+    s->line_count = s->count - s->solid_count;
+    return;
+  }
+  var sel_id: int32 = scene_selected_id(sc);
+  var hov_id: int32 = scene_hover_id(sc);
+  var n: int32 = scene_count(sc);
+  var ei: int32 = 0;
+  while (ei < n) {
+    var e: Entity* = scene_row(sc, ei);
+    ei = ei + 1;
+    if (e == 0) {
+      continue;
+    }
+    if ((e->flags & SE_FLAG_HIDDEN()) != 0) {
+      continue;
+    }
+    var r: float64 = 0.34;
+    var g: float64 = 0.80;
+    var b: float64 = 1.0;
+    if (sel_id != 0 && e->id == sel_id) {
+      r = 1.0; g = 0.82; b = 0.37;
+    } else {
+      if (hov_id != 0 && e->id == hov_id) {
+        r = 0.70; g = 0.92; b = 1.0;
+      }
+    }
+    if (e->kind == SK_TERRAIN()) {
+      if ((sel_id != 0 && e->id == sel_id) || (hov_id != 0 && e->id == hov_id)) {
+        vksc_emit_terrain_lines(s, sc, e, r, g, b);
+      }
+      continue;
+    }
+    vksc_cube_edge(s, sc, e, 0, 1, r, g, b);
+    vksc_cube_edge(s, sc, e, 0, 2, r, g, b);
+    vksc_cube_edge(s, sc, e, 1, 3, r, g, b);
+    vksc_cube_edge(s, sc, e, 2, 3, r, g, b);
+    vksc_cube_edge(s, sc, e, 4, 5, r, g, b);
+    vksc_cube_edge(s, sc, e, 4, 6, r, g, b);
+    vksc_cube_edge(s, sc, e, 5, 7, r, g, b);
+    vksc_cube_edge(s, sc, e, 6, 7, r, g, b);
+    vksc_cube_edge(s, sc, e, 0, 4, r, g, b);
+    vksc_cube_edge(s, sc, e, 1, 5, r, g, b);
+    vksc_cube_edge(s, sc, e, 2, 6, r, g, b);
+    vksc_cube_edge(s, sc, e, 3, 7, r, g, b);
+  }
+
+  // Transform gizmo on the selected entity for the active tool (1 move, 2
+  // rotate, 3 scale). Mirrors the CPU vp_draw_transform_gizmo.
+  if (vp != 0 && sel_id != 0) {
+    var sel: Entity* = scene_find(sc, sel_id);
+    if (sel != 0) {
+      vksc_gizmo(s, sc, sel, vp, vp->active_tool, vp->manip_axis, vp->manip_dragging, vp->manip_hover_axis);
+    }
+  }
+  // Terrain brush ring/crosshair: draped on the heightmap under the cursor.
+  // Drawn after the gizmo so it always sits on top in the line bucket.
+  vksc_emit_terrain_brush(s, sc, vp);
+  s->line_count = s->count - s->solid_count;
+}
+
+// Column-major MVP = perspective * view. View is built from the camera basis
+// (right, up, forward) and eye position, matching the CPU projection so the
+// Vulkan view agrees with picking/fly. aspect = width/height.
+export function vk_scene_build_mvp(s: VkSceneBuf*, vp: EngineViewport*, aspect: float64) {
+  if (s == 0 || vp == 0) {
+    return;
+  }
+  var yaw: float64 = vp->cam_yaw;
+  var pitch: float64 = vp->cam_pitch;
+  var cy: float64 = cosf64(yaw);
+  var sy: float64 = sinf64(yaw);
+  var cp: float64 = cosf64(pitch);
+  var sp: float64 = sinf64(pitch);
+  // Camera basis (same as CPU renderer).
+  var fx: float64 = sy * cp;
+  var fy: float64 = sp;
+  var fz: float64 = cy * cp;
+  var rx: float64 = cy;
+  var ry: float64 = 0.0;
+  var rz: float64 = 0.0 - sy;
+  // up = forward x right (left-handed-ish to match CPU y-up screen).
+  var ux: float64 = fy * rz - fz * ry;
+  var uy: float64 = fz * rx - fx * rz;
+  var uz: float64 = fx * ry - fy * rx;
+  var ex: float64 = vp->cam_x;
+  var ey: float64 = vp->cam_y;
+  var ez: float64 = vp->cam_z;
+  // View matrix (row vectors = basis, translation = -dot(basis, eye)).
+  var tx: float64 = 0.0 - (rx * ex + ry * ey + rz * ez);
+  var ty: float64 = 0.0 - (ux * ex + uy * ey + uz * ez);
+  var tz: float64 = 0.0 - (fx * ex + fy * ey + fz * ez);
+
+  // Perspective: 60deg vertical FOV, near 0.1, far 500.
+  var fovy: float64 = 1.0471975512;
+  var tn: float64 = tanf64(fovy * 0.5);
+  var f: float64 = 1.0 / tn;
+  var nearz: float64 = 0.1;
+  var farz: float64 = 500.0;
+  var a: float64 = f / aspect;
+  var b: float64 = f;
+  var c: float64 = farz / (farz - nearz);
+  var d: float64 = 0.0 - (farz * nearz) / (farz - nearz);
+
+  // M = P * V, column-major (m[col*4 + row]). Vulkan clip: y down, z [0,1];
+  // we negate the y row to flip into Vulkan's coordinate convention.
+  var m: float32* = (float32*)((int64)(&(s->mvp[0])));
+  m[0]  = (float32)(a * rx);
+  m[1]  = (float32)(0.0 - (b * ux));
+  m[2]  = (float32)(c * fx);
+  m[3]  = (float32)fx;
+  m[4]  = (float32)(a * ry);
+  m[5]  = (float32)(0.0 - (b * uy));
+  m[6]  = (float32)(c * fy);
+  m[7]  = (float32)fy;
+  m[8]  = (float32)(a * rz);
+  m[9]  = (float32)(0.0 - (b * uz));
+  m[10] = (float32)(c * fz);
+  m[11] = (float32)fz;
+  m[12] = (float32)(a * tx);
+  m[13] = (float32)(0.0 - (b * ty));
+  m[14] = (float32)(c * tz + d);
+  m[15] = (float32)tz;
+}
+
+// Upload the built geometry + draw one Vulkan frame with the built MVP.
+export function vk_scene_present(ctx: VkContext*, s: VkSceneBuf*) -> int32 {
+  if (ctx == 0 || s == 0) {
+    return 0;
+  }
+  vk_upload_vertices_split(ctx, s->verts, s->solid_count, s->line_count);
+  var mvp_ptr: float32* = (float32*)((int64)(&(s->mvp[0])));
+  return vk_draw_frame(ctx, mvp_ptr);
+}

@@ -1,0 +1,231 @@
+// Repro probe for the --emit-obj float bounds bug seen in terrain sculpting.
+//
+// Build:
+//   bin\mettle.exe --build --emit-obj --linker internal tests\test_float_bounds_repro.mettle -o tests\test_float_bounds_repro.exe
+// Run:
+//   tests\test_float_bounds_repro.exe
+//
+// Expected: every "float_*" and "int_scaled" line prints 1.
+// Buggy object backend symptom: a float_* line prints 0 while int_scaled prints 1.
+import "std/conv";
+import "std/io";
+import "std/win32";
+
+struct BoundsProbe {
+  lx: float64;
+  lz: float64;
+  hx: float64;
+  hz: float64;
+}
+
+function trace(s: string) {
+  win32_write_stdout(s.chars, (uint32)s.length);
+}
+
+function write_c(s: cstring) {
+  if (s != 0) {
+    fputs(s, get_stdout());
+  }
+}
+
+function write_i64(v: int64) {
+  var buf: uint8[32];
+  int_to_dec((cstring)((int64)(&(buf[0]))), v);
+  write_c((cstring)((int64)(&(buf[0]))));
+}
+
+function println_result(label: string, v: int32) {
+  write_c(label.chars);
+  trace(" ");
+  write_i64((int64)v);
+  trace("\n");
+}
+
+function scaled(v: float64, scale: float64) -> int64 {
+  if (v < 0.0) {
+    return 0 - (int64)((0.0 - v) * scale);
+  }
+  return (int64)(v * scale);
+}
+
+function int_scaled_in_bounds(lx: float64, lz: float64, hx: float64, hz: float64) -> int32 {
+  var lxi: int64 = scaled(lx, 1000000.0);
+  var lzi: int64 = scaled(lz, 1000000.0);
+  var hxi: int64 = scaled(hx, 1000000.0);
+  var hzi: int64 = scaled(hz, 1000000.0);
+  if (lxi < 0 - hxi) { return 0; }
+  if (lxi > hxi) { return 0; }
+  if (lzi < 0 - hzi) { return 0; }
+  if (lzi > hzi) { return 0; }
+  return 1;
+}
+
+function float_compound_in_bounds(lx: float64, lz: float64, hx: float64, hz: float64) -> int32 {
+  if (lx >= 0.0 - hx && lx <= hx && lz >= 0.0 - hz && lz <= hz) {
+    return 1;
+  }
+  return 0;
+}
+
+function float_sequential_in_bounds(lx: float64, lz: float64, hx: float64, hz: float64) -> int32 {
+  if (lx < 0.0 - hx) { return 0; }
+  if (lx > hx) { return 0; }
+  if (lz < 0.0 - hz) { return 0; }
+  if (lz > hz) { return 0; }
+  return 1;
+}
+
+function float_precomputed_in_bounds(lx: float64, lz: float64, hx: float64, hz: float64) -> int32 {
+  var nx: float64 = 0.0 - hx;
+  var nz: float64 = 0.0 - hz;
+  if (lx < nx) { return 0; }
+  if (lx > hx) { return 0; }
+  if (lz < nz) { return 0; }
+  if (lz > hz) { return 0; }
+  return 1;
+}
+
+function pred_lx_ge_neg_expr(lx: float64, hx: float64) -> int32 {
+  if (lx >= 0.0 - hx) { return 1; }
+  return 0;
+}
+
+function pred_lx_lt_neg_expr(lx: float64, hx: float64) -> int32 {
+  if (lx < 0.0 - hx) { return 1; }
+  return 0;
+}
+
+function pred_lx_le_pos(lx: float64, hx: float64) -> int32 {
+  if (lx <= hx) { return 1; }
+  return 0;
+}
+
+function pred_lx_gt_pos(lx: float64, hx: float64) -> int32 {
+  if (lx > hx) { return 1; }
+  return 0;
+}
+
+function pred_lz_ge_neg_expr(lz: float64, hz: float64) -> int32 {
+  if (lz >= 0.0 - hz) { return 1; }
+  return 0;
+}
+
+function pred_lz_lt_neg_expr(lz: float64, hz: float64) -> int32 {
+  if (lz < 0.0 - hz) { return 1; }
+  return 0;
+}
+
+function pred_lz_le_pos(lz: float64, hz: float64) -> int32 {
+  if (lz <= hz) { return 1; }
+  return 0;
+}
+
+function pred_lz_gt_pos(lz: float64, hz: float64) -> int32 {
+  if (lz > hz) { return 1; }
+  return 0;
+}
+
+function neg_expr_scaled(h: float64) -> int64 {
+  return scaled(0.0 - h, 1000.0);
+}
+
+function neg_mul_scaled(h: float64) -> int64 {
+  return scaled(h * -1.0, 1000.0);
+}
+
+function sub_expr_scaled(a: float64, b: float64) -> int64 {
+  return scaled(a - b, 1000.0);
+}
+
+function pred_a_ge_b(a: float64, b: float64) -> int32 {
+  if (a >= b) { return 1; }
+  return 0;
+}
+
+function pred_a_gt_b(a: float64, b: float64) -> int32 {
+  if (a > b) { return 1; }
+  return 0;
+}
+
+function pred_a_le_b(a: float64, b: float64) -> int32 {
+  if (a <= b) { return 1; }
+  return 0;
+}
+
+function pred_a_lt_b(a: float64, b: float64) -> int32 {
+  if (a < b) { return 1; }
+  return 0;
+}
+
+function println_i64(label: string, v: int64) {
+  write_c(label.chars);
+  trace(" ");
+  write_i64(v);
+  trace("\n");
+}
+
+function assign_out(lx: float64*, lz: float64*, hx: float64*, hz: float64*) {
+  *lx = -3348.0;
+  *lz = -9738.0;
+  *hx = 22000.0;
+  *hz = 22000.0;
+}
+
+function probe_from_out_params() {
+  var lx: float64 = 0.0;
+  var lz: float64 = 0.0;
+  var hx: float64 = 0.0;
+  var hz: float64 = 0.0;
+  assign_out(&lx, &lz, &hx, &hz);
+  println_result("out_params_float_compound", float_compound_in_bounds(lx, lz, hx, hz));
+  println_result("out_params_float_sequential", float_sequential_in_bounds(lx, lz, hx, hz));
+  println_result("out_params_float_precomputed", float_precomputed_in_bounds(lx, lz, hx, hz));
+  println_result("out_params_int_scaled", int_scaled_in_bounds(lx, lz, hx, hz));
+}
+
+function probe_from_struct(p: BoundsProbe*) {
+  println_result("struct_float_compound", float_compound_in_bounds(p->lx, p->lz, p->hx, p->hz));
+  println_result("struct_float_sequential", float_sequential_in_bounds(p->lx, p->lz, p->hx, p->hz));
+  println_result("struct_float_precomputed", float_precomputed_in_bounds(p->lx, p->lz, p->hx, p->hz));
+  println_result("struct_int_scaled", int_scaled_in_bounds(p->lx, p->lz, p->hx, p->hz));
+}
+
+function main() -> int32 {
+  trace("float bounds repro\n");
+  var lx: float64 = -3348.0;
+  var lz: float64 = -9738.0;
+  var hx: float64 = 22000.0;
+  var hz: float64 = 22000.0;
+  println_result("locals_float_compound", float_compound_in_bounds(lx, lz, hx, hz));
+  println_result("locals_float_sequential", float_sequential_in_bounds(lx, lz, hx, hz));
+  println_result("locals_float_precomputed", float_precomputed_in_bounds(lx, lz, hx, hz));
+  println_result("locals_int_scaled", int_scaled_in_bounds(lx, lz, hx, hz));
+  println_result("pred_lx_ge_neg_expr", pred_lx_ge_neg_expr(lx, hx));
+  println_result("pred_lx_lt_neg_expr", pred_lx_lt_neg_expr(lx, hx));
+  println_result("pred_lx_le_pos", pred_lx_le_pos(lx, hx));
+  println_result("pred_lx_gt_pos", pred_lx_gt_pos(lx, hx));
+  println_result("pred_lz_ge_neg_expr", pred_lz_ge_neg_expr(lz, hz));
+  println_result("pred_lz_lt_neg_expr", pred_lz_lt_neg_expr(lz, hz));
+  println_result("pred_lz_le_pos", pred_lz_le_pos(lz, hz));
+  println_result("pred_lz_gt_pos", pred_lz_gt_pos(lz, hz));
+  println_i64("neg_expr_hx_mm", neg_expr_scaled(hx));
+  println_i64("neg_mul_hx_mm", neg_mul_scaled(hx));
+  println_i64("sub_0_hx_mm", sub_expr_scaled(0.0, hx));
+  println_i64("sub_5_2_mm", sub_expr_scaled(5.0, 2.0));
+  println_i64("sub_2_5_mm", sub_expr_scaled(2.0, 5.0));
+  println_result("cmp_neg3348_ge_neg22000", pred_a_ge_b(-3348.0, -22000.0));
+  println_result("cmp_neg3348_gt_neg22000", pred_a_gt_b(-3348.0, -22000.0));
+  println_result("cmp_neg3348_le_neg22000", pred_a_le_b(-3348.0, -22000.0));
+  println_result("cmp_neg3348_lt_neg22000", pred_a_lt_b(-3348.0, -22000.0));
+  println_result("cmp_neg30000_lt_neg22000", pred_a_lt_b(-30000.0, -22000.0));
+  println_result("cmp_pos3348_lt_pos22000", pred_a_lt_b(3348.0, 22000.0));
+  println_result("cmp_pos3348_gt_pos22000", pred_a_gt_b(3348.0, 22000.0));
+  probe_from_out_params();
+  var p: BoundsProbe;
+  p.lx = -3348.0;
+  p.lz = -9738.0;
+  p.hx = 22000.0;
+  p.hz = 22000.0;
+  probe_from_struct(&p);
+  return 0;
+}

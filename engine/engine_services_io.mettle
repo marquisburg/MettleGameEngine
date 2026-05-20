@@ -1,7 +1,7 @@
 // Service model save/load for the playtest pipeline. Text format, versioned,
 // line-oriented, deliberately easy to inspect. Mirrors engine_scene_io.
 //
-//   methsvc 1
+//   mettlesvc 1
 //   script
 //   id <id>
 //   service <service_id>
@@ -96,7 +96,7 @@ export function service_io_save(path: cstring, sm: ServiceModel*) -> int32 {
   if (fp == 0) {
     return 0;
   }
-  fputs(cstr("methsvc 1\n"), fp);
+  fputs(cstr("mettlesvc 1\n"), fp);
   var i: int32 = 0;
   while (i < sm->script_count) {
     var rec: ServiceScriptRecord* = service_script_record_ptr(sm, i);

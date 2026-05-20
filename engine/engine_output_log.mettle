@@ -4,7 +4,7 @@
 // without a console.
 //
 // Single global instance. This mirrors the lua_ctx_* module-static pattern in
-// engine_lua: one Methlang process == one editor == one log. Keeping it a
+// engine_lua: one Mettle process == one editor == one log. Keeping it a
 // singleton means lua_api_log (which only gets a lua_State*) can append
 // without threading a pointer through every C callback.
 import "std/io";

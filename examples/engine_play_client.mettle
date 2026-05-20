@@ -29,6 +29,72 @@ extern function ioctlsocket(s: int64, cmd: int32, argp: uint32*) -> int32 = "ioc
 
 function client_log(s: string) {
   fputs(s.chars, get_stdout());
+  fflush(get_stdout());
+}
+
+// Built-in default fly-cam.
+//
+// Runs every client frame UNTIL a LocalScript calls engine.camera_set_pos or
+// engine.camera_set_look — the moment a script takes over, the viewport's
+// script_camera_active latch flips and this stops. The point: a fresh project
+// with no camera LocalScript still has a usable WASD + mouse-look camera, so
+// "playtest" never lands the user in a frozen-camera dead zone.
+//
+// Bindings are pulled straight from the InputMap (IA_MOVE_FORWARD/BACK/LEFT/
+// RIGHT/UP/DOWN), so anything the user rebinds via input_bind_key is honored
+// for free. Mouse delta is read directly off the InputMap (the main loop has
+// already filled it for this frame). Speed roughly matches the reference
+// player.client.lua so behavior is consistent whether or not the script is
+// loaded.
+function client_default_camera_tick(vp: EngineViewport*, input: InputMap*, dt: float64) {
+  if (vp == 0 || input == 0) {
+    return;
+  }
+  var look_sens: float64 = 0.0035;   // rad / pixel
+  var move_speed: float64 = 8.0;     // m / s
+  var dx: int32 = input_map_mouse_dx(input);
+  var dy: int32 = input_map_mouse_dy(input);
+  if (dx != 0 || dy != 0) {
+    var yaw: float64 = engine_viewport_cam_get_yaw(vp) + (float64)dx * look_sens;
+    // dy is screen-down-positive; pushing the mouse up (negative dy) should
+    // pitch up, matching the reference LocalScript and the editor fly-cam.
+    var pitch: float64 = engine_viewport_cam_get_pitch(vp) - (float64)dy * look_sens;
+    engine_viewport_cam_set_look(vp, yaw, pitch);
+  }
+  var fx: float64 = engine_viewport_cam_forward(vp, 0);
+  var fy: float64 = engine_viewport_cam_forward(vp, 1);
+  var fz: float64 = engine_viewport_cam_forward(vp, 2);
+  var rx: float64 = engine_viewport_cam_right(vp, 0);
+  var ry: float64 = engine_viewport_cam_right(vp, 1);
+  var rz: float64 = engine_viewport_cam_right(vp, 2);
+  var mvx: float64 = 0.0;
+  var mvy: float64 = 0.0;
+  var mvz: float64 = 0.0;
+  if (input_action_held(input, IA_MOVE_FORWARD()) != 0) {
+    mvx = mvx + fx; mvy = mvy + fy; mvz = mvz + fz;
+  }
+  if (input_action_held(input, IA_MOVE_BACK()) != 0) {
+    mvx = mvx - fx; mvy = mvy - fy; mvz = mvz - fz;
+  }
+  if (input_action_held(input, IA_MOVE_RIGHT()) != 0) {
+    mvx = mvx + rx; mvy = mvy + ry; mvz = mvz + rz;
+  }
+  if (input_action_held(input, IA_MOVE_LEFT()) != 0) {
+    mvx = mvx - rx; mvy = mvy - ry; mvz = mvz - rz;
+  }
+  if (input_action_held(input, IA_MOVE_UP()) != 0) {
+    mvy = mvy + 1.0;
+  }
+  if (input_action_held(input, IA_MOVE_DOWN()) != 0) {
+    mvy = mvy - 1.0;
+  }
+  if (mvx != 0.0 || mvy != 0.0 || mvz != 0.0) {
+    var step: float64 = move_speed * dt;
+    var cx: float64 = engine_viewport_cam_get_x(vp);
+    var cy: float64 = engine_viewport_cam_get_y(vp);
+    var cz: float64 = engine_viewport_cam_get_z(vp);
+    engine_viewport_cam_set_pos(vp, cx + mvx * step, cy + mvy * step, cz + mvz * step);
+  }
 }
 
 function client_apply_entity_packet(sc: Scene*, meshes: MeshStore*, pkt: PlayPacket*) {
@@ -67,7 +133,23 @@ function client_apply_entity_packet(sc: Scene*, meshes: MeshStore*, pkt: PlayPac
   if (e->scale <= 0.0) {
     e->scale = 1.0;
   }
+  e->size_x = (float64)pkt->i11 / 1000000.0;
+  e->size_y = (float64)pkt->i12 / 1000000.0;
+  e->size_z = (float64)pkt->i13 / 1000000.0;
+  if (e->size_x <= 0.0) { e->size_x = e->half; }
+  if (e->size_y <= 0.0) { e->size_y = e->half; }
+  if (e->size_z <= 0.0) { e->size_z = e->half; }
+  e->flags = pkt->i14;
+  e->material_id = pkt->i15;
   scene_set_name(sc, id, (cstring)((int64)(&(pkt->s1[0]))));
+  if (pkt->i1 == SK_TERRAIN() && pkt->s0[0] != (uint8)0) {
+    var mm: int32 = 0;
+    while (mm + 1 < 520 && pkt->s0[mm] != (uint8)0) {
+      e->mesh_path[mm] = pkt->s0[mm];
+      mm = mm + 1;
+    }
+    e->mesh_path[mm] = (uint8)0;
+  }
   if (pkt->i1 == SK_MESH() && pkt->s0[0] != (uint8)0) {
     var mid: int32 = 0;
     var half: float64 = e->half;
@@ -311,6 +393,7 @@ export function main() -> int32 {
     net_cleanup();
     return 9;
   }
+  scene_terrain_reload_all(sc, play_manifest_project_root(mani));
   var nb: uint32 = 1;
   ioctlsocket(client_sock, (int32)-2147195266, &nb);
 
@@ -325,7 +408,7 @@ export function main() -> int32 {
   }
   // Load services snapshot (StarterPlayerScripts -> LOCAL, ReplicatedStorage
   // -> MODULE). Same file the editor wrote and the server loaded; on local
-  // playtest both processes read the same .methplay/services.msvc.
+  // playtest both processes read the same .mettleplay/services.msvc.
   var csvc_path: cstring = play_manifest_services_snapshot(mani);
   if (csvc_path != 0 && (uint8)(csvc_path[0]) != (uint8)0) {
     if (service_io_load(csvc_path, sm) != 0) {
@@ -373,6 +456,10 @@ export function main() -> int32 {
     return 12;
   }
   engine_viewport_sync_scene(vp, sc);
+  // Bind the game camera so LocalScripts can drive it via engine.camera_*.
+  // The client never runs the editor fly-cam (engine_viewport_input_tick);
+  // the camera is fully script-controlled (gap 1.1).
+  lua_ctx_set_viewport(vp);
 
   var input: InputMap* = input_map_create();
   if (input == 0) {
@@ -432,9 +519,35 @@ export function main() -> int32 {
     if (frame_dt <= 0.0) {
       frame_dt = 0.016;
     }
-    input_map_update(input, g);
-
-    engine_viewport_input_tick(vp, sc, meshes, g, 0, 0, g->width, g->height);
+    // Only sample input while the client window has focus. Without this,
+    // game_input_key_held reads stale/garbage async key state when the window
+    // is backgrounded and every action latches "held" forever — the input
+    // spam seen in headless playtests (playtest_gaps 1.2). When unfocused,
+    // clear the map so held/pressed/released all read false and a neutral
+    // snapshot is still sent (the server keeps getting fed, just with no
+    // input, instead of a frozen last state).
+    var focused: int32 = game_win32_window_is_foreground(g);
+    if (focused != 0) {
+      input_map_update(input, g);
+      // Game camera: capture the mouse while focused for relative look, read
+      // the per-frame delta, and hand it to the Lua VM. The client does NOT
+      // run engine_viewport_input_tick (that's the editor fly-cam + gizmo +
+      // selection, gap 1.1) — a LocalScript drives the camera via
+      // engine.camera_* / engine.mouse_delta instead.
+      if (game_mouse_is_captured(g) == 0) {
+        game_mouse_begin_capture(g);
+      }
+      var mdx: int32 = 0;
+      var mdy: int32 = 0;
+      game_mouse_read_delta(g, &mdx, &mdy);
+      input_map_set_mouse_delta(input, mdx, mdy);
+    } else {
+      if (game_mouse_is_captured(g) != 0) {
+        game_mouse_end_capture(g);
+      }
+      input_map_clear(input);
+      input_map_set_mouse_delta(input, 0, 0);
+    }
 
     client_send_input_snapshot(client_sock, input, input_seq);
     input_seq = input_seq + 1;
@@ -469,6 +582,15 @@ export function main() -> int32 {
 
     runtime_time = runtime_time + frame_dt;
     lua_vm_tick(lua_vm, frame_dt, runtime_time);
+
+    // Default fly-cam fallback. Only runs while focused (no input == nothing
+    // to do anyway, and we don't want the camera drifting on a backgrounded
+    // window) and only until a LocalScript takes over the camera. The Lua
+    // camera setters flip vp->script_camera_active; once that's set, this is
+    // a permanent no-op for the session.
+    if (focused != 0 && engine_viewport_script_camera_active(vp) == 0) {
+      client_default_camera_tick(vp, input, frame_dt);
+    }
 
     if (vk_on != 0) {
       var resized: int32 = game_win32_move_child(g, 0, 0, g->width, g->height);

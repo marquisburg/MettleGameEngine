@@ -1,0 +1,6 @@
+// Leaf module with a deliberate error, imported two levels deep, to check
+// diagnostic source-mapping (#2).
+function leaf_broken(x: int32) -> int32 {
+  var y: int32 = x +    // missing right operand -> parse error here
+  return y;
+}
