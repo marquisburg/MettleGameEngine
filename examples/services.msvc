@@ -1,0 +1,11 @@
+mettlesvc 1
+script
+id 1
+service 5
+role 2
+owner 0
+enabled 1
+load_order 0
+name Script1.client.lua
+path G:\Projects\MettleEngine\examples\StarterPlayerScripts\Script1.client.lua
+end

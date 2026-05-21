@@ -4,7 +4,7 @@
 -- the camera-relative horizontal plane (so forward is always "where you look",
 -- projected onto the ground). Space/Ctrl move the entity up/down in world
 -- space. The camera tracks the entity at a fixed eye offset, so moving the
--- entity also moves the view � this gives a first-person feel without needing
+-- entity also moves the view. this gives a first-person feel without needing
 -- a separate "attach camera to entity" API.
 --
 -- Controls (defaults from engine InputMap):
